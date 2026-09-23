@@ -203,6 +203,7 @@ String makeFrame(const String& kind, const String& topic, const String& payload,
 
 void sendFrame(const String& kind, const String& topic, const String& payload) {
   Serial.println(makeFrame(kind, topic, payload, txSeq++));
+  Serial.flush();
 }
 
 bool parseFrame(String line, String& src, long& seq, String& kind, String& topic, String& payload) {
