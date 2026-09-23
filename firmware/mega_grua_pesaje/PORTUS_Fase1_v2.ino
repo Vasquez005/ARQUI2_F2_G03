@@ -26,7 +26,7 @@
 
 // --- PESAJE: PORTB del Mega (pin 50=PB3, 51=PB2, 52=PB1) ---
 // Se usa PORTB porque en el Mega los pines 2,3,4 NO comparten puerto.
-const uint8_t BIT_DT_A = (1 << 3);   // pin 50
+const uint8_t BIT_DT_A = (1 << 3); aq  // pin 50
 const uint8_t BIT_DT_B = (1 << 2);   // pin 51
 const uint8_t BIT_SCK  = (1 << 1);   // pin 52  (compartido por ambos modulos)
 
@@ -63,12 +63,7 @@ const float PESO_MIN_VALIDO = -200.0;   // filtro anti-saltos
 const float PESO_MAX_VALIDO = 5000.0;
 
 const int AGUJA_ABIERTA = 90;           // paso libre (default, fail-safe)
-const int AGUJA_BLOQUEO = 0;            // bloquea carril normal -> envia al parqueo
-// TODO-AJUSTAR: angulo de ejemplo, calibrar en banco de pruebas contra el mecanismo real.
-// Posicion para devolver al carril principal un vehiculo que estaba en el parqueo de
-// retencion (AgujaLiberar). Antes compartia AGUJA_BLOQUEO con AgujaParqueo; se separa
-// porque son acciones opuestas (Fase_2_PORTUS.md sec. 8.1: la aguja opera en 3 estados).
-const int AGUJA_LIBERANDO = 45;
+const int AGUJA_BLOQUEO = 0;            // bloquea carril normal -> ramal
 
 // Umbrales: subir PRESENCIA si detecta mesetas con la plataforma vacia;
 // bajarlo si no detecta el camion. Debe quedar por encima del ruido.
@@ -220,15 +215,6 @@ bool parpadeoReservaOn = false;
 unsigned long ultimoHeartbeatPortusMs = 0;
 long txSeqPortus = 1;
 
-// ── Modo degradado (ver Observaciones_Firmware_PersonaA.md, punto 5) ──
-// La Pi manda un ping ("PIN") periodico ademas de los comandos; si no llega
-// nada de la Pi en UMBRAL_DEGRADADO_MS se asume enlace perdido. Esto es una
-// extension del protocolo (bridge.py) porque el PDF solo define el latido en
-// sentido Controlador->Servidor, no al reves.
-unsigned long ultimaActividadPiMs = 0;
-const unsigned long UMBRAL_DEGRADADO_MS = 10000;  // ~3x el periodo de ping (3s)
-bool modoDegradadoGrua = false;
-
 int           optLectura  = HIGH;
 int           optEstable  = HIGH;
 unsigned long optCambioMs = 0;
@@ -270,9 +256,7 @@ void reiniciarPatioLogicoDesdeSensores();
 void iniciarRegresoP0();
 void procesarComandosPortus();
 void emitirHeartbeatPortus();
-void actualizarModoDegradadoGrua();
 void emitirEventoGruaPortus(const char* evt);
-void emitirEventoPesajePortus(float medido, float esperado, bool ok, bool deposito);
 void responderCmdPortus(bool ok, const String& name, const String& extra);
 bool parseFramePortus(String line, String& src, long& seq, String& kind, String& topic, String& payload);
 String framePortus(const String& kind, const String& topic, const String& payload, long seq);
@@ -443,7 +427,6 @@ void decidirRuta(float pesoBruto) {
     turnoAprobado = false;
     Serial.println(F("[PESAJE] FUERA DE TOLERANCIA -> flecha ambar, TURNO RETENIDO"));
   }
-  emitirEventoPesajePortus(medido, esperado, ok, esDeposito);
   avisoRetencionDado = false;
   Serial.println();
 }
@@ -639,7 +622,6 @@ void setup() {
 void loop() {
   actualizarPesaje();               // no bloqueante, cada pasada
   procesarComandosPortus();
-  actualizarModoDegradadoGrua();
   emitirHeartbeatPortus();
   procesarComandoSerial();
   actualizarCamion();
@@ -716,14 +698,37 @@ void actualizarLedsCeldas() {
     parpadeoReservaOn = !parpadeoReservaOn;
   }
 
+  // En arranque/reposo: mostrar estado fisico puro (sin parpadeo de reserva).
+  // El parpadeo solo debe aparecer cuando la grua ya esta en ciclo activo.
+  bool cicloGruaActivo =
+      (estadoGrua == ST_REVISANDO_PATIO)   ||
+      (estadoGrua == ST_BAJANDO_ORIGEN)    ||
+      (estadoGrua == ST_ACTIVANDO_IMAN)    ||
+      (estadoGrua == ST_SUBIENDO_CARGA)    ||
+      (estadoGrua == ST_MOVIENDO_DESTINO)  ||
+      (estadoGrua == ST_BAJANDO_DESTINO)   ||
+      (estadoGrua == ST_LIBERANDO_CARGA)   ||
+      (estadoGrua == ST_VERIFICANDO_DEPOSITO) ||
+      (estadoGrua == ST_SUBIENDO_CABEZAL)  ||
+      (estadoGrua == ST_REGRESANDO_P0)     ||
+      (estadoGrua == ST_FINALIZADO);
+
   for (int i = 0; i < 4; i++) {
     bool ledLibre = false, ledOcupado = false;
 
-    switch (estadoPatio[i]) {
-      case LIBRE:     ledLibre = true; break;
-      case RESERVADA: ledLibre = parpadeoReservaOn; break;
-      case OCUPADA:   ledOcupado = true; break;
-      case BLOQUEADA: ledOcupado = true; ledLibre = parpadeoReservaOn; break;
+    if (!cicloGruaActivo) {
+      // Inicio/espera: libre=azul fijo, ocupada=rojo fijo, sin parpadeo.
+      bool fisicaOcupada = celdaFisicamenteOcupada(i + 1);
+      ledLibre = !fisicaOcupada;
+      ledOcupado = fisicaOcupada;
+    } else {
+      // Durante ciclo: aplicar estados logicos de patio (incluye reserva parpadeando).
+      switch (estadoPatio[i]) {
+        case LIBRE:     ledLibre = true; break;
+        case RESERVADA: ledLibre = parpadeoReservaOn; break;
+        case OCUPADA:   ledOcupado = true; break;
+        case BLOQUEADA: ledOcupado = true; ledLibre = parpadeoReservaOn; break;
+      }
     }
 
     digitalWrite(PIN_LED_CELDA_LIBRE[i], ledLibre ? HIGH : LOW);
@@ -796,36 +801,18 @@ void responderCmdPortus(bool ok, const String& name, const String& extra) {
   Serial.println(framePortus(ok ? "ACK" : "REJ", "cmd", payload, txSeqPortus++));
 }
 
-void actualizarModoDegradadoGrua() {
-  modoDegradadoGrua = (millis() - ultimaActividadPiMs) > UMBRAL_DEGRADADO_MS;
-}
-
 void emitirHeartbeatPortus() {
   if (millis() - ultimoHeartbeatPortusMs < 5000) return;
   ultimoHeartbeatPortusMs = millis();
   String payload = "estado=" + String((int)estadoGrua) +
                    ";suspendida=" + String(gruaSuspendidaRemota ? "1" : "0") +
-                   ";mantenimiento=" + String(modoMantenimientoRemoto ? "1" : "0") +
-                   ";degradado=" + String(modoDegradadoGrua ? "1" : "0");
+                   ";mantenimiento=" + String(modoMantenimientoRemoto ? "1" : "0");
   Serial.println(framePortus("HBT", "estado", payload, txSeqPortus++));
 }
 
 void emitirEventoGruaPortus(const char* evt) {
   String payload = "evt=" + String(evt) + ";estado=" + String((int)estadoGrua) + ";pos=" + String(posicionActual);
   Serial.println(framePortus("EVT", "grua", payload, txSeqPortus++));
-}
-
-// Reporta el resultado del pesaje al servidor (antes solo se decidia localmente
-// contra PESO_DECLARADO/TOLERANCIA fijos en el firmware). El servidor es quien
-// deberia comparar contra el manifiesto real y decidir la retencion (RT01/RT02);
-// esto solo cubre la parte de "avisar", ver Observaciones_Firmware_PersonaA.md.
-void emitirEventoPesajePortus(float medido, float esperado, bool ok, bool deposito) {
-  String payload = "medido=" + String(medido, 1) +
-                    ";esperado=" + String(esperado, 1) +
-                    ";tolerancia=" + String(TOLERANCIA, 2) +
-                    ";resultado=" + String(ok ? "ok" : "fuera_tolerancia") +
-                    ";operacion=" + String(deposito ? "deposito" : "retiro");
-  Serial.println(framePortus("EVT", "pesaje", payload, txSeqPortus++));
 }
 
 void handleCmdPortus(const String& payload) {
@@ -865,10 +852,6 @@ void handleCmdPortus(const String& payload) {
       responderCmdPortus(false, name, "causa=trabajo_activo");
       return;
     }
-    if (camionPresente) {
-      responderCmdPortus(false, name, "causa=vehiculo_en_transferencia");
-      return;
-    }
     String valor = fieldPortus(payload, "valor");
     modoMantenimientoRemoto = (valor == "activar");
     responderCmdPortus(true, name, "");
@@ -879,13 +862,8 @@ void handleCmdPortus(const String& payload) {
     responderCmdPortus(true, name, "");
     return;
   }
-  if (name == "AgujaParqueo") {
+  if (name == "AgujaParqueo" || name == "AgujaLiberar") {
     aguja.write(AGUJA_BLOQUEO);
-    responderCmdPortus(true, name, "");
-    return;
-  }
-  if (name == "AgujaLiberar") {
-    aguja.write(AGUJA_LIBERANDO);
     responderCmdPortus(true, name, "");
     return;
   }
@@ -909,21 +887,7 @@ void handleCmdPortus(const String& payload) {
       responderCmdPortus(false, name, "causa=posicion_invalida");
       return;
     }
-    if (estadoPatio[p - 1] != BLOQUEADA) {
-      responderCmdPortus(false, name, "causa=posicion_no_bloqueada");
-      return;
-    }
-    if ((horizActivo || vertActivo) && (p == posicionActual || p == posicionDestino)) {
-      responderCmdPortus(false, name, "causa=posicion_en_trabajo");
-      return;
-    }
-    // NOTA (pendiente, ver Observaciones_Firmware_PersonaA.md): el PDF pide rechazar
-    // si "la inconsistencia fisica que origino el bloqueo persiste". El firmware no
-    // guarda que inconsistencia especifica motivo el bloqueo (ese contexto vive en el
-    // manifiesto/servidor), asi que no se puede verificar aqui sin arriesgar falsos
-    // rechazos (una celda puede estar fisicamente ocupada de forma legitima). Se deja
-    // documentado como limitacion conocida en vez de adivinar una heuristica.
-    estadoPatio[p - 1] = LIBRE;
+    if (estadoPatio[p - 1] == BLOQUEADA) estadoPatio[p - 1] = LIBRE;
     responderCmdPortus(true, name, "");
     return;
   }
@@ -944,9 +908,7 @@ void procesarComandosPortus() {
   String src, kind, topic, payload;
   long seq = 0;
   if (!parseFramePortus(line, src, seq, kind, topic, payload)) return;
-  ultimaActividadPiMs = millis();  // cualquier frame valido de la Pi cuenta como "hay enlace"
   if (kind == "CMD" && topic == "cmd") handleCmdPortus(payload);
-  // kind == "PIN" no requiere accion adicional: ya cumplio su proposito arriba.
 }
 
 

@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Optional
+from sqlalchemy import event
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -217,6 +218,19 @@ class Alarma(Base):
 
 
 def make_db(db_path: str):
-    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+
+    # Activa WAL: permite lecturas y escrituras concurrentes sin bloquear tanto
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, conn_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)
