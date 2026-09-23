@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 import paho.mqtt.client as mqtt
 import serial
 
-from protocol import encode_frame, parse_frame, payload_to_dict
+from protocol import FrameStreamDecoder, encode_frame, parse_frame, payload_to_dict
 
 
 @dataclass
@@ -34,7 +35,12 @@ class PortusBridge:
 
     def open_serial(self) -> None:
         for node in self.nodes.values():
-            node.ser = serial.Serial(node.port, node.baud, timeout=0.2)
+            # En Linux, exclusive=True impide que miniterm, otro bridge o un
+            # diagnostico consuman simultaneamente partes del mismo frame.
+            serial_options = {"timeout": 0.2}
+            if os.name == "posix":
+                serial_options["exclusive"] = True
+            node.ser = serial.Serial(node.port, node.baud, **serial_options)
             print(f"[SERIAL] {node.name} -> {node.port} @ {node.baud}")
 
     def start(self) -> None:
@@ -101,50 +107,44 @@ class PortusBridge:
 
     def read_loop(self, node: SerialNode):
         assert node.ser is not None
+        decoder = FrameStreamDecoder()
         while self.running:
             try:
-                line = node.ser.readline().decode("utf-8", errors="replace").strip()
-                if not line:
+                chunk = node.ser.read(node.ser.in_waiting or 1)
+                if not chunk:
                     continue
-                # Permite convivir con firmware legado que imprime logs libres.
-                if not line.startswith("<PORTUS|"):
-                    continue
-                frame = parse_frame(line)
-                if frame.seq <= node.last_seq:
-                    print(f"[WARN] {node.name} seq repetido/atrasado: {frame.seq}")
-                node.last_seq = frame.seq
-                data = payload_to_dict(frame.payload)
-
-                if frame.kind in ("EVT", "HBT"):
-                    topic = f"portus/evt/{frame.topic}"
-                    message = {
-                        "id": f"{frame.src}-{frame.seq}",
-                        "ts": int(time.time()),
-                        "origin": frame.src,
-                        "type": frame.kind,
-                        "seq": frame.seq,
-                        "data": data,
-                    }
-                    self.mqttc.publish(topic, json.dumps(message))
-                    if frame.kind == "HBT":
-                        self.mqttc.publish("portus/evt/estado", json.dumps(message))
-                    print(f"[SERIAL->MQTT] {topic} {message}")
-                elif frame.kind in ("ACK", "REJ"):
-                    message = {
-                        "id": f"{frame.src}-{frame.seq}",
-                        "ts": int(time.time()),
-                        "origin": frame.src,
-                        "type": frame.kind,
-                        "seq": frame.seq,
-                        "data": data,
-                    }
-                    self.mqttc.publish("portus/cmd/respuesta", json.dumps(message))
-                    print(f"[SERIAL->MQTT] portus/cmd/respuesta {message}")
-                else:
-                    print(f"[WARN] kind no reconocido: {frame.kind}")
+                for raw_frame in decoder.feed(chunk):
+                    self.process_frame(node, raw_frame)
             except Exception as exc:
                 print(f"[SERIAL] {node.name} error: {exc}")
                 time.sleep(0.2)
+
+    def process_frame(self, node: SerialNode, raw_frame: str) -> None:
+        frame = parse_frame(raw_frame)
+        if frame.seq <= node.last_seq:
+            print(f"[WARN] {node.name} seq repetido/atrasado: {frame.seq}")
+        node.last_seq = frame.seq
+        data = payload_to_dict(frame.payload)
+        message = {
+            "id": f"{frame.src}-{frame.seq}",
+            "ts": int(time.time()),
+            "origin": frame.src,
+            "type": frame.kind,
+            "seq": frame.seq,
+            "data": data,
+        }
+
+        if frame.kind in ("EVT", "HBT"):
+            topic = f"portus/evt/{frame.topic}"
+            self.mqttc.publish(topic, json.dumps(message))
+            if frame.kind == "HBT":
+                self.mqttc.publish("portus/evt/estado", json.dumps(message))
+            print(f"[SERIAL->MQTT] {topic} {message}")
+        elif frame.kind in ("ACK", "REJ"):
+            self.mqttc.publish("portus/cmd/respuesta", json.dumps(message))
+            print(f"[SERIAL->MQTT] portus/cmd/respuesta {message}")
+        else:
+            print(f"[WARN] kind no reconocido: {frame.kind}")
 
 
 def main():

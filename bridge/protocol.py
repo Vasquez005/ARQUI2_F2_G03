@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 
 
+FRAME_PREFIX = b"<PORTUS|"
+MAX_SERIAL_BUFFER = 2048
+
+
 @dataclass
 class Frame:
     src: str
@@ -9,6 +13,51 @@ class Frame:
     topic: str
     payload: str
     chk: str
+
+
+class FrameStreamDecoder:
+    """Extrae frames PORTUS completos de un flujo serial arbitrariamente cortado.
+
+    Los Arduino tambien imprimen mensajes de diagnostico. Esos bytes se descartan
+    hasta encontrar ``<PORTUS|``. El frame puede llegar repartido entre varias
+    lecturas sin perderse.
+    """
+
+    def __init__(self, max_buffer: int = MAX_SERIAL_BUFFER):
+        self._buffer = bytearray()
+        self._max_buffer = max_buffer
+
+    def feed(self, chunk: bytes) -> list[str]:
+        if chunk:
+            self._buffer.extend(chunk)
+
+        frames: list[str] = []
+        while True:
+            start = self._buffer.find(FRAME_PREFIX)
+            if start < 0:
+                # Conserva solo los bytes que aun podrian ser el inicio parcial
+                # del prefijo; evita crecimiento por los logs libres del firmware.
+                keep = min(len(self._buffer), len(FRAME_PREFIX) - 1)
+                if keep:
+                    del self._buffer[:-keep]
+                else:
+                    self._buffer.clear()
+                break
+
+            if start:
+                del self._buffer[:start]
+
+            end = self._buffer.find(b">", len(FRAME_PREFIX))
+            if end < 0:
+                if len(self._buffer) > self._max_buffer:
+                    del self._buffer[:-len(FRAME_PREFIX)]
+                break
+
+            raw = bytes(self._buffer[:end + 1])
+            del self._buffer[:end + 1]
+            frames.append(raw.decode("utf-8", errors="replace"))
+
+        return frames
 
 
 def checksum(content: str) -> str:
