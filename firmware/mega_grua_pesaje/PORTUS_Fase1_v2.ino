@@ -1,19 +1,38 @@
 /*
- * PORTUS - Fase 1 | Grua/Patio (sin pesaje)
+ * PORTUS - Fase 1 | Pesaje dinamico + Grua/Patio
  * Arduino Mega 2560
+ *
+ * CABLEADO PESAJE:
+ *   DT modulo A -> pin 50      LED verde -> A0
+ *   DT modulo B -> pin 51      LED ambar -> A1
+ *   SCK (ambos) -> pin 52      Servo aguja -> pin 53
  *
  * COMANDOS SERIAL (115200):
  *   P0 / HOME  -> regresar grua a transferencia
  *   RESET      -> releer patio desde sensores
- *   RETIRO     -> modo retiro (toma primera celda ocupada)
- *   DEPOSITO   -> modo deposito (toma camion y busca primera celda libre)
+ *   OK / RET   -> aprobar / retener turno manualmente (pruebas sin bascula)
+ *   PESO       -> ultimo peso medido y estado del turno
+ *   V          -> ver cada muestra del pesaje (diagnostico)
+ *   A          -> alternar aguja manualmente (diagnostico)
+ *   T          -> tarar plataforma
  */
 
 #include <Stepper.h>
+#include <Servo.h>
 
 // ════════════════════════════════════════════════════════════════════════════
 //  PINES
 // ════════════════════════════════════════════════════════════════════════════
+
+// --- PESAJE: PORTB del Mega (pin 50=PB3, 51=PB2, 52=PB1) ---
+// Se usa PORTB porque en el Mega los pines 2,3,4 NO comparten puerto.
+const uint8_t BIT_DT_A = (1 << 3); aq  // pin 50
+const uint8_t BIT_DT_B = (1 << 2);   // pin 51
+const uint8_t BIT_SCK  = (1 << 1);   // pin 52  (compartido por ambos modulos)
+
+const int PIN_LED_VERDE = A0;        // flecha verde recta
+const int PIN_LED_AMBAR = A1;        // flecha ambar al ramal
+const int PIN_AGUJA     = 53;        // servo de la aguja desviadora
 
 // --- GRUA ---
 const int PIN_ELECTROIMAN = 30;
@@ -31,6 +50,42 @@ const int PIN_LED_SEMAFORO_VERDE    = 49;
 const int PIN_LED_CELDA_LIBRE[4]   = {22, 25, 28, 44};  // P1..P4
 const int PIN_LED_CELDA_OCUPADA[4] = {23, 26, 29, 45};  // P1..P4
 
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CALIBRACION Y PARAMETROS - PESAJE
+// ════════════════════════════════════════════════════════════════════════════
+const float ESCALA_A = -66.000;
+const float ESCALA_B = -75.949;
+volatile long offsetA = 0;
+volatile long offsetB = 0;
+
+const float PESO_MIN_VALIDO = -200.0;   // filtro anti-saltos
+const float PESO_MAX_VALIDO = 5000.0;
+
+const int AGUJA_ABIERTA = 90;           // paso libre (default, fail-safe)
+const int AGUJA_BLOQUEO = 0;            // bloquea carril normal -> ramal
+
+// Umbrales: subir PRESENCIA si detecta mesetas con la plataforma vacia;
+// bajarlo si no detecta el camion. Debe quedar por encima del ruido.
+const float UMBRAL_PRESENCIA = 30.0;
+const float UMBRAL_VACIO     = 15.0;
+const float UMBRAL_PLANO     = 12.0;
+const int   VENTANA          = 5;
+const int   MIN_MUESTRAS     = 6;       // a 10 SPS no pidas mas de 6-8
+const int   MAX_MUESTRAS     = 60;
+const unsigned long BLOQUEO_MS = 1500;
+
+const int CICLOS_VACIO_MIN = 20;
+const unsigned long TARA_CADA_MS = 5000;
+
+// Tiempo que la plataforma debe estar vacia antes de reponer la aguja
+const unsigned long REARME_AGUJA_MS = 5000;
+unsigned long tPlataformaVacia = 0;
+
+// Manifiesto precargado (luego lo entrega la garita)
+const float TARA_CAMION    = 16.0;
+const float PESO_DECLARADO = 10.0;
+const float TOLERANCIA     = 0.30;
 bool esDeposito = true;
 
 
@@ -59,6 +114,7 @@ bool irOcupadoEnHigh = true;
 
 Stepper motorHorizontal(PASOS_POR_REVOLUCION, 8, 10, 9, 11);
 Stepper motorVertical  (PASOS_POR_REVOLUCION, 4, 6, 5, 7);
+Servo   aguja;
 const char* SRC_PORTUS = "MEGA_GRUA";
 
 
@@ -82,6 +138,38 @@ enum CodigoError {
 
 
 // ════════════════════════════════════════════════════════════════════════════
+//  ESTADO - PESAJE
+// ════════════════════════════════════════════════════════════════════════════
+const uint8_t BUF_SIZE = 32;
+volatile long bufA[BUF_SIZE];
+volatile long bufB[BUF_SIZE];
+volatile uint8_t bufHead = 0;
+volatile uint8_t bufTail = 0;
+volatile unsigned long totalMuestras = 0;
+
+float   ventana[VENTANA];
+uint8_t idxVentana   = 0;
+bool    ventanaLlena = false;
+
+float   muestras[MAX_MUESTRAS];
+uint8_t nMuestras = 0;
+bool    enMeseta  = false;
+unsigned long tFinMeseta = 0;
+
+int ciclosVacio = 0;
+unsigned long tUltimaTara = 0;
+
+bool verMuestras  = false;
+unsigned long tReporteSPS = 0;
+unsigned long muestrasPrev = 0;
+
+// ── ENLACE ENTRE MODULOS ──
+// La grua solo opera si el ultimo pesaje fue aprobado.
+bool  turnoAprobado   = false;
+float ultimoPesoBruto = 0.0;
+
+
+// ════════════════════════════════════════════════════════════════════════════
 //  ESTADO - GRUA
 // ════════════════════════════════════════════════════════════════════════════
 EstadoGrua  estadoGrua  = ST_REFERENCIANDO;
@@ -102,11 +190,9 @@ bool cicloCamionArmado = false;
 bool patioRechazadoEsteCamion = false;
 bool necesitaHomingP0  = false;
 bool regresoPostDeposito = false;
-bool retiroTomandoDesdePatio = false;
-bool omitirPrimeraMarcaRetorno = false;
+bool avisoRetencionDado  = false;
 bool gruaSuspendidaRemota = false;
 bool modoMantenimientoRemoto = false;
-int  posicionOrigenRetiro = 0;
 
 bool vertActivo   = false;
 bool vertSubiendo = false;
@@ -151,7 +237,6 @@ void sincronizarPatioFisico();
 void imprimirPatio();
 void inicializarPatioDesdeSensores();
 int  buscarPrimeraCeldaLibre();
-int  buscarPrimeraCeldaOcupada();
 void reservarCelda(int p);
 void liberarReserva(int p);
 bool confirmarDepositoFisico(int p);
@@ -183,14 +268,282 @@ void inicializarLedsEstado();
 void actualizarLedsSemaforo();
 void actualizarLedsCeldas();
 void actualizarLedsEstado();
+// pesaje
+void  leerAmbos(long &a, long &b);
+bool  sacarCrudo(long &a, long &b);
+void  autoTarar(long a, long b);
+void  taraInicial(uint8_t n);
+float calcularMediana(float *datos, uint8_t n);
+void  decidirRuta(float pesoBruto);
+void  actualizarPesaje();
+void  diagnosticoPesaje();
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PESAJE: lectura simultanea de los dos HX711
+//  Los 24 bits de ambos chips salen con el MISMO pulso de reloj, de modo que
+//  las dos conversiones corresponden al mismo instante del camion en marcha.
+// ════════════════════════════════════════════════════════════════════════════
+inline void leerAmbos(long &a, long &b) {
+  a = 0;
+  b = 0;
+
+  for (uint8_t i = 0; i < 24; i++) {
+    PORTB |= BIT_SCK;                          // reloj arriba
+    __asm__ __volatile__("nop\n\tnop");
+    a = (a << 1) | ((PINB & BIT_DT_A) ? 1 : 0);
+    b = (b << 1) | ((PINB & BIT_DT_B) ? 1 : 0);
+    PORTB &= ~BIT_SCK;                         // reloj abajo
+    __asm__ __volatile__("nop\n\tnop");
+  }
+
+  PORTB |= BIT_SCK;                            // pulso 25: canal A, ganancia 128
+  __asm__ __volatile__("nop\n\tnop");
+  PORTB &= ~BIT_SCK;
+
+  if (a & 0x800000L) a |= 0xFF000000L;         // extension de signo (24 bits)
+  if (b & 0x800000L) b |= 0xFF000000L;
+}
+
+
+// ── ISR Timer2: cada 1 ms. Corta y no bloquea ──
+// En el Mega la libreria Servo usa Timer5, asi que Timer2 queda libre.
+ISR(TIMER2_COMPA_vect) {
+  if ((PINB & BIT_DT_A) || (PINB & BIT_DT_B)) return;   // dato aun no listo
+
+  long a, b;
+  leerAmbos(a, b);
+
+  uint8_t next = (bufHead + 1) % BUF_SIZE;
+  if (next != bufTail) {
+    bufA[bufHead] = a;
+    bufB[bufHead] = b;
+    bufHead = next;
+    totalMuestras++;
+  }
+}
+
+
+bool sacarCrudo(long &a, long &b) {
+  if (bufTail == bufHead) return false;
+  noInterrupts();
+  a = bufA[bufTail];
+  b = bufB[bufTail];
+  bufTail = (bufTail + 1) % BUF_SIZE;
+  interrupts();
+  return true;
+}
+
+
+void autoTarar(long a, long b) {
+  noInterrupts();
+  offsetA = a;
+  offsetB = b;
+  interrupts();
+}
+
+
+void taraInicial(uint8_t n) {
+  long sumA = 0, sumB = 0, a, b;
+  for (uint8_t i = 0; i < n; i++) {
+    unsigned long t0 = millis();
+    while ((PINB & BIT_DT_A) || (PINB & BIT_DT_B)) {
+      if (millis() - t0 > 1000) {
+        Serial.println(F("!! HX711 sin respuesta. Revisa VCC/GND y pines 50/51/52."));
+        return;
+      }
+    }
+    leerAmbos(a, b);
+    sumA += a;
+    sumB += b;
+    delay(5);
+  }
+  offsetA = sumA / n;
+  offsetB = sumB / n;
+}
+
+
+void diagnosticoPesaje() {
+  Serial.println(F("--- Diagnostico pesaje ---"));
+  Serial.print(F("DT_A (50): "));
+  Serial.print((PINB & BIT_DT_A) ? F("HIGH") : F("LOW"));
+  Serial.print(F("   DT_B (51): "));
+  Serial.println((PINB & BIT_DT_B) ? F("HIGH") : F("LOW"));
+  Serial.println(F("(en reposo deben estar HIGH la mayor parte del tiempo)"));
+  Serial.print(F("Offset A: ")); Serial.print(offsetA);
+  Serial.print(F("   Offset B: ")); Serial.println(offsetB);
+  Serial.println(F("--------------------------"));
+}
+
+
+float calcularMediana(float *datos, uint8_t n) {
+  float copia[MAX_MUESTRAS];
+  for (uint8_t i = 0; i < n; i++) copia[i] = datos[i];
+
+  for (uint8_t i = 1; i < n; i++) {
+    float v = copia[i];
+    int j = i - 1;
+    while (j >= 0 && copia[j] > v) { copia[j + 1] = copia[j]; j--; }
+    copia[j + 1] = v;
+  }
+  return (n % 2) ? copia[n / 2] : (copia[n / 2 - 1] + copia[n / 2]) / 2.0;
+}
+
+
+void decidirRuta(float pesoBruto) {
+  ultimoPesoBruto = pesoBruto;
+
+  Serial.print(F("[PESAJE] Bruto: "));
+  Serial.print(pesoBruto, 1);
+  Serial.println(F(" g"));
+
+  float medido, esperado;
+  if (esDeposito) {
+    medido   = pesoBruto - TARA_CAMION;   // deposito: se valida el contenedor
+    esperado = PESO_DECLARADO;
+    Serial.print(F("[PESAJE] Contenedor: "));
+  } else {
+    medido   = pesoBruto;                 // retiro: al ingreso debe venir vacio
+    esperado = TARA_CAMION;
+    Serial.print(F("[PESAJE] Camion vacio: "));
+  }
+  Serial.print(medido, 1);
+  Serial.print(F(" g (esperado "));
+  Serial.print(esperado, 1);
+  Serial.println(F(" g)"));
+
+  bool ok = (abs(medido - esperado) <= esperado * TOLERANCIA);
+
+  if (ok) {
+    aguja.write(AGUJA_ABIERTA);
+    digitalWrite(PIN_LED_VERDE, HIGH);
+    digitalWrite(PIN_LED_AMBAR, LOW);
+    turnoAprobado = true;
+    Serial.println(F("[PESAJE] OK -> flecha verde, continua a transferencia"));
+  } else {
+    aguja.write(AGUJA_BLOQUEO);
+    digitalWrite(PIN_LED_VERDE, LOW);
+    digitalWrite(PIN_LED_AMBAR, HIGH);
+    turnoAprobado = false;
+    Serial.println(F("[PESAJE] FUERA DE TOLERANCIA -> flecha ambar, TURNO RETENIDO"));
+  }
+  avisoRetencionDado = false;
+  Serial.println();
+}
+
+
+// ── Procesa una muestra del buffer. No bloquea: si no hay dato, retorna. ──
+void actualizarPesaje() {
+  // Reporte de tasa de muestreo cada 5 s (diagnostico)
+  if (millis() - tReporteSPS >= 5000) {
+    unsigned long n = totalMuestras - muestrasPrev;
+    muestrasPrev = totalMuestras;
+    tReporteSPS  = millis();
+    if (n == 0) {
+      Serial.println(F("!! PESAJE sin muestras. Revisa cableado 50/51/52."));
+    } else if (n / 5 > 200) {
+      Serial.println(F("!! PESAJE lee basura (falta pullup en DT)."));
+    }
+  }
+
+  long crudoA, crudoB;
+  if (!sacarCrudo(crudoA, crudoB)) return;
+
+  float peso = (crudoA - offsetA) / ESCALA_A + (crudoB - offsetB) / ESCALA_B;
+
+  if (peso < PESO_MIN_VALIDO || peso > PESO_MAX_VALIDO) return;   // anti-saltos
+
+  if (verMuestras) Serial.println(peso, 1);
+
+  ventana[idxVentana] = peso;
+  idxVentana = (idxVentana + 1) % VENTANA;
+  if (idxVentana == 0) ventanaLlena = true;
+  if (!ventanaLlena) return;
+
+  float mx = ventana[0], mn = ventana[0];
+  for (uint8_t i = 1; i < VENTANA; i++) {
+    if (ventana[i] > mx) mx = ventana[i];
+    if (ventana[i] < mn) mn = ventana[i];
+  }
+  bool plano    = (mx - mn) < UMBRAL_PLANO;
+  bool presente = peso > UMBRAL_PRESENCIA;
+  bool vacio    = abs(peso) < UMBRAL_VACIO;
+
+    // --- Reposicion automatica de la aguja ---
+  if (vacio && !enMeseta) {
+    if (tPlataformaVacia == 0) tPlataformaVacia = millis();
+
+    if (millis() - tPlataformaVacia >= REARME_AGUJA_MS &&
+        aguja.read() != AGUJA_ABIERTA) {
+      aguja.write(AGUJA_ABIERTA);
+      digitalWrite(PIN_LED_VERDE, LOW);
+      digitalWrite(PIN_LED_AMBAR, LOW);
+      Serial.println(F("[PESAJE] Plataforma libre - aguja repuesta"));
+    }
+  } else {
+    tPlataformaVacia = 0;
+  }
+  
+
+  if (vacio && plano && !enMeseta) ciclosVacio++;
+  else                             ciclosVacio = 0;
+
+  if (ciclosVacio >= CICLOS_VACIO_MIN &&
+      (millis() - tUltimaTara > TARA_CADA_MS)) {
+    autoTarar(crudoA, crudoB);
+    tUltimaTara  = millis();
+    ciclosVacio  = 0;
+    ventanaLlena = false;
+    idxVentana   = 0;
+    return;
+  }
+
+  if (!enMeseta && plano && presente && (millis() - tFinMeseta > BLOQUEO_MS)) {
+    enMeseta  = true;
+    nMuestras = 0;
+    Serial.println(F("[PESAJE] Meseta detectada"));
+  }
+
+  if (enMeseta) {
+    if (plano && presente && nMuestras < MAX_MUESTRAS) {
+      muestras[nMuestras++] = peso;
+    } else {
+      if (nMuestras >= MIN_MUESTRAS) {
+        Serial.print(F("[PESAJE] ("));
+        Serial.print(nMuestras);
+        Serial.println(F(" muestras)"));
+        decidirRuta(calcularMediana(muestras, nMuestras));
+      }
+      enMeseta    = false;
+      tFinMeseta  = millis();
+      tUltimaTara = millis();
+    }
+  }
+}
 
 
 // ════════════════════════════════════════════════════════════════════════════
 //  SETUP
 // ════════════════════════════════════════════════════════════════════════════
 void setup() {
-  Serial.begin(115200);
-  Serial.setTimeout(50);
+  Serial.begin(9600);
+  Serial.setTimeout(50);            // evita bloqueo en readStringUntil
+
+  // --- Pesaje: DT como entrada CON PULLUP, SCK como salida (PORTB) ---
+  // El pullup es obligatorio: el HX711 deja DT en alta impedancia mientras
+  // convierte, y sin resistencia el pin flota y se lee como LOW permanente.
+  DDRB  &= ~(BIT_DT_A | BIT_DT_B);
+  PORTB |=  (BIT_DT_A | BIT_DT_B);   // <<< PULLUP INTERNO
+  DDRB  |=   BIT_SCK;
+  PORTB &=  ~BIT_SCK;
+
+  pinMode(PIN_LED_VERDE, OUTPUT);
+  pinMode(PIN_LED_AMBAR, OUTPUT);
+  digitalWrite(PIN_LED_VERDE, LOW);
+  digitalWrite(PIN_LED_AMBAR, LOW);
+
+  aguja.attach(PIN_AGUJA);
+  aguja.write(AGUJA_ABIERTA);       // default: paso libre (fail-safe)
 
   // --- Grua ---
   motorHorizontal.setSpeed(VELOCIDAD_MOTORES);
@@ -206,8 +559,28 @@ void setup() {
   digitalWrite(PIN_US_TRIG, LOW);
   inicializarLedsEstado();
 
-  Serial.println(F("=== PORTUS Fase 1 - Grua + Patio (sin pesaje) ==="));
+  Serial.println(F("=== PORTUS Fase 1 - Pesaje + Grua ==="));
   Serial.println(F("Riel: P1-P2-P3-P4-P0"));
+
+  delay(300);
+  diagnosticoPesaje();
+
+  Serial.println(F("Tarando plataforma, nada encima..."));
+  delay(2000);
+  taraInicial(20);
+
+  // --- Timer2 en CTC, interrupcion cada 1 ms ---
+  noInterrupts();
+  TCCR2A = 0;
+  TCCR2B = 0;
+  TCNT2  = 0;
+  OCR2A  = 249;                     // 16MHz / 64 / 250 = 1 kHz
+  TCCR2A |= (1 << WGM21);           // modo CTC
+  TCCR2B |= (1 << CS22);            // prescaler 64
+  TIMSK2 |= (1 << OCIE2A);
+  interrupts();
+  tUltimaTara = millis();
+  tReporteSPS = millis();
 
   autoDetectarPolaridadIR();
   inicializarPatioDesdeSensores();
@@ -238,7 +611,7 @@ void setup() {
     cambiarEstado(ST_ESPERANDO_CAMION);
   }
 
-  Serial.println(F("Comandos: P0 | RESET | RETIRO | DEPOSITO"));
+  Serial.println(F("Comandos: P0 | RESET | OK | RET | PESO | V | A | T | D"));
   Serial.println(framePortus("EVT", "grua", "evt=inicio;estado=boot", txSeqPortus++));
 }
 
@@ -247,6 +620,7 @@ void setup() {
 //  LOOP
 // ════════════════════════════════════════════════════════════════════════════
 void loop() {
+  actualizarPesaje();               // no bloqueante, cada pasada
   procesarComandosPortus();
   emitirHeartbeatPortus();
   procesarComandoSerial();
@@ -301,7 +675,9 @@ void actualizarLedsSemaforo() {
     }
     rojo = semaforoParpadeoOn;
   } else if (estadoGrua == ST_ESPERANDO_CAMION) {
-    verde = true;
+    // Turno retenido por pesaje: la transferencia no autoriza
+    if (camionEstable && !turnoAprobado) amarillo = true;
+    else                                 verde    = true;
     semaforoParpadeoOn = false;
   } else if (estadoGrua == ST_REVISANDO_PATIO || estadoGrua == ST_FINALIZADO) {
     amarillo = true;
@@ -482,11 +858,13 @@ void handleCmdPortus(const String& payload) {
     return;
   }
   if (name == "AgujaRecta") {
-    responderCmdPortus(false, name, "causa=pesaje_externo");
+    aguja.write(AGUJA_ABIERTA);
+    responderCmdPortus(true, name, "");
     return;
   }
   if (name == "AgujaParqueo" || name == "AgujaLiberar") {
-    responderCmdPortus(false, name, "causa=pesaje_externo");
+    aguja.write(AGUJA_BLOQUEO);
+    responderCmdPortus(true, name, "");
     return;
   }
   if (name == "PosicionBloquear") {
@@ -568,13 +946,50 @@ void procesarComandoSerial() {
     patioRechazadoEsteCamion = false;
     imprimirPatio();
   }
-  else if (cmd == "RETIRO") {
-    esDeposito = false;
-    Serial.println(F("[CMD] Modo RETIRO activado."));
+  else if (cmd == "OK") {           // pruebas sin bascula
+    turnoAprobado = true;
+    aguja.write(AGUJA_ABIERTA);
+    digitalWrite(PIN_LED_VERDE, HIGH);
+    digitalWrite(PIN_LED_AMBAR, LOW);
+    avisoRetencionDado = false;
+    Serial.println(F("[CMD] Turno APROBADO manualmente."));
   }
-  else if (cmd == "DEPOSITO") {
-    esDeposito = true;
-    Serial.println(F("[CMD] Modo DEPOSITO activado."));
+  else if (cmd == "RET") {          // pruebas del desvio
+    turnoAprobado = false;
+    aguja.write(AGUJA_BLOQUEO);
+    digitalWrite(PIN_LED_VERDE, LOW);
+    digitalWrite(PIN_LED_AMBAR, HIGH);
+    Serial.println(F("[CMD] Turno RETENIDO manualmente."));
+  }
+  else if (cmd == "PESO") {
+    Serial.print(F("[CMD] Ultimo bruto: "));
+    Serial.print(ultimoPesoBruto, 1);
+    Serial.print(F(" g | turno "));
+    Serial.println(turnoAprobado ? F("APROBADO") : F("RETENIDO"));
+  }
+  else if (cmd == "V") {            // ver cada muestra del pesaje
+    verMuestras = !verMuestras;
+    Serial.println(verMuestras ? F("[CMD] muestras ON") : F("[CMD] muestras OFF"));
+  }
+  else if (cmd == "A") {            // probar la aguja sin bascula
+    static bool ab = true;
+    ab = !ab;
+    aguja.write(ab ? AGUJA_ABIERTA : AGUJA_BLOQUEO);
+    digitalWrite(PIN_LED_VERDE, ab ? HIGH : LOW);
+    digitalWrite(PIN_LED_AMBAR, ab ? LOW : HIGH);
+    Serial.println(ab ? F("[CMD] aguja ABIERTA (90)") : F("[CMD] aguja BLOQUEO (0)"));
+  }
+  else if (cmd == "T") {            // tarar plataforma
+    long a, b;
+    if (sacarCrudo(a, b)) {
+      autoTarar(a, b);
+      Serial.println(F("[CMD] Plataforma tarada."));
+    } else {
+      Serial.println(F("[CMD] Sin muestras para tarar."));
+    }
+  }
+  else if (cmd == "D") {
+    diagnosticoPesaje();
   }
 }
 
@@ -615,64 +1030,53 @@ void ejecutarEstadoGrua() {
           millis() - camionAusenteDesdeMs >= TIEMPO_CAMION_AUSENTE_MS) {
         cicloCamionArmado        = false;
         patioRechazadoEsteCamion = false;
+        avisoRetencionDado       = false;
+        turnoAprobado            = false;   // el camion se fue: nuevo turno
         camionAusenteDesdeMs     = 0;
       }
       if (!camionEstable) break;
 
+      // ── ENLACE CON EL PESAJE ──
+      if (!turnoAprobado) {
+        if (!avisoRetencionDado) {
+          avisoRetencionDado = true;
+          Serial.println(F("[BLOQUEO] Turno retenido por pesaje. Grua no inicia."));
+        }
+        break;
+      }
+
       if (!cicloCamionArmado && !patioRechazadoEsteCamion) {
         cicloCamionArmado = true;
-        Serial.println(F("[OK] Camion detectado en transferencia."));
+        Serial.println(F("[OK] Camion en transferencia con pesaje aprobado."));
         reiniciarPatioLogicoDesdeSensores();
         cambiarEstado(ST_REVISANDO_PATIO);
       }
       break;
 
     case ST_REVISANDO_PATIO:
-      if (esDeposito) {
-        posicionDestino = buscarPrimeraCeldaLibre();
-        if (posicionDestino == 0) {
-          Serial.println(F("[ERROR] PATIO SIN POSICIONES DISPONIBLES"));
-          Serial.println(F("  Escribe RESET si las celdas estan vacias."));
-          ultimoError              = ERR_PATIO_LLENO;
-          patioRechazadoEsteCamion = true;
-          cicloCamionArmado        = true;
-          cambiarEstado(ST_ESPERANDO_CAMION);
-        } else {
-          reservarCelda(posicionDestino);
-          Serial.print(F("[OK] Destino P"));
-          Serial.print(posicionDestino);
-          Serial.println(F(" RESERVADA"));
-          retiroTomandoDesdePatio = false;
-          posicionOrigenRetiro = 0;
-          alturaSegura = false;
-          vertHechos   = 0;
-          cambiarEstado(ST_BAJANDO_ORIGEN);
-        }
+      posicionDestino = buscarPrimeraCeldaLibre();
+      if (posicionDestino == 0) {
+        Serial.println(F("[ERROR] PATIO SIN POSICIONES DISPONIBLES"));
+        Serial.println(F("  Escribe RESET si las celdas estan vacias."));
+        ultimoError              = ERR_PATIO_LLENO;
+        patioRechazadoEsteCamion = true;
+        cicloCamionArmado        = true;
+        cambiarEstado(ST_ESPERANDO_CAMION);
       } else {
-        posicionOrigenRetiro = buscarPrimeraCeldaOcupada();
-        if (posicionOrigenRetiro == 0) {
-          Serial.println(F("[ERROR] RETIRO SIN CELDAS OCUPADAS"));
-          ultimoError              = ERR_PATIO_LLENO;
-          patioRechazadoEsteCamion = true;
-          cicloCamionArmado        = true;
-          cambiarEstado(ST_ESPERANDO_CAMION);
-        } else {
-          reservarCelda(posicionOrigenRetiro);
-          posicionDestino = posicionOrigenRetiro;   // Primer tramo: ir a celda ocupada.
-          retiroTomandoDesdePatio = true;
-          Serial.print(F("[OK] Retiro origen P"));
-          Serial.print(posicionOrigenRetiro);
-          Serial.println(F(" RESERVADA"));
-          cambiarEstado(ST_MOVIENDO_DESTINO);
-        }
+        reservarCelda(posicionDestino);
+        Serial.print(F("[OK] Destino P"));
+        Serial.print(posicionDestino);
+        Serial.println(F(" RESERVADA"));
+        alturaSegura = false;
+        vertHechos   = 0;
+        cambiarEstado(ST_BAJANDO_ORIGEN);
       }
       break;
 
     case ST_BAJANDO_ORIGEN:
-      if (esDeposito && posicionActual != 0) { abortarOperacion(ERR_SIN_REFERENCIA); break; }
+      if (posicionActual != 0) { abortarOperacion(ERR_SIN_REFERENCIA); break; }
       if (!vertActivo && vertHechos == 0) {
-        if (esDeposito) Serial.println(F("Bajando cabezal en P0..."));
-        else            Serial.println(F("Bajando cabezal en celda de retiro..."));
+        Serial.println(F("Bajando cabezal en P0..."));
         iniciarMovimientoVertical(false, PASOS_BAJADA_ORIGEN);
       }
       if (!vertActivo && vertHechos >= PASOS_BAJADA_ORIGEN) {
@@ -697,38 +1101,22 @@ void ejecutarEstadoGrua() {
       }
       if (!vertActivo && alturaSegura) {
         Serial.println(F("[OK] Altura segura alcanzada"));
-        if (!esDeposito && retiroTomandoDesdePatio) {
-          // Retiro: al terminar la toma en patio, liberar celda origen y volver a P0.
-          retiroTomandoDesdePatio = false;
-          if (posicionOrigenRetiro >= 1 && posicionOrigenRetiro <= 4) {
-            estadoPatio[posicionOrigenRetiro - 1] = LIBRE;
-          }
-          posicionDestino = 0;
-        }
         cambiarEstado(ST_MOVIENDO_DESTINO);
       }
       break;
 
     case ST_MOVIENDO_DESTINO:
-      if (!alturaSegura) {
-        if (!vertActivo) {
-          Serial.println(F("Subiendo a altura segura para traslado..."));
-          iniciarMovimientoVertical(true, PASOS_SUBIDA_SEGURA);
-        }
-        break;
-      }
+      if (!alturaSegura) { abortarOperacion(ERR_SIN_REFERENCIA); break; }
       if (!horizActivo && posicionActual != posicionDestino) {
         Serial.print(F("Traslado hacia P"));
         Serial.println(posicionDestino);
-        // En retiro, cuando ya lleva carga y vuelve a transferencia, destino=0.
-        iniciarMovimientoHorizontal(posicionDestino == 0);
+        iniciarMovimientoHorizontal(false);
       }
       if (!horizActivo && posicionActual == posicionDestino) {
         Serial.print(F("[OK] Posicion destino P"));
         Serial.println(posicionActual);
         vertHechos = 0;
-        if (!esDeposito && retiroTomandoDesdePatio) cambiarEstado(ST_BAJANDO_ORIGEN);
-        else                                        cambiarEstado(ST_BAJANDO_DESTINO);
+        cambiarEstado(ST_BAJANDO_DESTINO);
       }
       break;
 
@@ -748,12 +1136,7 @@ void ejecutarEstadoGrua() {
         Serial.println(F("Electroiman OFF"));
       }
       faseInicioMs = millis();
-      if (!esDeposito && posicionDestino == 0) {
-        // Retiro final en transferencia: no existe sensor de celda en P0 para confirmar.
-        cambiarEstado(ST_SUBIENDO_CABEZAL);
-      } else {
-        cambiarEstado(ST_VERIFICANDO_DEPOSITO);
-      }
+      cambiarEstado(ST_VERIFICANDO_DEPOSITO);
       break;
 
     case ST_VERIFICANDO_DEPOSITO:
@@ -808,18 +1191,11 @@ void ejecutarEstadoGrua() {
       break;
 
     case ST_FINALIZADO:
-      if (esDeposito) {
-        Serial.print(F("DEPOSITO COMPLETADO | POSICION: P"));
-        Serial.print(posicionDestino);
-        Serial.println(F(" | GRUA EN P0"));
-      } else {
-        Serial.print(F("RETIRO COMPLETADO | ORIGEN: P"));
-        Serial.print(posicionOrigenRetiro);
-        Serial.println(F(" | ENTREGA EN P0"));
-      }
+      Serial.print(F("DEPOSITO COMPLETADO | POSICION: P"));
+      Serial.print(posicionDestino);
+      Serial.println(F(" | GRUA EN P0"));
       posicionDestino = 0;
-      posicionOrigenRetiro = 0;
-      retiroTomandoDesdePatio = false;
+      turnoAprobado   = false;      // cierra el turno; el siguiente vuelve a pesar
       cambiarEstado(ST_ESPERANDO_CAMION);
       break;
 
@@ -882,16 +1258,6 @@ void iniciarMovimientoHorizontal(bool haciaP0) {
   moviendoHaciaP0 = haciaP0;
   horizActivo     = true;
   pasosSinMarca   = 0;
-  if (!haciaP0) omitirPrimeraMarcaRetorno = false;
-  if (
-      haciaP0 &&
-      (estadoGrua == ST_REGRESANDO_P0 || (estadoGrua == ST_MOVIENDO_DESTINO && posicionDestino == 0)) &&
-      posicionActual >= 1 && posicionActual <= 4
-  ) {
-    // Si salimos desde una celda y estamos sobre la marca actual, primero
-    // esperar a liberarla antes de volver a contar marcas.
-    omitirPrimeraMarcaRetorno = (digitalRead(PIN_OPTICO) == LOW || optEstable == LOW);
-  }
 }
 
 void actualizarMovimientoHorizontal() {
@@ -964,17 +1330,6 @@ void actualizarMarcaOptica() {
   if (!horizActivo) {
     if (optEstable == HIGH) optSobreMarca = false;
     return;
-  }
-
-  if (omitirPrimeraMarcaRetorno && moviendoHaciaP0) {
-    if (optEstable == HIGH) {
-      omitirPrimeraMarcaRetorno = false;
-      optSobreMarca = false;
-      Serial.println(F("  Marca inicial liberada, conteo retorno habilitado"));
-    } else {
-      optSobreMarca = true;
-      return;
-    }
   }
 
   if (optEstable == LOW && !optSobreMarca) {
@@ -1111,14 +1466,6 @@ int buscarPrimeraCeldaLibre() {
   for (int i = 0; i < 4; i++) {
     if (estadoPatio[i] == BLOQUEADA) continue;
     if (!celdaFisicamenteOcupada(i + 1)) return i + 1;
-  }
-  return 0;
-}
-
-int buscarPrimeraCeldaOcupada() {
-  for (int i = 0; i < 4; i++) {
-    if (estadoPatio[i] == BLOQUEADA) continue;
-    if (celdaFisicamenteOcupada(i + 1)) return i + 1;
   }
   return 0;
 }

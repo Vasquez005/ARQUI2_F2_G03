@@ -45,7 +45,7 @@ String camionesDentro[MAX_DENTRO];
 int totalDentro = 0;
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   Serial.setTimeout(20);
   commEntrada.begin(9600);
 
