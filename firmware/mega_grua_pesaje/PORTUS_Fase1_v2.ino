@@ -189,29 +189,8 @@ void actualizarLedsEstado();
 //  SETUP
 // ════════════════════════════════════════════════════════════════════════════
 void setup() {
-<<<<<<< HEAD
-  Serial.begin(115200);
-  Serial.setTimeout(50);
-=======
   Serial.begin(9600);
-  Serial.setTimeout(50);            // evita bloqueo en readStringUntil
-
-  // --- Pesaje: DT como entrada CON PULLUP, SCK como salida (PORTB) ---
-  // El pullup es obligatorio: el HX711 deja DT en alta impedancia mientras
-  // convierte, y sin resistencia el pin flota y se lee como LOW permanente.
-  DDRB  &= ~(BIT_DT_A | BIT_DT_B);
-  PORTB |=  (BIT_DT_A | BIT_DT_B);   // <<< PULLUP INTERNO
-  DDRB  |=   BIT_SCK;
-  PORTB &=  ~BIT_SCK;
-
-  pinMode(PIN_LED_VERDE, OUTPUT);
-  pinMode(PIN_LED_AMBAR, OUTPUT);
-  digitalWrite(PIN_LED_VERDE, LOW);
-  digitalWrite(PIN_LED_AMBAR, LOW);
-
-  aguja.attach(PIN_AGUJA);
-  aguja.write(AGUJA_ABIERTA);       // default: paso libre (fail-safe)
->>>>>>> 1348ba4f1a40eb2667a17f9fe0263de328e7cd50
+  Serial.setTimeout(50);
 
   // --- Grua ---
   motorHorizontal.setSpeed(VELOCIDAD_MOTORES);
