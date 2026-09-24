@@ -1,0 +1,466 @@
+"""Bot del transportista (Persona D) — Fase_2_PORTUS.md sec. 6 y 9.
+
+Integrado con el backend de B: usa la MISMA base de datos (backend/portus_core.db)
+y los mismos modelos (backend/models.py). Ya no hay datos semilla propios: los
+transportistas, manifiestos, turnos y citas son los reales del sistema.
+
+- Las citas se guardan en la tabla `citas` de B, que es la que la garita usa
+  para decidir RT04 (llegada fuera de ventana).
+- Los avisos automaticos (sec. 6.3) los redacta el servidor en la tabla
+  `notificaciones`; este bot solo los envia y marca como enviados.
+"""
+
+import asyncio
+import os
+import sys
+from datetime import datetime, timedelta
+from typing import Optional
+
+BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "backend"))
+sys.path.insert(0, BACKEND_DIR)
+
+from sqlalchemy import func, select  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+
+import servicios  # noqa: E402
+from catalogos import (  # noqa: E402
+    CITAS_POR_FRANJA, ESTADOS_FINALES, MINUTOS_FRANJA, TOLERANCIA_VENTANA_MIN,
+)
+from models import (  # noqa: E402
+    Cita, Manifiesto, Notificacion, PosicionPatio, Transportista, Turno, make_db,
+)
+
+try:
+    from telegram import Update
+    from telegram.ext import Application, ContextTypes, MessageHandler, filters
+except Exception:
+    Update = object  # type: ignore
+    Application = None  # type: ignore
+    ContextTypes = None  # type: ignore
+    MessageHandler = None  # type: ignore
+    filters = None  # type: ignore
+
+
+DB_PATH = os.getenv("PORTUS_DB_PATH", os.path.join(BACKEND_DIR, "portus_core.db"))
+SessionLocal = make_db(DB_PATH)
+
+NOMBRE_TERMINAL = "Terminal Portuaria PORTUS"
+FRANJAS_A_OFRECER = 4
+DIAS_BUSQUEDA_FRANJAS = 7
+
+COMANDOS = [
+    ("/inicio", "Presenta el servicio y lista los comandos"),
+    ("/vincular CODIGO", "Asocia tu cuenta con el codigo que te dio la terminal"),
+    ("/cita", "Solicita una cita para un contenedor con levante otorgado"),
+    ("/miscitas", "Lista tus citas y su estado"),
+    ("/estado CONTENEDOR", "Consulta el estado de uno de tus contenedores"),
+    ("/misturnos", "Lista tus operaciones en curso"),
+    ("/ayuda", "Repite esta lista de comandos"),
+]
+
+# Sec. 6.1.5: un usuario no vinculado recibe SIEMPRE la misma respuesta.
+MSG_NO_VINCULADO = (
+    f"Bienvenido al servicio de {NOMBRE_TERMINAL}.\n"
+    "Tu cuenta no esta vinculada. Pide un codigo de vinculacion a la terminal y escribe:\n"
+    "/vincular CODIGO"
+)
+MSG_NO_RECONOCIDO = "Comando no reconocido. Escribe /ayuda para ver los comandos disponibles."
+MSG_SIN_CARGA = "No tienes carga asociada a ese identificador."
+
+ESTADO_DOCUMENTAL_TEXTO = {
+    "declarado": "Manifiesto declarado (sin levante)",
+    "declaracion_presentada": "Declaracion presentada (sin levante)",
+    "levante_solicitado": "Levante solicitado (pendiente)",
+    "levante_otorgado": "Levante otorgado",
+    "levante_retenido": "Levante retenido",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Consultas (siempre filtradas por el transportista vinculado — sec. 6.3)
+# ══════════════════════════════════════════════════════════════════════════
+
+def get_transportista_by_chat(db: Session, chat_id: str) -> Optional[Transportista]:
+    return db.scalar(select(Transportista).where(Transportista.chat_id == chat_id))
+
+
+def manifiesto_del_transportista(db: Session, trans: Transportista, contenedor_id: str) -> Optional[Manifiesto]:
+    return db.scalars(
+        select(Manifiesto)
+        .where(Manifiesto.contenedor_id == contenedor_id, Manifiesto.transportista_id == trans.id)
+        .order_by(Manifiesto.id.desc())
+    ).first()
+
+
+def cita_vigente(db: Session, contenedor_id: str) -> Optional[Cita]:
+    return db.scalars(
+        select(Cita).where(Cita.contenedor_id == contenedor_id, Cita.estado == "programada")
+    ).first()
+
+
+def contenedores_elegibles(db: Session, trans: Transportista) -> list:
+    """Levante otorgado, sin cita vigente y sin turno todavia (sec. 6.2 /cita, 9.3, 9.4)."""
+    manifiestos = db.scalars(
+        select(Manifiesto).where(
+            Manifiesto.transportista_id == trans.id,
+            Manifiesto.estado_documental == "levante_otorgado",
+            Manifiesto.anulado.is_(False),
+        ).order_by(Manifiesto.id)
+    ).all()
+    elegibles = []
+    for m in manifiestos:
+        tiene_turno = db.scalars(select(Turno).where(Turno.manifiesto_id == m.id)).first() is not None
+        if not tiene_turno and cita_vigente(db, m.contenedor_id) is None:
+            elegibles.append(m)
+    return elegibles
+
+
+def citas_en_franja(db: Session, inicio: datetime) -> int:
+    return db.scalar(
+        select(func.count(Cita.id)).where(Cita.inicio == inicio, Cita.estado.in_(["programada", "cumplida"]))
+    ) or 0
+
+
+def proximas_franjas(db: Session, desde: datetime, cantidad: int = FRANJAS_A_OFRECER) -> list:
+    """Franjas de 15 min con capacidad (sec. 9.1, 9.2, 9.5). Las llenas no se ofrecen."""
+    actual = desde.replace(second=0, microsecond=0)
+    actual = actual.replace(minute=(actual.minute // MINUTOS_FRANJA) * MINUTOS_FRANJA)
+    if actual < desde:
+        actual += timedelta(minutes=MINUTOS_FRANJA)
+    limite = desde + timedelta(days=DIAS_BUSQUEDA_FRANJAS)
+    franjas = []
+    while actual < limite and len(franjas) < cantidad:
+        if citas_en_franja(db, actual) < CITAS_POR_FRANJA:
+            franjas.append((actual, actual + timedelta(minutes=MINUTOS_FRANJA)))
+        actual += timedelta(minutes=MINUTOS_FRANJA)
+    return franjas
+
+
+def texto_franja(inicio: datetime, fin: datetime) -> str:
+    return f"{servicios.hora_local(inicio, '%d/%m/%Y')} de {servicios.hora_local(inicio, '%H:%M')} a {servicios.hora_local(fin, '%H:%M')}"
+
+
+def estado_cita_texto(cita: Cita, ahora: datetime) -> str:
+    # No se escribe "vencida" en la BD: si el camion llega tarde, la garita
+    # necesita encontrar la cita "programada" para generar RT04.
+    if cita.estado == "programada" and ahora > cita.fin + timedelta(minutes=TOLERANCIA_VENTANA_MIN):
+        return "vencida"
+    return cita.estado
+
+
+def ubicacion_en_patio(db: Session, contenedor_id: str) -> Optional[str]:
+    for p in db.scalars(select(PosicionPatio).order_by(PosicionPatio.id)).all():
+        if p.contenedor_nivel1 == contenedor_id:
+            return f"Patio posicion {p.id}, nivel 1"
+        if p.contenedor_nivel2 == contenedor_id:
+            return f"Patio posicion {p.id}, nivel 2"
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Comandos
+# ══════════════════════════════════════════════════════════════════════════
+
+def cmd_inicio() -> str:
+    lineas = [f"Hola, bienvenido al servicio de {NOMBRE_TERMINAL}.", "", "Comandos disponibles:"]
+    lineas += [f"{c} - {d}" for c, d in COMANDOS]
+    return "\n".join(lineas)
+
+
+def cmd_ayuda() -> str:
+    return "Comandos disponibles:\n" + "\n".join(f"{c} - {d}" for c, d in COMANDOS)
+
+
+def cmd_vincular(db: Session, chat_id: str, codigo: Optional[str]) -> str:
+    if not codigo:
+        return "Uso: /vincular CODIGO (6 caracteres que te dio la terminal)."
+    codigo = codigo.strip().upper()
+    trans = db.scalar(select(Transportista).where(Transportista.codigo_vinculacion == codigo))
+    if not trans:
+        return "Codigo invalido o ya utilizado. Pide uno nuevo a la terminal."
+    if trans.codigo_expira_at is None or datetime.utcnow() > trans.codigo_expira_at:
+        return "El codigo esta vencido (duran 60 minutos). Pide uno nuevo a la terminal."
+    # Un chat solo puede representar a un transportista: si este chat estaba
+    # vinculado a otro, se desvincula para que nunca reciba carga ajena.
+    for otro in db.scalars(select(Transportista).where(Transportista.chat_id == chat_id)).all():
+        otro.chat_id = None
+    trans.chat_id = chat_id
+    trans.codigo_vinculacion = None  # un solo uso
+    trans.codigo_expira_at = None
+    db.commit()
+    return f"Vinculacion exitosa. Esta cuenta ahora representa a: {trans.nombre}.\n\n{cmd_ayuda()}"
+
+
+def cmd_cita(db: Session, trans: Transportista, args: list) -> str:
+    if not args:
+        elegibles = contenedores_elegibles(db, trans)
+        if not elegibles:
+            return "No tienes contenedores con levante otorgado pendientes de cita."
+        lista = "\n".join(f"- {m.contenedor_id} ({m.tipo_operacion}, canal {(m.canal or '-').upper()})" for m in elegibles)
+        return f"Contenedores disponibles para cita:\n{lista}\n\nEscribe /cita CONTENEDOR para ver los horarios."
+
+    contenedor = args[0].upper()
+    m = manifiesto_del_transportista(db, trans, contenedor)
+    if m is None:
+        return MSG_SIN_CARGA
+    if m not in contenedores_elegibles(db, trans):
+        if m.estado_documental != "levante_otorgado":
+            return f"El contenedor {contenedor} aun no tiene levante otorgado."
+        if cita_vigente(db, contenedor) is not None:
+            return f"El contenedor {contenedor} ya tiene una cita vigente. Revisa /miscitas."
+        return f"El contenedor {contenedor} ya tiene un turno en la terminal."
+
+    franjas = proximas_franjas(db, datetime.utcnow())
+    if not franjas:
+        return "No hay franjas con capacidad en los proximos dias."
+
+    if len(args) < 2:
+        lineas = [f"{i}. {texto_franja(s, e)}" for i, (s, e) in enumerate(franjas, start=1)]
+        return (f"Proximas franjas con capacidad para {contenedor}:\n" + "\n".join(lineas) +
+                f"\n\nEscribe /cita {contenedor} NUMERO para confirmar (ej. /cita {contenedor} 1).")
+
+    try:
+        eleccion = int(args[1])
+        if eleccion < 1:
+            raise IndexError
+        inicio, fin = franjas[eleccion - 1]
+    except (ValueError, IndexError):
+        return f"Opcion invalida. Escribe /cita {contenedor} para ver las franjas disponibles."
+
+    cita = Cita(contenedor_id=contenedor, transportista_id=trans.id, inicio=inicio, fin=fin, estado="programada")
+    db.add(cita)
+    db.commit()
+    return (f"Cita confirmada.\nContenedor: {contenedor}\n"
+            f"Fecha: {servicios.hora_local(inicio, '%d/%m/%Y')}\n"
+            f"Hora de inicio: {servicios.hora_local(inicio, '%H:%M')}\n"
+            f"Hora de fin: {servicios.hora_local(fin, '%H:%M')}\n"
+            f"Debes presentarte entre el inicio y {TOLERANCIA_VENTANA_MIN} minutos despues del fin.")
+
+
+def cmd_miscitas(db: Session, trans: Transportista) -> str:
+    rows = db.scalars(
+        select(Cita).where(Cita.transportista_id == trans.id).order_by(Cita.inicio.desc()).limit(10)
+    ).all()
+    if not rows:
+        return "No tienes citas registradas."
+    ahora = datetime.utcnow()
+    lineas = [f"- {c.contenedor_id} | {texto_franja(c.inicio, c.fin)} | {estado_cita_texto(c, ahora)}" for c in rows]
+    return "Tus citas:\n" + "\n".join(lineas)
+
+
+def cmd_estado(db: Session, trans: Transportista, contenedor: Optional[str]) -> str:
+    if not contenedor:
+        return "Uso: /estado CONTENEDOR"
+    contenedor = contenedor.upper()
+    m = manifiesto_del_transportista(db, trans, contenedor)
+    if m is None:
+        return MSG_SIN_CARGA
+
+    turno = db.scalars(select(Turno).where(Turno.manifiesto_id == m.id).order_by(Turno.id.desc())).first()
+    ubicacion = ubicacion_en_patio(db, contenedor)
+    if turno is not None and turno.estado not in ESTADOS_FINALES:
+        estado = f"Turno {turno.estado} (estacion: {turno.estacion_actual or '-'})"
+    elif m.anulado:
+        estado = "Manifiesto anulado"
+    elif turno is not None:
+        estado = f"Turno {turno.estado}"
+    else:
+        estado = ESTADO_DOCUMENTAL_TEXTO.get(m.estado_documental, m.estado_documental)
+
+    permanencia = "-"
+    if ubicacion:
+        deposito = db.scalars(
+            select(Turno).where(Turno.contenedor_id == contenedor, Turno.tipo_operacion == "DEPOSITO",
+                                Turno.closed_at.is_not(None)).order_by(Turno.id.desc())
+        ).first()
+        if deposito is not None:
+            permanencia = servicios.duracion_texto(deposito.closed_at)
+
+    return (f"Contenedor: {contenedor}\n"
+            f"Estado: {estado}\n"
+            f"Ubicacion: {ubicacion or 'No esta en patio'}\n"
+            f"Permanencia: {permanencia}\n"
+            f"Autorizacion: {ESTADO_DOCUMENTAL_TEXTO.get(m.estado_documental, m.estado_documental)}\n"
+            f"Canal: {(m.canal or '-').upper()}")
+
+
+def cmd_misturnos(db: Session, trans: Transportista) -> str:
+    rows = db.scalars(
+        select(Turno).where(Turno.transportista_id == trans.id, Turno.estado.not_in(ESTADOS_FINALES))
+        .order_by(Turno.id)
+    ).all()
+    if not rows:
+        return "No tienes turnos activos."
+    lineas = [f"- Vehiculo {t.vehiculo_uid} | {t.contenedor_id} | {t.tipo_operacion} | {t.estado} | {t.estacion_actual or '-'}"
+              for t in rows]
+    return "Tus turnos activos:\n" + "\n".join(lineas)
+
+
+def process_command(db: Session, chat_id: str, text: str) -> str:
+    """Nunca devuelve vacio: sec. 6.2 'el servicio nunca debera quedar sin responder'."""
+    parts = (text or "").strip().split()
+    if not parts:
+        return MSG_NO_RECONOCIDO
+    cmd = parts[0].lower().split("@")[0]  # en grupos Telegram manda /cmd@NombreBot
+    args = parts[1:]
+
+    if cmd == "/vincular":
+        return cmd_vincular(db, chat_id, args[0] if args else None)
+
+    trans = get_transportista_by_chat(db, chat_id)
+    if not trans:
+        return MSG_NO_VINCULADO
+
+    if cmd in ("/inicio", "/start"):
+        return cmd_inicio()
+    if cmd == "/ayuda":
+        return cmd_ayuda()
+    if cmd == "/cita":
+        return cmd_cita(db, trans, args)
+    if cmd == "/miscitas":
+        return cmd_miscitas(db, trans)
+    if cmd == "/estado":
+        return cmd_estado(db, trans, args[0] if args else None)
+    if cmd == "/misturnos":
+        return cmd_misturnos(db, trans)
+    return MSG_NO_RECONOCIDO
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Notificaciones automaticas (sec. 6.3)
+# ══════════════════════════════════════════════════════════════════════════
+
+def encolar_recordatorios(db: Session) -> int:
+    """Recordatorio 1 hora antes. Solo para citas pedidas con mas de 1 h de
+    anticipacion (si la pidio 20 min antes, no tiene sentido 'recordarle')."""
+    ahora = datetime.utcnow()
+    citas = db.scalars(
+        select(Cita).where(Cita.estado == "programada", Cita.inicio > ahora,
+                           Cita.inicio <= ahora + timedelta(hours=1))
+    ).all()
+    n = 0
+    for c in citas:
+        if c.created_at and c.created_at > c.inicio - timedelta(hours=1):
+            continue
+        ref = f"recordatorio:cita:{c.id}"
+        if db.scalar(select(Notificacion.id).where(Notificacion.referencia == ref)):
+            continue
+        servicios.encolar_notificacion(
+            db, c.transportista_id, "recordatorio_cita",
+            f"PORTUS: recordatorio, tu cita es en menos de 1 hora.\nContenedor: {c.contenedor_id}\n"
+            f"Ventana: {texto_franja(c.inicio, c.fin)}",
+            referencia=ref)
+        n += 1
+    db.commit()
+    return n
+
+
+def notificaciones_pendientes(db: Session) -> list:
+    """(notificacion, chat_id) de transportistas ya vinculados. Si aun no se
+    vinculan, el aviso queda en cola y sale cuando se vinculen."""
+    return db.execute(
+        select(Notificacion, Transportista.chat_id)
+        .join(Transportista, Transportista.id == Notificacion.transportista_id)
+        .where(Notificacion.sent_at.is_(None), Transportista.chat_id.is_not(None))
+        .order_by(Notificacion.id)
+    ).all()
+
+
+async def despachar_notificaciones(send) -> None:
+    with SessionLocal() as db:
+        encolar_recordatorios(db)
+        for notif, chat_id in notificaciones_pendientes(db):
+            try:
+                await send(chat_id, notif.texto)
+            except Exception as exc:  # un chat bloqueado no debe frenar a los demas
+                print(f"[NOTIF] error enviando #{notif.id} a {chat_id}: {exc}")
+                continue
+            notif.sent_at = datetime.utcnow()
+            db.commit()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Modos de ejecucion
+# ══════════════════════════════════════════════════════════════════════════
+
+async def telegram_mode(token: str) -> None:
+    app = Application.builder().token(token).build()
+
+    async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_chat or not update.effective_message:
+            return
+        with SessionLocal() as db:
+            reply = process_command(db, str(update.effective_chat.id), update.effective_message.text or "")
+        await update.effective_message.reply_text(reply)
+
+    # Un solo handler para TODO texto (comandos y no comandos): asi cualquier
+    # cosa recibe respuesta, incluido lo que no es un comando valido.
+    app.add_handler(MessageHandler(filters.TEXT, on_text))
+
+    async def send(chat_id: str, text: str) -> None:
+        await app.bot.send_message(chat_id=chat_id, text=text)
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    print("Bot Telegram activo.")
+    while True:
+        try:
+            await despachar_notificaciones(send)
+        except Exception as exc:
+            print(f"[NOTIF] error: {exc}")
+        await asyncio.sleep(3)
+
+
+def cli_mode() -> None:
+    print("Modo simulacion CLI (sin PORTUS_BOT_TOKEN). BD:", DB_PATH)
+    print("Utilitarios: transportistas | gen-code <id> | chat <chat_id> <texto> | notifs | exit")
+
+    async def send(chat_id: str, text: str) -> None:
+        print(f"[NOTIF -> chat {chat_id}]\n{text}\n")
+
+    while True:
+        try:
+            line = input("> ").strip()
+        except EOFError:
+            break
+        if line == "exit":
+            break
+        if line == "transportistas":
+            with SessionLocal() as db:
+                for t in db.scalars(select(Transportista).order_by(Transportista.id)).all():
+                    print(f"  id={t.id} {t.nombre} chat={t.chat_id} codigo={t.codigo_vinculacion}")
+            continue
+        if line.startswith("gen-code "):
+            with SessionLocal() as db:
+                t = db.get(Transportista, int(line.split()[1]))
+                if not t:
+                    print("Transportista no existe")
+                    continue
+                print("Codigo generado:", servicios.generar_codigo_vinculacion(db, t))
+                db.commit()
+            continue
+        if line.startswith("chat "):
+            parts = line.split(maxsplit=2)
+            if len(parts) < 3:
+                print("Uso: chat <chat_id> <texto>")
+                continue
+            with SessionLocal() as db:
+                print(process_command(db, parts[1], parts[2]))
+            continue
+        if line == "notifs":
+            asyncio.run(despachar_notificaciones(send))
+            continue
+        print("Utilitario no reconocido.")
+
+
+def main() -> None:
+    token = os.getenv("PORTUS_BOT_TOKEN")
+    if token and Application is not None:
+        asyncio.run(telegram_mode(token))
+    else:
+        cli_mode()
+
+
+if __name__ == "__main__":
+    main()

@@ -15,7 +15,7 @@ import os
 from models import Transportista, Usuario, make_db
 from security import hash_password
 
-DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "portus_core.db"))
+DB_PATH = os.getenv("PORTUS_DB_PATH", os.path.abspath(os.path.join(os.path.dirname(__file__), "portus_core.db")))
 
 USUARIOS_MINIMOS = [
     ("terminal1", "TERMINAL", "Operador de Terminal"),

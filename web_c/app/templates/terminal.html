@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Interfaz TERMINAL</h1>
+
+<section class="panel">
+  <h2>Pestanas obligatorias</h2>
+  <div class="tabs">
+    {% for tab in tabs %}
+    <span class="tab">{{ tab }}</span>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Operacion (sinoptico en vivo por MQTT)</h2>
+  <div class="status-grid">
+    <div>
+      <strong>Enlace MQTT:</strong>
+      <span id="mqtt-connected">Desconectado</span>
+    </div>
+    <div>
+      <strong>Ultimo heartbeat:</strong>
+      <span id="mqtt-heartbeat">N/A</span>
+    </div>
+  </div>
+  <p class="muted">Canal en tiempo real: WebSocket + suscripcion MQTT (sin polling a DB).</p>
+</section>
+
+<section class="panel">
+  <h2>Eventos recientes</h2>
+  <div id="event-log" class="event-log"></div>
+</section>
+
+<section class="panel">
+  <h2>Comando remoto (TERMINAL)</h2>
+  <form id="command-form" class="inline-form">
+    <select id="command-input" required>
+      {% for c in comandos %}
+      <option value="{{ c }}">{{ c }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">Enviar</button>
+  </form>
+  <p class="muted">La respuesta del controlador (ACK/REJ) aparece en Eventos recientes, topico portus/cmd/respuesta.</p>
+  <pre id="command-result" class="command-result"></pre>
+</section>
+
+<section class="panel">
+  <h2>Vinculacion Bot Transportista (Integracion C + D)</h2>
+  <div class="status-grid">
+    <div>
+      <label for="transportista-select"><strong>Transportista:</strong></label>
+      <select id="transportista-select"></select>
+    </div>
+    <div>
+      <button id="refresh-transportistas" type="button">Actualizar lista</button>
+      <button id="generate-link-code" type="button">Generar codigo</button>
+    </div>
+  </div>
+  <pre id="link-code-result" class="command-result"></pre>
+</section>
+
+<script>
+  window.PORTUS_WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + window.location.host + "/ws/terminal";
+</script>
+<script src="/static/app.js"></script>
+{% endblock %}

@@ -6,7 +6,8 @@ no acoplar este modulo al cliente MQTT). Nada aqui asume una sesion HTTP real
 todavia — eso sigue pendiente de Persona C.
 """
 
-from datetime import datetime, timedelta
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from sqlalchemy import select
@@ -14,12 +15,13 @@ from sqlalchemy import select
 from catalogos import (
     ANULADO, CATALOGO_ALARMAS, CERRADO, EN_GARITA,
     EN_PESAJE_ENTRADA, EN_PESAJE_SALIDA, EN_RUTA, EN_SALIDA, EN_TRANSFERENCIA,
-    ESTADOS_FINALES, ROL_FACULTADO_POR_CAUSA, RESOLUCIONES, RETENIDO,
-    RT01, RT02, RT03, RT04, SEVERIDADES_AUTO_RECONOCIBLES, TRANSICIONES,
+    ESTADOS_FINALES, MINUTOS_EXPIRA_CODIGO, ROL_FACULTADO_POR_CAUSA, RESOLUCIONES, RETENIDO,
+    RT01, RT02, RT03, RT04, SEVERIDADES_AUTO_RECONOCIBLES, TOLERANCIA_VENTANA_MIN,
+    TRANSICIONES, ZONA_HORARIA,
 )
 from models import (
-    Alarma, Cita, LinkDevice, Manifiesto, ParqueoPlaza, PosicionPatio,
-    Retencion, Turno, EventoTurno,
+    Alarma, Cita, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
+    Retencion, Transportista, Turno, EventoTurno,
 )
 
 PublishFn = Callable[[str, str, dict], None]
@@ -59,12 +61,88 @@ def transicionar_turno(db, turno: Turno, nuevo_estado: str, origen: str = "servi
     registrar_evento(db, turno.id, origen, descripcion or f"Turno pasa a {nuevo_estado}", valores)
 
 
+def hora_local(dt_utc: Optional[datetime], formato: str = "%d/%m/%Y %H:%M") -> str:
+    """La BD guarda UTC (datetime.utcnow); a las personas se les muestra la hora de Guatemala."""
+    if dt_utc is None:
+        return "-"
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(ZONA_HORARIA)
+    except Exception:
+        tz = timezone(timedelta(hours=-6))
+    return dt_utc.replace(tzinfo=timezone.utc).astimezone(tz).strftime(formato)
+
+
+def duracion_texto(desde: Optional[datetime], hasta: Optional[datetime] = None) -> str:
+    if desde is None:
+        return "-"
+    minutos = int(((hasta or datetime.utcnow()) - desde).total_seconds() // 60)
+    return f"{minutos // 60} h {minutos % 60} min"
+
+
+def encolar_notificacion(db, transportista_id: Optional[int], evento: str, texto: str,
+                          referencia: Optional[str] = None) -> Optional[Notificacion]:
+    """Deja el aviso en la bandeja de salida; el bot (bot_d) lo envia."""
+    if transportista_id is None:
+        return None
+    n = Notificacion(transportista_id=transportista_id, evento=evento, texto=texto, referencia=referencia)
+    db.add(n)
+    return n
+
+
+_ALFABETO_CODIGO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O ni 1/I para que no se confundan al teclear
+
+
+def generar_codigo_vinculacion(db, transportista: Transportista) -> str:
+    """Sec. 6.1: 6 caracteres, un solo uso, expira a los 60 minutos. Generar
+    uno nuevo invalida el anterior. El bot lo consume con /vincular."""
+    while True:
+        codigo = "".join(secrets.choice(_ALFABETO_CODIGO) for _ in range(6))
+        if not db.scalars(select(Transportista).where(Transportista.codigo_vinculacion == codigo)).first():
+            break
+    transportista.codigo_vinculacion = codigo
+    transportista.codigo_expira_at = datetime.utcnow() + timedelta(minutes=MINUTOS_EXPIRA_CODIGO)
+    return codigo
+
+
+def _gramos(valor: Optional[int]) -> str:
+    return "-" if valor is None else f"{valor} g"
+
+
+def _texto_notificacion_turno(turno: Turno, evento: str, detalle: dict) -> str:
+    base = f"Vehiculo {turno.vehiculo_uid} | Contenedor {turno.contenedor_id}"
+    if evento == "retencion_generada":
+        texto = f"PORTUS: tu vehiculo fue RETENIDO.\n{base}\nCausa: {detalle.get('causa')}"
+        if detalle.get("plaza"):
+            texto += f"\nPlaza de parqueo: {detalle['plaza']}"
+        declarado, medido = detalle.get("peso_declarado_g"), detalle.get("peso_medido_g")
+        if detalle.get("causa") in (RT01, RT02) and declarado is not None and medido is not None:
+            texto += (f"\nPeso declarado: {_gramos(declarado)}\nPeso medido: {_gramos(medido)}"
+                      f"\nDiferencia: {abs(medido - declarado)} g")
+        return texto
+    if evento == "retencion_resuelta":
+        resolucion = detalle.get("resolucion")
+        texto = f"PORTUS: tu retencion fue resuelta ({resolucion}).\n{base}"
+        if resolucion == "corregir":
+            texto += f"\nNuevo peso declarado: {_gramos(detalle.get('peso_declarado_g'))}"
+        if resolucion == "rechazar":
+            texto += f"\nMotivo: {detalle.get('motivo')}\nEl turno fue ANULADO; el vehiculo sale sin completar la operacion."
+        return texto
+    if evento == "turno_cerrado":
+        return (f"PORTUS: turno CERRADO.\n{base}\nOperacion: {turno.tipo_operacion}"
+                f"\nTiempo total en la terminal: {duracion_texto(turno.created_at, turno.closed_at)}")
+    if evento == "turno_anulado":
+        return f"PORTUS: turno ANULADO.\n{base}\nCausa: {detalle.get('causa') or 'no indicada'}"
+    return f"PORTUS: {evento}\n{base}"
+
+
 def notificar_transportista(db, turno: Turno, evento: str, detalle: Optional[dict] = None) -> None:
-    """Persona D (bot) todavia no existe en este repo. Se deja constancia en la
-    linea de tiempo del turno para que quede visible que "aqui debia salir una
-    notificacion", en vez de fallar silenciosamente o inventar un canal."""
-    registrar_evento(db, turno.id, "servidor",
-                      f"[pendiente bot D] notificacion '{evento}' al transportista", detalle)
+    """Sec. 6.3: cada aviso va solo al transportista duenio del turno. Tambien
+    queda en la linea de tiempo para poder demostrar que se envio."""
+    detalle = detalle or {}
+    encolar_notificacion(db, turno.transportista_id, evento, _texto_notificacion_turno(turno, evento, detalle),
+                          referencia=f"turno:{turno.id}")
+    registrar_evento(db, turno.id, "servidor", f"Notificacion '{evento}' al transportista", detalle)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -220,6 +298,7 @@ def crear_retencion(db, turno: Turno, causa: str, estado_resume: str, estacion: 
     transicionar_turno(db, turno, RETENIDO, origen="servidor",
                         descripcion=f"Retenido por {causa}",
                         valores={"causa": causa, "plaza": plaza})
+    turno.estacion_actual = f"parqueo_plaza_{plaza}" if plaza is not None else (estacion or turno.estacion_actual)
 
     if plaza is not None:
         publish_cmd("AgujaParqueo", "MEGA_GRUA", {"plaza": plaza})
@@ -274,6 +353,7 @@ def resolver_retencion(db, retencion_id: int, resolucion: str, rol_usuario: str,
                 manifiesto.peso_declarado_g = retencion.peso_medido_g
             turno.peso_declarado_g = retencion.peso_medido_g
         turno.estado = retencion.estado_anterior  # continua el flujo, no pasa por transicionar_turno
+        turno.estacion_actual = retencion.estacion or turno.estacion_actual
         # (transicionar_turno valida el mapa "hacia adelante"; volver desde
         # Retenido es un caso especial de esta funcion, no del mapa general)
         registrar_evento(db, turno.id, "usuario",
@@ -312,7 +392,7 @@ def _cita_vigente(db, contenedor_id: str) -> Optional[Cita]:
 
 
 def _fuera_de_ventana(cita: Cita, ahora: datetime) -> bool:
-    return not (cita.inicio <= ahora <= cita.fin + timedelta(minutes=5))
+    return not (cita.inicio <= ahora <= cita.fin + timedelta(minutes=TOLERANCIA_VENTANA_MIN))
 
 
 def procesar_ingreso_garita(db, contenedor_id: str, vehiculo_uid: str,
@@ -338,8 +418,13 @@ def procesar_ingreso_garita(db, contenedor_id: str, vehiculo_uid: str,
     cita = _cita_vigente(db, contenedor_id)
     riesgo_conocido = (manifiesto.canal == "rojo") or (cita is not None and _fuera_de_ventana(cita, ahora))
     if riesgo_conocido and parqueo_lleno(db):
-        generar_alarma(db, "AL11", origen="garita", descripcion="Parqueo lleno, ingreso rechazado")
+        # La AL11 la registra app.py despues del rollback (si se agregara aqui,
+        # el rollback del rechazo la borraria junto con todo lo demas).
         raise ReglaDeNegocioError("parqueo_lleno")
+
+    if transportista_id is None:
+        # Sin esto el turno queda sin duenio y el bot no puede avisarle a nadie (sec. 6.3)
+        transportista_id = manifiesto.transportista_id
 
     turno = Turno(
         manifiesto_id=manifiesto.id, vehiculo_uid=vehiculo_uid, transportista_id=transportista_id,
@@ -351,6 +436,10 @@ def procesar_ingreso_garita(db, contenedor_id: str, vehiculo_uid: str,
     registrar_evento(db, turno.id, "servidor", "Ingreso autorizado por servidor",
                       {"contenedor_id": contenedor_id, "canal": manifiesto.canal})
     publish_cmd("AbrirTalanquera", "UNO_ENTRADA", {})
+
+    if cita is not None:
+        # Sec. 9.8: el cumplimiento de ventana se registra por cita (metrica de Reportes)
+        cita.estado = "vencida" if _fuera_de_ventana(cita, ahora) else "cumplida"
 
     if cita is not None and _fuera_de_ventana(cita, ahora):
         crear_retencion(db, turno, RT04, estado_resume=EN_PESAJE_ENTRADA, estacion="garita",
@@ -366,6 +455,7 @@ def procesar_pesaje_entrada(db, turno: Turno, peso_medido_g: int,
                             descripcion="Cruza plataforma de pesaje de entrada")
     elif turno.estado != EN_PESAJE_ENTRADA:
         raise ReglaDeNegocioError(f"turno_no_listo_para_pesaje_entrada:{turno.estado}")
+    turno.estacion_actual = "pesaje_entrada"
 
     manifiesto = db.get(Manifiesto, turno.manifiesto_id) if turno.manifiesto_id else None
     declarado = turno.peso_declarado_g or 0
@@ -386,6 +476,7 @@ def procesar_pesaje_entrada(db, turno: Turno, peso_medido_g: int,
         return
 
     transicionar_turno(db, turno, EN_RUTA, origen="controlador", descripcion="Pesaje de entrada dentro de tolerancia")
+    turno.estacion_actual = "ruta_transferencia"
 
 
 def procesar_pesaje_salida(db, turno: Turno, peso_medido_g: int,
@@ -395,6 +486,7 @@ def procesar_pesaje_salida(db, turno: Turno, peso_medido_g: int,
                             descripcion="Cruza plataforma de pesaje de salida")
     elif turno.estado != EN_PESAJE_SALIDA:
         raise ReglaDeNegocioError(f"turno_no_listo_para_pesaje_salida:{turno.estado}")
+    turno.estacion_actual = "pesaje_salida"
 
     manifiesto = db.get(Manifiesto, turno.manifiesto_id) if turno.manifiesto_id else None
     declarado = turno.peso_declarado_g or 0
@@ -410,11 +502,28 @@ def procesar_pesaje_salida(db, turno: Turno, peso_medido_g: int,
         return
 
     transicionar_turno(db, turno, EN_SALIDA, origen="controlador", descripcion="Pesaje de salida dentro de tolerancia")
+    turno.estacion_actual = "salida"
 
 
 def cerrar_turno(db, turno: Turno, publish_cmd: PublishFn = _noop_publish) -> None:
     transicionar_turno(db, turno, CERRADO, origen="servidor", descripcion="Turno cerrado")
     notificar_transportista(db, turno, "turno_cerrado", {"contenedor_id": turno.contenedor_id})
+
+
+def anular_turno(db, turno: Turno, causa: Optional[str] = None,
+                 publish_cmd: PublishFn = _noop_publish) -> None:
+    """Boton Anular de la pestania Turnos (sec. 4.2): anula y autoriza la salida
+    sin completar la operacion. Un turno Retenido se anula con Rechazar desde su
+    retencion (asi se libera la plaza y lo resuelve el rol facultado)."""
+    if turno.estado == RETENIDO:
+        raise ReglaDeNegocioError("turno_retenido_usar_rechazar_en_la_retencion")
+    if ANULADO not in TRANSICIONES.get(turno.estado, ()):
+        raise ReglaDeNegocioError(f"no_se_puede_anular_desde:{turno.estado}")
+    transicionar_turno(db, turno, ANULADO, origen="usuario",
+                        descripcion=f"Turno anulado por la terminal: {causa or 'sin causa indicada'}",
+                        valores={"causa": causa})
+    publish_cmd("AbrirPuertaSalida", "UNO_SALIDA", {"turno": turno.id})
+    notificar_transportista(db, turno, "turno_anulado", {"causa": causa})
 
 
 # ══════════════════════════════════════════════════════════════════════════

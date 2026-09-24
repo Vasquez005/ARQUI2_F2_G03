@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Login PORTUS</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="login-body">
+    <div class="login-card">
+      <h1>PORTUS Fase 2</h1>
+      <p>Ingreso a plataforma</p>
+      {% if error %}
+      <div class="error">{{ error }}</div>
+      {% endif %}
+      <form method="post" action="/login">
+        <label>Usuario</label>
+        <input name="username" required />
+        <label>Contrasena</label>
+        <input name="password" type="password" required />
+        <button type="submit">Entrar</button>
+      </form>
+    </div>
+  </body>
+</html>

@@ -11,14 +11,17 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 import servicios
-from catalogos import CAUSAS_RETENCION, DISPOSITIVOS, ROLES, UMBRAL_ENLACE_PERDIDO_S
+from catalogos import (
+    CAUSAS_RETENCION, DISPOSITIVOS, MINUTOS_EXPIRA_CODIGO, ROLES, UMBRAL_ENLACE_PERDIDO_S,
+)
 from models import (
     Alarma, CommandAudit, Declaracion, EventLog, EventoTurno, LinkDevice,
     LinkStatus, Manifiesto, ParqueoPlaza, PosicionPatio, Retencion, Turno,
-    Transportista, make_db,
+    Transportista, Usuario, make_db,
 )
+from security import verify_password
 
-DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "portus_core.db"))
+DB_PATH = os.getenv("PORTUS_DB_PATH", os.path.abspath(os.path.join(os.path.dirname(__file__), "portus_core.db")))
 SessionLocal = make_db(DB_PATH)
 MQTT_HOST = os.getenv("PORTUS_MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("PORTUS_MQTT_PORT", "1883"))
@@ -285,6 +288,32 @@ def _tiene_manifiesto_pendiente(db, contenedor_id: str) -> bool:
     return False
 
 
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/auth/login")
+def login(body: LoginIn):
+    """Lo usa la web (web_c) para validar credenciales contra la tabla usuarios
+    (contrasenas hasheadas, sec. 2.2). La sesion/cookie la maneja web_c."""
+    with SessionLocal() as db:
+        u = db.scalars(select(Usuario).where(Usuario.username == body.username)).first()
+        if not u or not u.activo or not verify_password(body.password, u.password_hash):
+            raise HTTPException(401, "credenciales_invalidas")
+        return {"id": u.id, "username": u.username, "rol": u.rol, "nombre": u.nombre}
+
+
+@app.get("/usuarios")
+def listar_usuarios(rol: Optional[str] = None):
+    with SessionLocal() as db:
+        q = select(Usuario)
+        if rol:
+            q = q.where(Usuario.rol == rol)
+        rows = db.scalars(q.order_by(Usuario.id)).all()
+        return [{"id": u.id, "username": u.username, "rol": u.rol, "nombre": u.nombre} for u in rows]
+
+
 class TransportistaIn(BaseModel):
     nombre: str
 
@@ -303,7 +332,19 @@ def crear_transportista(body: TransportistaIn):
 def listar_transportistas():
     with SessionLocal() as db:
         rows = db.scalars(select(Transportista).order_by(Transportista.id)).all()
-        return [{"id": t.id, "nombre": t.nombre} for t in rows]
+        return [{"id": t.id, "nombre": t.nombre, "vinculado": t.chat_id is not None} for t in rows]
+
+
+@app.post("/transportistas/{transportista_id}/codigo-vinculacion")
+def generar_codigo_vinculacion(transportista_id: int):
+    with SessionLocal() as db:
+        t = db.get(Transportista, transportista_id)
+        if not t:
+            raise HTTPException(404, "transportista_no_existe")
+        codigo = servicios.generar_codigo_vinculacion(db, t)
+        db.commit()
+        return {"transportistaId": t.id, "nombre": t.nombre, "codigo": codigo,
+                "expiraEnMinutos": MINUTOS_EXPIRA_CODIGO, "expiraLocal": servicios.hora_local(t.codigo_expira_at)}
 
 
 @app.post("/manifiestos")
@@ -334,7 +375,10 @@ def listar_manifiestos(naviera_usuario_id: Optional[int] = None, contenedor_id: 
         return [
             {"id": m.id, "contenedorId": m.contenedor_id, "tipoOperacion": m.tipo_operacion,
              "pesoDeclaradoG": m.peso_declarado_g, "toleranciaPct": m.tolerancia_pct,
-             "estadoDocumental": m.estado_documental, "canal": m.canal, "anulado": m.anulado}
+             "estadoDocumental": m.estado_documental, "canal": m.canal, "anulado": m.anulado,
+             "navieraUsuarioId": m.naviera_usuario_id, "transportistaId": m.transportista_id,
+             "pesoDeclaradoAnteriorG": m.peso_declarado_anterior_g, "observaciones": m.observaciones,
+             "createdAt": m.created_at.isoformat()}
             for m in rows
         ]
 
@@ -416,11 +460,23 @@ def resolver_levante(manifiesto_id: int, body: LevanteIn):
                 raise HTTPException(400, "canal_obligatorio_al_otorgar")
             m.estado_documental = "levante_otorgado"
             m.canal = body.canal
+            texto = (f"PORTUS: levante OTORGADO para el contenedor {m.contenedor_id}.\n"
+                     f"Canal asignado: {body.canal.upper()}")
+            if body.canal == "rojo":
+                texto += "\nEl vehiculo sera enviado a verificacion (parqueo) despues del pesaje de entrada."
+            texto += "\nYa puedes pedir tu cita con /cita."
+            servicios.encolar_notificacion(db, m.transportista_id, "levante_otorgado", texto,
+                                            referencia=f"manifiesto:{m.id}")
         else:
             if not body.motivo_retencion:
                 raise HTTPException(400, "motivo_obligatorio_al_retener")
             m.estado_documental = "levante_retenido"
             m.observaciones = (m.observaciones or "") + f"\n[levante retenido] {body.motivo_retencion}"
+            servicios.encolar_notificacion(
+                db, m.transportista_id, "levante_retenido",
+                f"PORTUS: levante RETENIDO para el contenedor {m.contenedor_id}.\n"
+                f"Motivo: {body.motivo_retencion}",
+                referencia=f"manifiesto:{m.id}")
         db.commit()
         return {"ok": True, "estadoDocumental": m.estado_documental, "canal": m.canal}
 
@@ -449,6 +505,10 @@ def garita_ingreso(body: IngresoIn):
             )
         except servicios.ReglaDeNegocioError as exc:
             db.rollback()
+            if str(exc) == "parqueo_lleno":
+                servicios.generar_alarma(db, "AL11", origen="garita",
+                                          descripcion=f"Parqueo lleno, ingreso rechazado ({body.contenedor_id})")
+                db.commit()
             raise HTTPException(409, str(exc))
         db.commit()
         return {"turnoId": turno.id, "estado": turno.estado}
@@ -571,6 +631,25 @@ def cerrar_turno_endpoint(turno_id: int):
             raise HTTPException(409, str(exc))
         db.commit()
         return {"ok": True}
+
+
+class AnularIn(BaseModel):
+    causa: Optional[str] = None
+
+
+@app.post("/turnos/{turno_id}/anular")
+def anular_turno_endpoint(turno_id: int, body: AnularIn):
+    with SessionLocal() as db:
+        t = db.get(Turno, turno_id)
+        if not t:
+            raise HTTPException(404, "turno_no_existe")
+        try:
+            servicios.anular_turno(db, t, body.causa, publish_cmd=make_publish_and_audit(db))
+        except servicios.ReglaDeNegocioError as exc:
+            db.rollback()
+            raise HTTPException(409, str(exc))
+        db.commit()
+        return {"ok": True, "estado": t.estado}
 
 
 class RetenerManualIn(BaseModel):

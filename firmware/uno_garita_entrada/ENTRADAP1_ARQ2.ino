@@ -24,6 +24,22 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 Servo talanquera;
 Servo agujaPesaje;
+const char* SRC = "UNO_ENTRADA";
+long txSeq = 1;
+unsigned long lastHeartbeatMs = 0;
+
+// ── Modo degradado (Observaciones_Firmware_PersonaA.md, punto 5) ──
+// La Pi manda un ping ("PIN") periodico; si no llega nada de ella en
+// UMBRAL_DEGRADADO_MS se asume enlace perdido y se rechazan ingresos nuevos
+// (Fase_2_PORTUS.md sec. 12.1.3). Requiere que bridge.py mande ese ping.
+unsigned long ultimaActividadPiMs = 0;
+const unsigned long UMBRAL_DEGRADADO_MS = 10000;
+bool modoDegradado = false;
+
+// ── Mensaje de rechazo no bloqueante (antes usaba delay(2500)) ──
+bool mostrandoRechazo = false;
+unsigned long tRechazoMs = 0;
+const unsigned long DURACION_MENSAJE_RECHAZO_MS = 2500;
 
 const int BARRA_ABAJO  = 90;
 const int BARRA_ARRIBA = 0;
@@ -46,6 +62,7 @@ enum FasePesaje { P_INACTIVO, P_CUENTA_ATRAS, P_ABIERTA, P_RECHAZADO };
 FasePesaje fasePesaje = P_INACTIVO;
 unsigned long tPesaje = 0;
 int camionEnPesaje = -1;
+String uidEnPesaje = "";
 
 const int NUM_CAMIONES = 4;
 
@@ -78,9 +95,9 @@ bool rechazarEnPesaje[NUM_CAMIONES] = {
   true       // pasa la garita pero la aguja NO se abre
 };
 
-
 void setup() {
   Serial.begin(9600);
+  Serial.setTimeout(20);
   commSalida.begin(9600);
 
   pinMode(PIN_IR_ANTES, INPUT);
@@ -111,21 +128,41 @@ void setup() {
   mostrarEspera();
 
   Serial.println(F("=== Garita ENTRADA + Pesaje lista ==="));
+  sendFrame("EVT", "garita", F("estado=iniciando;garita=entrada"));
 }
 
-
 void loop() {
-
+  procesarComandosRemotos();
+  actualizarModoDegradado();
   actualizarPesaje();        // corre siempre, no bloquea
 
+  if (millis() - lastHeartbeatMs >= 5000) {
+    lastHeartbeatMs = millis();
+    sendFrame("HBT", "estado", String(F("garita=entrada;barra=")) + (barraAbierta ? "abierta" : "cerrada") +
+              ";pesaje=" + nombreFasePesaje() + ";degradado=" + (modoDegradado ? "1" : "0"));
+  }
+
+  if (mostrandoRechazo) {
+    if (millis() - tRechazoMs >= DURACION_MENSAJE_RECHAZO_MS) {
+      mostrandoRechazo = false;
+      mostrarReposo();
+    }
+    return;  // sigue mostrando el mensaje; no lee una tarjeta nueva todavia
+  }
+
   if (!barraAbierta) {
+    // Un solo vehiculo a la vez en la zona de pesaje: si el anterior todavia
+    // no termina, la siguiente tarjeta espera (no se lee) en vez de pisar
+    // camionEnPesaje y reiniciar la cuenta de 10 s del vehiculo anterior.
+    if (fasePesaje != P_INACTIVO) return;
+
     if (!mfrc522.PICC_IsNewCardPresent()) return;
     if (!mfrc522.PICC_ReadCardSerial())   return;
 
     semaforoAmarillo();
     lcd.clear();
     lcd.setCursor(0, 0);
-    lcd.print("Validando...");
+    lcd.print(F("Validando..."));
 
     String uid = "";
     for (byte i = 0; i < mfrc522.uid.size; i++) {
@@ -138,14 +175,20 @@ void loop() {
 
     Serial.print(F("UID leido: "));
     Serial.println(uid);
+    sendFrame("EVT", "garita", String(F("evento=rfid;uid=")) + uid);
+
+    if (modoDegradado) {
+      rechazar(F("Modo degradado"));
+      return;
+    }
 
     int idx = buscarCamion(uid);
 
-    if (idx == -1)                        { rechazar("RFID no reconoc"); return; }
-    if (!camionAutorizado[idx])           { rechazar("No autorizado");   return; }
-    if (manifiestoOperacion[idx] == "")   { rechazar("Sin manifiesto");  return; }
+    if (idx == -1)                        { rechazar(F("RFID no reconoc")); return; }
+    if (!camionAutorizado[idx])           { rechazar(F("No autorizado"));   return; }
+    if (manifiestoOperacion[idx] == "")   { rechazar(F("Sin manifiesto"));  return; }
     if (manifiestoOperacion[idx] != "DEPOSITO" &&
-        manifiestoOperacion[idx] != "RETIRO") { rechazar("Op invalida"); return; }
+        manifiestoOperacion[idx] != "RETIRO") { rechazar(F("Op invalida")); return; }
 
     autorizar(idx, uid);
   }
@@ -158,25 +201,25 @@ void loop() {
 
     // cierre normal: el camion paso completo
     if (llegoAlDespues && !hayAntes && !hayDespues) {
-      cerrarBarra("Barra ENTRADA ABAJO");
+      cerrarBarra(F("Barra ENTRADA ABAJO"), F("barra_abajo"));
     }
     // cierre forzado: pasaron 20 s sin detectar el paso
     else if (millis() - tBarraAbierta >= TIMEOUT_BARRA) {
-      cerrarBarra("Barra ABAJO por tiempo");
+      cerrarBarra(F("Barra ABAJO por tiempo"), F("barra_abajo_timeout"));
     }
   }
 }
 
-
-void cerrarBarra(const char* msg) {
+void cerrarBarra(const __FlashStringHelper* msg, const __FlashStringHelper* evento) {
   talanquera.write(BARRA_ABAJO);
   barraAbierta = false;
   llegoAlDespues = false;
   semaforoRojo();
-  mostrarEspera();
+  if (fasePesaje == P_INACTIVO) mostrarReposo();
+  else if (fasePesaje == P_CUENTA_ATRAS) mostrarLCD(F("Garita entrada"), F("Espere pesaje"));
   Serial.println(msg);
+  sendFrame("EVT", "garita", String(F("evento=")) + evento + F(";garita=entrada"));
 }
-
 
 // ════════════════════════════════════════════════
 //  PESAJE - la aguja esta ABAJO por defecto
@@ -198,14 +241,18 @@ void actualizarPesaje() {
           flechas(true, false);
           Serial.println(F("[PESAJE] Peso dentro de tolerancia"));
           Serial.println(F("[PESAJE] APROBADO -> AGUJA ARRIBA, flecha verde"));
-          mostrarLCD("PESAJE OK", "Puede avanzar");
+          mostrarLCD(F("PESAJE OK"), F("Puede avanzar"));
+          sendFrame("EVT", "pesaje", String(F("evento=meseta;resultado=ok;uid=")) + uidEnPesaje +
+                    ";op=" + manifiestoOperacion[camionEnPesaje] + ";aguja=abierta");
           irAPesaje(P_ABIERTA);
         } else {
           agujaPesaje.write(AGUJA_ABAJO);     // se queda cerrada
           flechas(false, true);
           Serial.println(F("[PESAJE] RT01 discrepancia de peso"));
           Serial.println(F("[PESAJE] RECHAZADO -> AGUJA CERRADA, flecha ambar"));
-          mostrarLCD("RT01 RECHAZADO", "Peso incorrecto");
+          mostrarLCD(F("RT01 RECHAZADO"), F("Peso incorrecto"));
+          sendFrame("EVT", "pesaje", String(F("evento=meseta;resultado=fuera_tolerancia;causa=RT01;uid=")) + uidEnPesaje +
+                    ";op=" + manifiestoOperacion[camionEnPesaje] + ";aguja=cerrada");
           irAPesaje(P_RECHAZADO);
         }
       }
@@ -217,8 +264,8 @@ void actualizarPesaje() {
         agujaPesaje.write(AGUJA_ABAJO);
         flechas(false, false);
         Serial.println(F("[PESAJE] AGUJA ABAJO - lista para el siguiente\n"));
-        if (!barraAbierta) mostrarEspera();
-        irAPesaje(P_INACTIVO);
+        sendFrame("EVT", "pesaje", String(F("evento=aguja_abajo;uid=")) + uidEnPesaje);
+        terminarPesaje();
       }
       break;
 
@@ -227,8 +274,8 @@ void actualizarPesaje() {
       if (millis() - tPesaje >= T_RECHAZO) {
         flechas(false, false);
         Serial.println(F("[PESAJE] Fin del rechazo - aguja sigue ABAJO\n"));
-        if (!barraAbierta) mostrarEspera();
-        irAPesaje(P_INACTIVO);
+        sendFrame("EVT", "pesaje", String(F("evento=fin_rechazo;uid=")) + uidEnPesaje);
+        terminarPesaje();
       }
       break;
   }
@@ -237,6 +284,22 @@ void actualizarPesaje() {
 void irAPesaje(FasePesaje f) {
   fasePesaje = f;
   tPesaje = millis();
+}
+
+void terminarPesaje() {
+  irAPesaje(P_INACTIVO);
+  camionEnPesaje = -1;
+  uidEnPesaje = "";
+  if (!barraAbierta && !mostrandoRechazo) mostrarReposo();
+}
+
+const char* nombreFasePesaje() {
+  switch (fasePesaje) {
+    case P_CUENTA_ATRAS: return "en_camino";
+    case P_ABIERTA:      return "aprobado";
+    case P_RECHAZADO:    return "rechazado";
+    default:             return "libre";
+  }
 }
 
 void flechas(bool verde, bool ambar) {
@@ -252,6 +315,112 @@ void mostrarLCD(String l1, String l2) {
   lcd.print(l2);
 }
 
+// ════════════════════════════════════════════════
+//  PROTOCOLO SERIAL PORTUS
+// ════════════════════════════════════════════════
+String toHex2(uint8_t v) {
+  const char* h = "0123456789ABCDEF";
+  String s = "";
+  s += h[(v >> 4) & 0xF];
+  s += h[v & 0xF];
+  return s;
+}
+
+String checksumBase(const String& base) {
+  uint16_t sum = 0;
+  for (size_t i = 0; i < base.length(); i++) sum += (uint8_t)base[i];
+  return toHex2((uint8_t)(sum % 256));
+}
+
+String makeFrame(const String& kind, const String& topic, const String& payload, long seq) {
+  String base = "PORTUS|" + String(SRC) + "|" + String(seq) + "|" + kind + "|" + topic + "|" + payload;
+  return "<" + base + "|" + checksumBase(base) + ">";
+}
+
+void sendFrame(const String& kind, const String& topic, const String& payload) {
+  Serial.println(makeFrame(kind, topic, payload, txSeq++));
+  Serial.flush();
+}
+
+bool parseFrame(String line, String& src, long& seq, String& kind, String& topic, String& payload) {
+  line.trim();
+  if (!line.startsWith("<") || !line.endsWith(">")) return false;
+  line = line.substring(1, line.length() - 1);
+
+  int p[7];
+  int idx = 0, from = 0;
+  while (idx < 6) {
+    int at = line.indexOf('|', from);
+    if (at < 0) return false;
+    p[idx++] = at;
+    from = at + 1;
+  }
+  if (line.substring(0, p[0]) != "PORTUS") return false;
+  src = line.substring(p[0] + 1, p[1]);
+  seq = line.substring(p[1] + 1, p[2]).toInt();
+  kind = line.substring(p[2] + 1, p[3]);
+  topic = line.substring(p[3] + 1, p[4]);
+  payload = line.substring(p[4] + 1, p[5]);
+  String chk = line.substring(p[5] + 1);
+
+  String base = "PORTUS|" + src + "|" + String(seq) + "|" + kind + "|" + topic + "|" + payload;
+  return checksumBase(base) == chk;
+}
+
+bool hayVehiculoDebajoTalanquera() {
+  return digitalRead(PIN_IR_ANTES) == LOW || digitalRead(PIN_IR_DESPUES) == LOW;
+}
+
+void handleCommand(const String& payload) {
+  if (payload.indexOf("target=UNO_ENTRADA") < 0) return;
+
+  if (payload.indexOf("name=AbrirTalanquera") >= 0) {
+    if (hayVehiculoDebajoTalanquera()) {
+      sendFrame("REJ", "cmd", F("name=AbrirTalanquera;causa=vehiculo_bajo_talanquera"));
+      return;
+    }
+    talanquera.write(BARRA_ARRIBA);
+    barraAbierta = true;
+    llegoAlDespues = false;
+    tBarraAbierta = millis();
+    semaforoVerde();
+    sendFrame("ACK", "cmd", F("name=AbrirTalanquera"));
+    return;
+  }
+
+  if (payload.indexOf("name=CerrarTalanquera") >= 0) {
+    if (hayVehiculoDebajoTalanquera()) {
+      sendFrame("REJ", "cmd", F("name=CerrarTalanquera;causa=vehiculo_bajo_talanquera"));
+      return;
+    }
+    talanquera.write(BARRA_ABAJO);
+    barraAbierta = false;
+    semaforoRojo();
+    sendFrame("ACK", "cmd", F("name=CerrarTalanquera"));
+    return;
+  }
+
+  sendFrame("REJ", "cmd", F("name=UNKNOWN;causa=comando_no_soportado"));
+}
+
+void procesarComandosRemotos() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  if (!line.startsWith("<PORTUS|")) return;
+  String src, kind, topic, payload;
+  long seq = 0;
+  if (!parseFrame(line, src, seq, kind, topic, payload)) return;
+  ultimaActividadPiMs = millis();  // cualquier frame valido (CMD o PIN) cuenta como "hay enlace"
+  if (kind == "CMD" && topic == "cmd") handleCommand(payload);
+}
+
+void actualizarModoDegradado() {
+  bool antes = modoDegradado;
+  modoDegradado = (millis() - ultimaActividadPiMs) > UMBRAL_DEGRADADO_MS;
+  if (antes != modoDegradado && !barraAbierta && !mostrandoRechazo && fasePesaje == P_INACTIVO) {
+    mostrarReposo();
+  }
+}
 
 // ════════════════════════════════════════════════
 //  GARITA
@@ -267,16 +436,20 @@ void rechazar(String motivo) {
   semaforoRojo();
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("RECHAZADO");
+  lcd.print(F("RECHAZADO"));
   lcd.setCursor(0, 1);
   lcd.print(motivo);
 
   Serial.print(F("RECHAZADO: "));
   Serial.println(motivo);
+  sendFrame("EVT", "garita", String(F("evento=rechazado;motivo=")) + motivo);
 
   mfrc522.PICC_HaltA();
-  delay(2500);
-  mostrarEspera();
+  // Antes: delay(2500) bloqueaba heartbeat/comandos/sensores/pesaje por 2.5s
+  // (ver Observaciones_Firmware_PersonaA.md, punto 7). Ahora el mensaje se
+  // muestra sin bloquear y loop() lo retira solo tras DURACION_MENSAJE_RECHAZO_MS.
+  mostrandoRechazo = true;
+  tRechazoMs = millis();
 }
 
 void autorizar(int idx, String uid) {
@@ -287,6 +460,7 @@ void autorizar(int idx, String uid) {
 
   commSalida.print("ENTRO:");
   commSalida.println(uid);
+  sendFrame("EVT", "garita", String(F("evento=autorizado;uid=")) + uid + ";op=" + manifiestoOperacion[idx]);
 
   talanquera.write(BARRA_ARRIBA);
   barraAbierta   = true;
@@ -296,15 +470,17 @@ void autorizar(int idx, String uid) {
   semaforoVerde();
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("AUTORIZADO");
+  lcd.print(F("AUTORIZADO"));
   lcd.setCursor(0, 1);
   lcd.print(manifiestoOperacion[idx]);
 
   mfrc522.PICC_HaltA();
 
   camionEnPesaje = idx;
+  uidEnPesaje = uid;
   irAPesaje(P_CUENTA_ATRAS);
   Serial.println(F("[PESAJE] Vehiculo en camino, 10 s..."));
+  sendFrame("EVT", "pesaje", String(F("evento=en_camino;uid=")) + uid + ";segundos=10");
 }
 
 void semaforoRojo() {
@@ -323,10 +499,23 @@ void semaforoVerde() {
   digitalWrite(PIN_LED_VERDE, HIGH);
 }
 
+void mostrarReposo() {
+  if (modoDegradado) mostrarDegradado();
+  else mostrarEspera();
+}
+
 void mostrarEspera() {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Garita entrada");
+  lcd.print(F("Garita entrada"));
   lcd.setCursor(0, 1);
-  lcd.print("Acerca tarjeta");
-  } 
+  lcd.print(F("Acerca tarjeta"));
+}
+
+void mostrarDegradado() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("MODO DEGRADADO"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Sin enlace a Pi"));
+}

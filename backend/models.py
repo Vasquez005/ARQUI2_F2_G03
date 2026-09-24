@@ -217,6 +217,23 @@ class Alarma(Base):
     ack_comentario: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
+class Notificacion(Base):
+    """Bandeja de salida hacia el bot (Persona D, Fase_2_PORTUS.md sec. 6.3).
+
+    El servidor inserta aqui el aviso ya redactado y el bot lo envia al chat
+    del transportista y marca sent_at. Si el bot esta apagado, los avisos se
+    quedan pendientes y salen al volver (no se pierden).
+    """
+    __tablename__ = "notificaciones"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    transportista_id: Mapped[int] = mapped_column(ForeignKey("transportistas.id"), index=True)
+    evento: Mapped[str] = mapped_column(String(32), index=True)
+    texto: Mapped[str] = mapped_column(Text)
+    referencia: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)  # ej. "cita:12"
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+
+
 def make_db(db_path: str):
     engine = create_engine(
         f"sqlite:///{db_path}",

@@ -12,8 +12,11 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
   - UNO garita salida
   - Mega grua/pesaje
 
-> Web (Persona C) y bot (Persona D) todavia no estan en este repo. `run_all.sh`
-> los arranca solo si existen las carpetas `fase2_persona_c/` y `fase2_persona_d/`.
+- Web (Persona C): login, permisos por rol y API de las 4 interfaces, sobre el backend de B.
+- Bot de Telegram (Persona D): vinculacion, citas y avisos al transportista, sobre la misma base de B.
+
+> Estado de integracion y pendientes: `docs originales/Observaciones_Integracion.md`,
+> `Observaciones_Web_PersonaC.md` y `Observaciones_Bot_PersonaD.md`.
 
 ---
 
@@ -29,6 +32,12 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
     security.py       # hash/verificacion de contrasenas
     seed.py           # crea los usuarios y transportistas minimos
     requirements.txt
+  web_c/
+    app/main.py       # web: sesion, permisos por rol, proxy hacia B, MQTT -> WebSocket
+    app/templates/    # login + interfaces TERMINAL, NAVIERA, AGENTE, AUTORIDAD
+    app/static/
+  bot_d/
+    app/main.py       # bot de Telegram (o modo CLI sin token)
   bridge/
     bridge.py         # serial <-> MQTT
     protocol.py       # encode/parse de frames PORTUS
@@ -58,16 +67,17 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
    (ver `docs/protocolo_serial.md`).
 2. `bridge.py` valida checksum y secuencia.
 3. El bridge publica los eventos en MQTT `portus/evt/<topic>`.
-4. El backend consume `portus/evt/#`, guarda los eventos y expone una API HTTP
-   para la web y el bot.
-5. Los comandos remotos salen del backend (`POST /commands/send`) y se publican
-   en `portus/cmd/solicitud`.
+4. El backend consume `portus/evt/#` y guarda los eventos. La web tambien se
+   suscribe y los reenvia por WebSocket al sinoptico (sin polling).
+5. Los comandos remotos salen de la web -> backend (`POST /commands/send`) y se
+   publican en `portus/cmd/solicitud`.
 6. El bridge envia el comando al Arduino correcto y espera ACK/REJ.
 7. La respuesta se publica en `portus/cmd/respuesta`.
+8. El backend redacta los avisos al transportista en la tabla `notificaciones`
+   y el bot los envia.
 
-> Estado del firmware: `SALIDAP1_ARQ2.ino` y `PORTUS_Fase1_v2.ino` ya envian y
-> reciben frames `PORTUS`. `ENTRADAP1_ARQ2.ino` todavia solo imprime logs de texto,
-> asi que el bridge no recibe eventos de la garita de entrada.
+> Pendiente: el backend todavia no convierte los eventos del bridge en avances
+> de turno (ver `Observaciones_Integracion.md`, punto 3).
 
 ---
 
@@ -105,16 +115,14 @@ Desde la raiz del repo:
 UNO_ENTRADA_PORT=/dev/ttyACM0 \
 UNO_SALIDA_PORT=/dev/ttyACM1 \
 MEGA_GRUA_PORT=/dev/ttyACM2 \
-ARDUINO_BAUD=9600 \
+PORTUS_BOT_TOKEN="TOKEN_DE_TELEGRAM" \
+PORTUS_SECRET_KEY="una_clave_larga" \
 bash run_all.sh
 ```
 
-> **Baud rate:** los tres firmwares usan `Serial.begin(9600)`, pero `run_all.sh`
-> y `bridge.py` usan 115200 si no se indica otro valor. Pasa `ARDUINO_BAUD=9600`
-> o el bridge no va a poder leer los frames.
-
-El bridge solo se inicia si estan definidos los tres puertos. Sin Arduinos
-conectados, `bash run_all.sh` levanta solo Mosquitto y el backend.
+El bridge solo se inicia si estan definidos los tres puertos, y el bot solo si
+hay `PORTUS_BOT_TOKEN`. Sin nada de eso, `bash run_all.sh` levanta Mosquitto,
+el backend y la web.
 
 Variables opcionales:
 
@@ -123,13 +131,15 @@ Variables opcionales:
 | `PORTUS_MQTT_HOST` | `localhost` | Broker MQTT |
 | `PORTUS_MQTT_PORT` | `1883` | Puerto MQTT |
 | `PORTUS_START_LOCAL_MOSQUITTO` | `auto` | `auto`/`yes`/`no`: arranca Mosquitto con `mosquitto/mosquitto.conf` |
-| `ARDUINO_BAUD` | `115200` | Baud rate del bridge (usar `9600`) |
-| `PORTUS_BOT_TOKEN` | vacio | Token del bot (Persona D) |
+| `ARDUINO_BAUD` | `9600` | Baud rate del bridge (igual que los firmwares) |
+| `PORTUS_BOT_TOKEN` | vacio | Token del bot de Telegram (Persona D) |
+| `PORTUS_SECRET_KEY` | clave de ejemplo | Firma de las cookies de sesion de la web. Cambiarla en la Pi |
+| `PORTUS_BACKEND_BIND` | `127.0.0.1` | Donde escucha el backend. Dejarlo local: la web aplica los permisos |
 
 Servicios:
 
-- Backend: http://localhost:8100 (health en `/health`, docs en `/docs`)
-- Web C: http://localhost:8000 (cuando exista)
+- Web: http://<ip-de-la-pi>:8000
+- Backend: http://localhost:8100 (health en `/health`, docs en `/docs`), solo desde la propia Pi
 
 Estado y logs resumidos (los logs quedan en `.runtime/logs/`):
 
@@ -158,8 +168,17 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cd bridge
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python3 -u bridge.py \
-  --uno-entrada /dev/ttyACM0 --uno-salida /dev/ttyACM1 --mega-grua /dev/ttyACM2 \
-  --baud 9600
+  --uno-entrada /dev/ttyACM0 --uno-salida /dev/ttyACM1 --mega-grua /dev/ttyACM2
+
+# Web
+cd web_c
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# Bot (sin PORTUS_BOT_TOKEN entra en modo CLI para probar comandos)
+cd bot_d
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+PORTUS_BOT_TOKEN=... .venv/bin/python3 app/main.py
 ```
 
 ### Usuarios de prueba
@@ -171,7 +190,9 @@ cd backend
 
 Crea (sin duplicar) los usuarios `terminal1`, `naviera1`, `naviera2`, `agente1`,
 `autoridad1` y dos transportistas, todos con la contrasena de demostracion
-definida en `seed.py`. Cambiarla antes de usarla como credencial real.
+definida en `seed.py`. `run_all.sh` lo corre solo. Estos son los usuarios con
+los que se entra a la web. Los transportistas no tienen usuario web: se vinculan
+al bot con un codigo que genera la terminal.
 
 ### Pruebas del protocolo
 

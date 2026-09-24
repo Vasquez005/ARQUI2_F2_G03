@@ -78,4 +78,11 @@ CATALOGO_ALARMAS = {
 SEVERIDADES_AUTO_RECONOCIBLES = ("media", "baja")  # boton "Reconocer todas" (sec. 4.6)
 
 DISPOSITIVOS = ("UNO_ENTRADA", "UNO_SALIDA", "MEGA_GRUA")
+
+# ── Citas (sec. 9) y vinculacion del bot (sec. 6.1) ──
+MINUTOS_FRANJA = 15
+CITAS_POR_FRANJA = 2
+TOLERANCIA_VENTANA_MIN = 5
+MINUTOS_EXPIRA_CODIGO = 60
+ZONA_HORARIA = "America/Guatemala"  # la BD guarda UTC; a las personas se les muestra hora local
 UMBRAL_ENLACE_PERDIDO_S = 15  # ~3 latidos de 5s (sec. 10.2)

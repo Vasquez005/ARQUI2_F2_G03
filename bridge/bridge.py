@@ -154,7 +154,7 @@ def main():
     parser.add_argument("--uno-entrada", required=True)
     parser.add_argument("--uno-salida", required=True)
     parser.add_argument("--mega-grua", required=True)
-    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--baud", type=int, default=9600)
     args = parser.parse_args()
 
     nodes = [

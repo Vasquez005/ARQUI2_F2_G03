@@ -4,3 +4,9 @@ venv/
 __pycache__/
 *.pyc
 .env
+
+# Base de datos local (la crea backend/seed.py al arrancar)
+*.db
+*.db-wal
+*.db-shm
+.runtime/

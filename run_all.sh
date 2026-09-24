@@ -28,9 +28,13 @@ START_LOCAL_MOSQUITTO="${PORTUS_START_LOCAL_MOSQUITTO:-auto}"  # auto|yes|no
 UNO_ENTRADA_PORT="${UNO_ENTRADA_PORT:-}"
 UNO_SALIDA_PORT="${UNO_SALIDA_PORT:-}"
 MEGA_GRUA_PORT="${MEGA_GRUA_PORT:-}"
-ARDUINO_BAUD="${ARDUINO_BAUD:-115200}"
+ARDUINO_BAUD="${ARDUINO_BAUD:-9600}"  # los 3 firmwares usan Serial.begin(9600)
 
 BOT_TOKEN="${PORTUS_BOT_TOKEN:-}"
+# B solo escucha en localhost: la web (C) es la unica puerta de entrada HTTP y
+# es la que aplica los permisos por rol antes de llamar a B.
+BACKEND_BIND="${PORTUS_BACKEND_BIND:-127.0.0.1}"
+SECRET_KEY="${PORTUS_SECRET_KEY:-portus_cambiar_clave}"
 
 echo "[PORTUS] ROOT_DIR=$ROOT_DIR"
 echo "[PORTUS] MQTT=$MQTT_HOST:$MQTT_PORT"
@@ -78,8 +82,9 @@ start_proc "backend_b" \
   "cd '$ROOT_DIR/backend' && \
    python3 -m venv .venv >/dev/null 2>&1 || true && \
    .venv/bin/python3 -m pip install -q -r requirements.txt && \
+   .venv/bin/python3 seed.py && \
    PORTUS_MQTT_HOST='$MQTT_HOST' PORTUS_MQTT_PORT='$MQTT_PORT' \
-   .venv/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8100"
+   .venv/bin/python3 -m uvicorn app:app --host '$BACKEND_BIND' --port 8100"
 
 # 2) Bridge A+B (solo si hay puertos definidos)
 if [[ -n "$UNO_ENTRADA_PORT" && -n "$UNO_SALIDA_PORT" && -n "$MEGA_GRUA_PORT" ]]; then
@@ -98,34 +103,31 @@ else
   echo "[WARN] Bridge serial no iniciado (faltan UNO_ENTRADA_PORT/UNO_SALIDA_PORT/MEGA_GRUA_PORT)."
 fi
 
-# 3) Web C (todavia no existe en este repo — ver Observaciones_Backend_PersonaB.md)
-if [[ -d "$ROOT_DIR/fase2_persona_c" ]]; then
-  start_proc "web_c" \
-    "cd '$ROOT_DIR/fase2_persona_c' && \
-     python3 -m venv .venv >/dev/null 2>&1 || true && \
-     .venv/bin/python3 -m pip install -q -r requirements.txt && \
-     PORTUS_MQTT_HOST='$MQTT_HOST' PORTUS_MQTT_PORT='$MQTT_PORT' \
-     .venv/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
-else
-  echo "[WARN] Web C no iniciada (no existe la carpeta fase2_persona_c todavia)."
-fi
+# 3) Web C
+start_proc "web_c" \
+  "cd '$ROOT_DIR/web_c' && \
+   python3 -m venv .venv >/dev/null 2>&1 || true && \
+   .venv/bin/python3 -m pip install -q -r requirements.txt && \
+   PORTUS_MQTT_HOST='$MQTT_HOST' PORTUS_MQTT_PORT='$MQTT_PORT' \
+   PORTUS_BACKEND_URL='http://127.0.0.1:8100' PORTUS_SECRET_KEY='$SECRET_KEY' \
+   .venv/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
-# 4) Bot D (todavia no existe en este repo, y ademas requiere token)
-if [[ -n "$BOT_TOKEN" && -d "$ROOT_DIR/fase2_persona_d" ]]; then
+# 4) Bot D (requiere token; sin token su modo CLI es interactivo y no sirve en segundo plano)
+if [[ -n "$BOT_TOKEN" ]]; then
   start_proc "bot_d" \
-    "cd '$ROOT_DIR/fase2_persona_d' && \
+    "cd '$ROOT_DIR/bot_d' && \
      python3 -m venv .venv >/dev/null 2>&1 || true && \
      .venv/bin/python3 -m pip install -q -r requirements.txt && \
-     PORTUS_BOT_TOKEN='$BOT_TOKEN' .venv/bin/python3 app/main.py"
+     PORTUS_BOT_TOKEN='$BOT_TOKEN' .venv/bin/python3 -u app/main.py"
 else
-  echo "[WARN] Bot D no iniciado (falta PORTUS_BOT_TOKEN o no existe fase2_persona_d todavia)."
+  echo "[WARN] Bot D no iniciado (falta PORTUS_BOT_TOKEN). Para probarlo sin Telegram: cd bot_d && python3 app/main.py"
 fi
 
 cat <<EOF
 
 [PORTUS] Arranque completado.
-- Backend B health: http://localhost:8100/health
-- Web C:            http://localhost:8000 (si existe)
+- Web C:            http://<ip-de-la-pi>:8000
+- Backend B health: http://localhost:8100/health (solo desde la propia Pi)
 
 Logs:
   $LOG_DIR
