@@ -526,7 +526,7 @@ void actualizarPesaje() {
 //  SETUP
 // ════════════════════════════════════════════════════════════════════════════
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   Serial.setTimeout(50);            // evita bloqueo en readStringUntil
 
   // --- Pesaje: DT como entrada CON PULLUP, SCK como salida (PORTB) ---
