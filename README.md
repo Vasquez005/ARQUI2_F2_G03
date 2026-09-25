@@ -15,8 +15,7 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
 - Web (Persona C): login, permisos por rol y API de las 4 interfaces, sobre el backend de B.
 - Bot de Telegram (Persona D): vinculacion, citas y avisos al transportista, sobre la misma base de B.
 
-> Estado de integracion y pendientes: `docs originales/Observaciones_Integracion.md`,
-> `Observaciones_Web_PersonaC.md` y `Observaciones_Bot_PersonaD.md`.
+> Estado y pendientes por fase: `docs originales/Plan_de_trabajo_final.md`.
 
 ---
 
@@ -30,7 +29,9 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
     servicios.py      # reglas de negocio (turnos, patio, parqueo, retenciones, alarmas)
     catalogos.py      # roles, dispositivos, causas de retencion, umbrales
     security.py       # hash/verificacion de contrasenas
-    seed.py           # crea los usuarios y transportistas minimos
+    orquestador.py    # eventos de la maqueta -> avance del turno (garitas, pesaje, salida)
+    seed.py           # usuarios, transportistas y tarjetas RFID (--demo: manifiestos de prueba)
+    test_orquestador.py
     requirements.txt
   web_c/
     app/main.py       # web: sesion, permisos por rol, proxy hacia B, MQTT -> WebSocket
@@ -53,7 +54,7 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
     protocolo_serial.md
     puertos_raspberry.md
     mosquitto.md
-  docs originales/    # enunciado, plan y observaciones de las personas A/B
+  docs originales/    # enunciado, plan original y plan de trabajo final
   run_all.sh
   status_all.sh
   stop_all.sh
@@ -76,8 +77,10 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
 8. El backend redacta los avisos al transportista en la tabla `notificaciones`
    y el bot los envia.
 
-> Pendiente: el backend todavia no convierte los eventos del bridge en avances
-> de turno (ver `Observaciones_Integracion.md`, punto 3).
+9. `backend/orquestador.py` convierte los eventos de garitas y pesaje en avances
+   del turno: la garita manda el UID, el servidor decide y responde
+   `AbrirTalanquera` / `RechazarIngreso` (y lo mismo en la salida). Ver
+   `docs/protocolo_serial.md`.
 
 ---
 
@@ -185,7 +188,8 @@ PORTUS_BOT_TOKEN=... .venv/bin/python3 app/main.py
 
 ```bash
 cd backend
-.venv/bin/python3 seed.py
+.venv/bin/python3 seed.py          # usuarios, transportistas y tarjetas RFID
+.venv/bin/python3 seed.py --demo   # ademas, manifiestos con levante para probar la maqueta
 ```
 
 Crea (sin duplicar) los usuarios `terminal1`, `naviera1`, `naviera2`, `agente1`,
@@ -194,11 +198,28 @@ definida en `seed.py`. `run_all.sh` lo corre solo. Estos son los usuarios con
 los que se entra a la web. Los transportistas no tienen usuario web: se vinculan
 al bot con un codigo que genera la terminal.
 
-### Pruebas del protocolo
+Tarjetas RFID de la maqueta:
+
+| UID | Transportista | Vehiculo | Uso en la demo |
+| --- | --- | --- | --- |
+| `E1 69 73 15` | Transportista Uno | C-001 | ciclo normal |
+| `E1 67 7F 15` | Transportista Dos | C-002 | ciclo normal |
+| `E1 8E 3C 53` | Transportista Uno | C-003 | peso fuera de tolerancia (RT01) |
+| `90 C7 3D 5F` | - | - | no registrada: rechazo en garita (E03) |
+
+Con `--demo` cada tarjeta registrada recibe un manifiesto con levante otorgado
+(canal verde), de modo que la garita puede abrir la talanquera.
+
+### Pruebas
 
 ```bash
+# Protocolo serial
 cd bridge
 python3 -m unittest test_protocol.py
+
+# Ciclo fisico del orquestador (sin MQTT ni Arduinos)
+cd backend
+.venv/bin/python3 -m unittest test_orquestador -v
 ```
 
 ---

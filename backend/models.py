@@ -91,6 +91,21 @@ class Transportista(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class Vehiculo(Base):
+    """Tarjeta RFID de un vehiculo y el transportista al que pertenece.
+
+    La garita solo conoce el UID de la tarjeta; con esta tabla el servidor
+    sabe de quien es el vehiculo y, por sus manifiestos, que contenedor trae
+    (fase 1 del plan: tarjeta -> contenedor).
+    """
+    __tablename__ = "vehiculos"
+    uid: Mapped[str] = mapped_column(String(32), primary_key=True)  # "E1 69 73 15"
+    transportista_id: Mapped[Optional[int]] = mapped_column(ForeignKey("transportistas.id"), nullable=True)
+    placa: Mapped[str] = mapped_column(String(16), default="")
+    activo: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Manifiesto(Base):
     __tablename__ = "manifiestos"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -101,6 +116,9 @@ class Manifiesto(Base):
     tolerancia_pct: Mapped[float] = mapped_column(Float, default=5.0)
     naviera_usuario_id: Mapped[Optional[int]] = mapped_column(ForeignKey("usuarios.id"), nullable=True)
     transportista_id: Mapped[Optional[int]] = mapped_column(ForeignKey("transportistas.id"), nullable=True)
+    # Opcional: fija que vehiculo trae este contenedor. Si queda vacio, la
+    # garita lo deduce por el transportista duenio de la tarjeta (ver Vehiculo).
+    vehiculo_uid: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
     observaciones: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     estado_documental: Mapped[str] = mapped_column(String(24), default="declarado")
     # declarado -> declaracion_presentada -> levante_solicitado -> levante_otorgado | levante_retenido
@@ -162,6 +180,19 @@ class EventoTurno(Base):
     origen: Mapped[str] = mapped_column(String(16))  # controlador | servidor | usuario
     descripcion: Mapped[str] = mapped_column(String(200))
     valores_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class IntentoIngreso(Base):
+    """Sec. 7 regla 1: un ingreso rechazado no crea turno, pero queda
+    registrado con su causa. Tambien guarda los rechazos de la garita de salida."""
+    __tablename__ = "intentos_ingreso"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vehiculo_uid: Mapped[str] = mapped_column(String(32), index=True)
+    contenedor_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    estacion: Mapped[str] = mapped_column(String(16))  # garita_entrada | garita_salida
+    causa: Mapped[str] = mapped_column(String(40))
+    decidido_por: Mapped[str] = mapped_column(String(16), default="servidor")  # servidor | controlador
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class PosicionPatio(Base):
@@ -250,4 +281,21 @@ def make_db(db_path: str):
         cursor.close()
 
     Base.metadata.create_all(engine)
+    _agregar_columnas_nuevas(engine)
     return sessionmaker(bind=engine)
+
+
+# create_all no agrega columnas a tablas que ya existen: una base creada antes
+# de la fase 1 (por ejemplo la de la Raspberry) necesita este ALTER TABLE.
+_COLUMNAS_NUEVAS = {
+    "manifiestos": {"vehiculo_uid": "VARCHAR(32)"},
+}
+
+
+def _agregar_columnas_nuevas(engine) -> None:
+    with engine.begin() as conn:
+        for tabla, columnas in _COLUMNAS_NUEVAS.items():
+            existentes = {fila[1] for fila in conn.exec_driver_sql(f"PRAGMA table_info({tabla})")}
+            for nombre, tipo in columnas.items():
+                if nombre not in existentes:
+                    conn.exec_driver_sql(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {tipo}")

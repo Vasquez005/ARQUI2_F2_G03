@@ -408,6 +408,7 @@ class ManifiestoIn(BaseModel):
     peso_declarado_g: int
     tolerancia_pct: Optional[float] = None
     transportista_id: int
+    vehiculo_uid: Optional[str] = None  # tarjeta RFID; si falta, se deduce por el transportista
     observaciones: Optional[str] = None
 
 

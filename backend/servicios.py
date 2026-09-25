@@ -6,6 +6,7 @@ no acoplar este modulo al cliente MQTT). Nada aqui asume una sesion HTTP real
 todavia — eso sigue pendiente de Persona C.
 """
 
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
@@ -20,8 +21,8 @@ from catalogos import (
     TRANSICIONES, ZONA_HORARIA,
 )
 from models import (
-    Alarma, Cita, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
-    Retencion, Transportista, Turno, EventoTurno,
+    Alarma, Cita, IntentoIngreso, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
+    Retencion, Transportista, Turno, EventoTurno, Vehiculo,
 )
 
 PublishFn = Callable[[str, str, dict], None]
@@ -398,18 +399,19 @@ def _fuera_de_ventana(cita: Cita, ahora: datetime) -> bool:
 def procesar_ingreso_garita(db, contenedor_id: str, vehiculo_uid: str,
                              transportista_id: Optional[int] = None,
                              publish_cmd: PublishFn = _noop_publish,
-                             ahora: Optional[datetime] = None) -> Turno:
-    """Reemplaza la decision que hoy toma el Arduino solo (ver
-    Observaciones_Firmware_PersonaA.md, punto 2). Esta funcion es la pieza de
-    servidor; falta que el firmware la llame en vez de decidir con su tabla
-    local — eso sigue pendiente, ver limitaciones al final de este archivo."""
+                             ahora: Optional[datetime] = None,
+                             manifiesto: Optional[Manifiesto] = None) -> Turno:
+    """Validacion de acceso del lado servidor (sec. 12). La llama
+    ingreso_por_rfid cuando la garita manda el UID de la tarjeta, o el
+    endpoint /garita/ingreso para pruebas manuales."""
     ahora = ahora or datetime.utcnow()
 
-    manifiesto = db.scalars(
-        select(Manifiesto).where(
-            Manifiesto.contenedor_id == contenedor_id, Manifiesto.anulado.is_(False),
-        ).order_by(Manifiesto.id.desc())
-    ).first()
+    if manifiesto is None:
+        manifiesto = db.scalars(
+            select(Manifiesto).where(
+                Manifiesto.contenedor_id == contenedor_id, Manifiesto.anulado.is_(False),
+            ).order_by(Manifiesto.id.desc())
+        ).first()
     if manifiesto is None:
         raise ReglaDeNegocioError("sin_manifiesto")
     if manifiesto.estado_documental != "levante_otorgado":
@@ -435,7 +437,10 @@ def procesar_ingreso_garita(db, contenedor_id: str, vehiculo_uid: str,
     db.flush()
     registrar_evento(db, turno.id, "servidor", "Ingreso autorizado por servidor",
                       {"contenedor_id": contenedor_id, "canal": manifiesto.canal})
-    publish_cmd("AbrirTalanquera", "UNO_ENTRADA", {})
+    # uid y op le dicen a la garita que esta es la respuesta a SU tarjeta
+    # pendiente (sin uid, el firmware lo trata como apertura manual). Nada mas:
+    # el UNO recibe con un bufer de 64 bytes y un frame largo se puede cortar.
+    publish_cmd("AbrirTalanquera", "UNO_ENTRADA", {"uid": vehiculo_uid, "op": manifiesto.tipo_operacion})
 
     if cita is not None:
         # Sec. 9.8: el cumplimiento de ventana se registra por cita (metrica de Reportes)
@@ -524,6 +529,181 @@ def anular_turno(db, turno: Turno, causa: Optional[str] = None,
                         valores={"causa": causa})
     publish_cmd("AbrirPuertaSalida", "UNO_SALIDA", {"turno": turno.id})
     notificar_transportista(db, turno, "turno_anulado", {"causa": causa})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Garitas automaticas por RFID (fase 1: los eventos de la maqueta mueven el turno)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Texto corto (LCD de 16 columnas) para cada causa de rechazo en garita (E03).
+MOTIVO_LCD = {
+    "rfid_no_registrado": "RFID no registr",
+    "vehiculo_inactivo": "Vehiculo inactiv",
+    "sin_manifiesto": "Sin manifiesto",
+    "sin_levante": "Sin levante",
+    "parqueo_lleno": "Parqueo lleno",
+    "turno_activo": "Ya tiene turno",
+    "sin_turno": "Sin turno activo",
+    "retenido": "Retenido",
+    "pesaje_pendiente": "Falta pesaje",
+}
+
+# No hay bascula real: la garita de entrada solo informa resultado=ok o
+# fuera_tolerancia. El servidor necesita un peso para aplicar su propia regla
+# (RT01), asi que usa el declarado si fue ok y declarado x este factor si no.
+FACTOR_PESO_FUERA = float(os.getenv("PORTUS_FACTOR_PESO_FUERA", "1.5"))
+
+DESC_SALIO = "Vehiculo salio de la terminal"
+
+
+def normalizar_uid(uid: str) -> str:
+    return " ".join((uid or "").upper().split())
+
+
+def motivo_lcd(causa: str) -> str:
+    return MOTIVO_LCD.get(causa, "No autorizado")
+
+
+def registrar_intento_rechazado(db, vehiculo_uid: str, estacion: str, causa: str,
+                                 contenedor_id: Optional[str] = None,
+                                 decidido_por: str = "servidor") -> IntentoIngreso:
+    intento = IntentoIngreso(vehiculo_uid=vehiculo_uid, contenedor_id=contenedor_id,
+                             estacion=estacion, causa=causa, decidido_por=decidido_por)
+    db.add(intento)
+    return intento
+
+
+def turno_activo_por_uid(db, vehiculo_uid: str) -> Optional[Turno]:
+    return db.scalars(
+        select(Turno).where(Turno.vehiculo_uid == vehiculo_uid, Turno.estado.not_in(ESTADOS_FINALES))
+        .order_by(Turno.id.desc())
+    ).first()
+
+
+def ultimo_turno_por_uid(db, vehiculo_uid: str) -> Optional[Turno]:
+    return db.scalars(
+        select(Turno).where(Turno.vehiculo_uid == vehiculo_uid).order_by(Turno.id.desc())
+    ).first()
+
+
+def _manifiesto_sin_turno(db, m: Manifiesto) -> bool:
+    return db.scalars(select(Turno.id).where(Turno.manifiesto_id == m.id)).first() is None
+
+
+def resolver_manifiesto_por_uid(db, vehiculo_uid: str, ahora: Optional[datetime] = None) -> Manifiesto:
+    """Tarjeta -> contenedor. Primero busca manifiestos que nombren este
+    vehiculo; si no hay, los del transportista duenio de la tarjeta. Entre
+    varios candidatos prefiere el que tiene levante y cita en ventana."""
+    ahora = ahora or datetime.utcnow()
+    candidatos = db.scalars(
+        select(Manifiesto).where(Manifiesto.vehiculo_uid == vehiculo_uid, Manifiesto.anulado.is_(False))
+        .order_by(Manifiesto.id)
+    ).all()
+    candidatos = [m for m in candidatos if _manifiesto_sin_turno(db, m)]
+
+    if not candidatos:
+        vehiculo = db.get(Vehiculo, vehiculo_uid)
+        if vehiculo is None:
+            raise ReglaDeNegocioError("rfid_no_registrado")
+        if not vehiculo.activo:
+            raise ReglaDeNegocioError("vehiculo_inactivo")
+        if vehiculo.transportista_id is not None:
+            candidatos = db.scalars(
+                select(Manifiesto).where(
+                    Manifiesto.transportista_id == vehiculo.transportista_id,
+                    Manifiesto.vehiculo_uid.is_(None), Manifiesto.anulado.is_(False),
+                ).order_by(Manifiesto.id)
+            ).all()
+            candidatos = [m for m in candidatos if _manifiesto_sin_turno(db, m)]
+    if not candidatos:
+        raise ReglaDeNegocioError("sin_manifiesto")
+
+    def prioridad(m: Manifiesto):
+        cita = _cita_vigente(db, m.contenedor_id)
+        en_ventana = cita is not None and not _fuera_de_ventana(cita, ahora)
+        return (m.estado_documental != "levante_otorgado", not en_ventana, m.id)
+
+    return min(candidatos, key=prioridad)
+
+
+def ingreso_por_rfid(db, vehiculo_uid: str, publish_cmd: PublishFn = _noop_publish,
+                     ahora: Optional[datetime] = None) -> Turno:
+    """La garita de entrada leyo una tarjeta: el servidor decide (sec. 12).
+    Si autoriza, crea el turno y manda AbrirTalanquera; si no, lanza
+    ReglaDeNegocioError con la causa y quien llama responde RechazarIngreso."""
+    if turno_activo_por_uid(db, vehiculo_uid) is not None:
+        raise ReglaDeNegocioError("turno_activo")
+    manifiesto = resolver_manifiesto_por_uid(db, vehiculo_uid, ahora)
+    try:
+        return procesar_ingreso_garita(db, manifiesto.contenedor_id, vehiculo_uid,
+                                       manifiesto.transportista_id, publish_cmd=publish_cmd,
+                                       ahora=ahora, manifiesto=manifiesto)
+    except ReglaDeNegocioError as exc:
+        exc.contenedor_id = manifiesto.contenedor_id  # para el registro de intento
+        raise
+
+
+def peso_simulado_entrada(turno: Turno, datos: dict) -> int:
+    """Peso para procesar_pesaje_entrada a partir del evento de la garita.
+    Si algun dia el controlador manda peso=<gramos>, se usa ese valor."""
+    if str(datos.get("peso", "")).isdigit():
+        return int(datos["peso"])
+    declarado = turno.peso_declarado_g or 0
+    if datos.get("resultado") == "ok":
+        return declarado
+    return max(1, round(declarado * FACTOR_PESO_FUERA))
+
+
+def ya_salio(db, turno: Turno) -> bool:
+    return db.scalars(
+        select(EventoTurno.id).where(EventoTurno.turno_id == turno.id, EventoTurno.descripcion == DESC_SALIO)
+    ).first() is not None
+
+
+def avanzar_hasta_salida(db, turno: Turno, publish_cmd: PublishFn = _noop_publish) -> None:
+    """El vehiculo se presento en la garita de salida. La grua todavia no
+    reporta el fin de la transferencia y la salida no tiene bascula, asi que el
+    servidor completa esos pasos aqui y lo deja en la linea de tiempo."""
+    if turno.estado == EN_RUTA:
+        transicionar_turno(db, turno, EN_TRANSFERENCIA, origen="servidor",
+                           descripcion="Transferencia no reportada por la grua; se asume completada")
+    if turno.estado in (EN_TRANSFERENCIA, EN_PESAJE_SALIDA):
+        # Sin bascula de salida: se toma el peso declarado (pesaje simulado).
+        procesar_pesaje_salida(db, turno, turno.peso_declarado_g or 0, publish_cmd=publish_cmd)
+
+
+def salida_por_rfid(db, vehiculo_uid: str, publish_cmd: PublishFn = _noop_publish) -> Turno:
+    """La garita de salida leyo una tarjeta: el servidor decide si abre."""
+    turno = ultimo_turno_por_uid(db, vehiculo_uid)
+    if turno is None or turno.estado == CERRADO:
+        raise ReglaDeNegocioError("sin_turno")
+    if turno.estado == ANULADO:
+        # Sec. 8.3: un turno anulado sale sin completar la operacion (una sola vez).
+        if ya_salio(db, turno):
+            raise ReglaDeNegocioError("sin_turno")
+    elif turno.estado == RETENIDO:
+        raise ReglaDeNegocioError("retenido")
+    elif turno.estado in (EN_GARITA, EN_PESAJE_ENTRADA):
+        raise ReglaDeNegocioError("pesaje_pendiente")
+    else:
+        avanzar_hasta_salida(db, turno, publish_cmd=publish_cmd)
+        if turno.estado != EN_SALIDA:
+            raise ReglaDeNegocioError("retenido")
+
+    registrar_evento(db, turno.id, "servidor", "Salida autorizada por servidor", {"uid": vehiculo_uid})
+    turno.estacion_actual = "salida"
+    publish_cmd("AbrirPuertaSalida", "UNO_SALIDA", {"uid": vehiculo_uid})
+    return turno
+
+
+def registrar_salida_fisica(db, turno: Turno, publish_cmd: PublishFn = _noop_publish) -> None:
+    """La garita de salida confirma que el vehiculo cruzo (sec. 7 regla 5:
+    ningun turno queda abierto con el vehiculo ya afuera)."""
+    if ya_salio(db, turno):
+        return
+    registrar_evento(db, turno.id, "controlador", DESC_SALIO)
+    if turno.estado == EN_SALIDA:
+        cerrar_turno(db, turno, publish_cmd=publish_cmd)
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -72,6 +72,6 @@ backend de B (`POST /auth/login`). Se crean con `backend/seed.py`
 
 - Necesita el backend corriendo (`PORTUS_BACKEND_URL`, por defecto `http://127.0.0.1:8100`).
 - Las rutas `/api/<rol>/...` revisan el rol de la sesion y llaman a B. La lista
-  completa y lo que falta de interfaz: `docs originales/Observaciones_Web_PersonaC.md`.
+  completa esta en `app/main.py`; lo que falta de interfaz: `docs originales/Plan_de_trabajo_final.md`.
 - Escucha `portus/evt/#` y `portus/cmd/respuesta` y los reenvia por `/ws/terminal`
   (solo sesiones TERMINAL).

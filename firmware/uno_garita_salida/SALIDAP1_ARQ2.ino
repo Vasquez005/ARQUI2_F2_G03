@@ -40,6 +40,16 @@ const int BARRA_ARRIBA = 0;
 bool barraAbierta = false;
 bool llegoAlDespues = false;
 
+// ── Autorizacion de salida en el SERVIDOR (fase 1 del plan) ──
+// Se manda evento=rfid_salida y se espera AbrirPuertaSalida (mismo uid) o
+// RechazarSalida. Sin respuesta, o en modo degradado, decide la lista local
+// camionesDentro: sec. 12.1.2 pide dejar salir a los turnos que ya estan dentro.
+bool esperandoServidor = false;
+String uidPendiente = "";
+unsigned long tEsperaMs = 0;
+const unsigned long TIMEOUT_SERVIDOR_MS = 5000;
+String uidSaliendo = "";  // para informar quien cruzo en salida_completada
+
 const int MAX_DENTRO = 10;
 String camionesDentro[MAX_DENTRO];
 int totalDentro = 0;
@@ -104,6 +114,14 @@ void loop() {
     }
   }
 
+  if (esperandoServidor) {
+    if (millis() - tEsperaMs >= TIMEOUT_SERVIDOR_MS) {
+      esperandoServidor = false;
+      decidirLocal(uidPendiente);
+    }
+    return;
+  }
+
   if (!barraAbierta) {
     if (!mfrc522.PICC_IsNewCardPresent()) return;
     if (!mfrc522.PICC_ReadCardSerial())   return;
@@ -126,12 +144,16 @@ void loop() {
     Serial.println(uid);
     sendFrame("EVT", "salida", String("evento=rfid_salida;uid=") + uid);
 
-    if (!estaDentro(uid)) {
-      rechazar("No esta dentro");
+    mfrc522.PICC_HaltA();
+
+    if (modoDegradado) {
+      decidirLocal(uid);
       return;
     }
 
-    autorizarSalida(uid);
+    esperandoServidor = true;
+    uidPendiente = uid;
+    tEsperaMs = millis();
   }
 
   else {
@@ -148,7 +170,8 @@ void loop() {
       semaforoRojo();
       mostrarEstado();
       Serial.println(F("Camion salio completo"));
-      sendFrame("EVT", "salida", "evento=salida_completada");
+      sendFrame("EVT", "salida", String(F("evento=salida_completada;uid=")) + uidSaliendo);
+      uidSaliendo = "";
     }
   }
 }
@@ -194,6 +217,16 @@ bool parseFrame(String line, String& src, long& seq, String& kind, String& topic
   return checksumBase(base) == chk;
 }
 
+// Valor de "clave=" dentro de un payload "a=1;b=2" ("" si no esta).
+String paramValor(const String& payload, const char* clave) {
+  String k = String(";") + clave + "=";
+  int i = payload.indexOf(k);
+  if (i < 0) return "";
+  int ini = i + k.length();
+  int fin = payload.indexOf(';', ini);
+  return fin < 0 ? payload.substring(ini) : payload.substring(ini, fin);
+}
+
 bool hayVehiculoBajoPuerta() {
   return digitalRead(PIN_IR_ANTES) == LOW || digitalRead(PIN_IR_DESPUES) == LOW;
 }
@@ -201,6 +234,21 @@ bool hayVehiculoBajoPuerta() {
 void handleCommand(const String& payload) {
   if (payload.indexOf("target=UNO_SALIDA") < 0) return;
   if (payload.indexOf("name=AbrirPuertaSalida") >= 0) {
+    // Respuesta del servidor a la tarjeta pendiente: el vehiculo esta frente
+    // a la puerta, no aplica el chequeo de "debajo".
+    String uid = paramValor(payload, "uid");
+    if (esperandoServidor && uid == uidPendiente) {
+      esperandoServidor = false;
+      autorizarSalida(uid, false);
+      sendFrame("ACK", "cmd", F("name=AbrirPuertaSalida"));
+      return;
+    }
+    if (uid.length()) {
+      // Autorizacion que llego tarde (ya decidio la lista local): no repetir.
+      sendFrame("REJ", "cmd", F("name=AbrirPuertaSalida;causa=sin_validacion_pendiente"));
+      return;
+    }
+    // Apertura manual (terminal, o turno anulado): no se sabe quien sale.
     if (hayVehiculoBajoPuerta()) {
       sendFrame("REJ", "cmd", "name=AbrirPuertaSalida;causa=vehiculo_bajo_puerta");
       return;
@@ -208,6 +256,7 @@ void handleCommand(const String& payload) {
     puerta.write(BARRA_ARRIBA);
     barraAbierta = true;
     llegoAlDespues = false;
+    uidSaliendo = "";
     semaforoVerde();
     sendFrame("ACK", "cmd", "name=AbrirPuertaSalida");
     return;
@@ -223,7 +272,25 @@ void handleCommand(const String& payload) {
     sendFrame("ACK", "cmd", "name=CerrarPuertaSalida");
     return;
   }
+  if (payload.indexOf("name=RechazarSalida") >= 0) {
+    String uid = paramValor(payload, "uid");
+    if (!esperandoServidor || uid != uidPendiente) {
+      sendFrame("REJ", "cmd", F("name=RechazarSalida;causa=sin_validacion_pendiente"));
+      return;
+    }
+    esperandoServidor = false;
+    String motivo = paramValor(payload, "motivo");
+    rechazar(uid, motivo.length() ? motivo : String(F("No autorizado")), false);
+    sendFrame("ACK", "cmd", F("name=RechazarSalida"));
+    return;
+  }
   sendFrame("REJ", "cmd", "name=UNKNOWN;causa=comando_no_soportado");
+}
+
+// Sin servidor (degradado o sin respuesta): decide la lista local.
+void decidirLocal(const String& uid) {
+  if (estaDentro(uid)) autorizarSalida(uid, true);
+  else rechazar(uid, F("No esta dentro"), true);
 }
 
 void procesarComandosRemotos() {
@@ -267,7 +334,8 @@ void quitarDentro(String uid) {
   }
 }
 
-void rechazar(String motivo) {
+// local=true: lo decidio la garita; local=false: lo decidio el servidor.
+void rechazar(const String& uid, const String& motivo, bool local) {
   semaforoRojo();
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -277,21 +345,22 @@ void rechazar(String motivo) {
 
   Serial.print(F("RECHAZADO: "));
   Serial.println(motivo);
-  sendFrame("EVT", "salida", String("evento=rechazado;motivo=") + motivo);
-
-  mfrc522.PICC_HaltA();
+  sendFrame("EVT", "salida", String(F("evento=rechazado;motivo=")) + motivo + F(";uid=") + uid +
+            F(";decision=") + (local ? F("local") : F("servidor")));
   // Antes: delay(2500) bloqueaba heartbeat/comandos/sensores por 2.5s (ver
   // Observaciones_Firmware_PersonaA.md, punto 5). Ahora no bloquea.
   mostrandoRechazo = true;
   tRechazoMs = millis();
 }
 
-void autorizarSalida(String uid) {
+void autorizarSalida(const String& uid, bool local) {
   Serial.print(F("SALIDA AUTORIZADA UID: "));
   Serial.println(uid);
-  sendFrame("EVT", "salida", String("evento=salida_autorizada;uid=") + uid);
+  sendFrame("EVT", "salida", String(F("evento=salida_autorizada;uid=")) + uid +
+            F(";decision=") + (local ? F("local") : F("servidor")));
 
   quitarDentro(uid);
+  uidSaliendo = uid;
 
   puerta.write(BARRA_ARRIBA);
   barraAbierta = true;
@@ -303,8 +372,6 @@ void autorizarSalida(String uid) {
   lcd.print("SALIDA OK");
   lcd.setCursor(0, 1);
   lcd.print("Puede salir");
-
-  mfrc522.PICC_HaltA();
 }
 
 void semaforoRojo() {

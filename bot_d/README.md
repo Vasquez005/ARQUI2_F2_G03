@@ -19,7 +19,7 @@ Implementacion base de **Persona D**:
 - Aislamiento por transportista (no ve carga ajena).
 
 > Usa la misma base de datos y modelos que el backend de B (`backend/portus_core.db`,
-> `backend/models.py`). Detalle y pendientes: `docs originales/Observaciones_Bot_PersonaD.md`.
+> `backend/models.py`). Pendientes: `docs originales/Plan_de_trabajo_final.md` (fase 4).
 
 ## Estructura
 

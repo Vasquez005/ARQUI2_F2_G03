@@ -10,14 +10,15 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 
+import orquestador
 import servicios
 from catalogos import (
     CAUSAS_RETENCION, DISPOSITIVOS, MINUTOS_EXPIRA_CODIGO, ROLES, UMBRAL_ENLACE_PERDIDO_S,
 )
 from models import (
-    Alarma, CommandAudit, Declaracion, EventLog, EventoTurno, LinkDevice,
+    Alarma, CommandAudit, Declaracion, EventLog, EventoTurno, IntentoIngreso, LinkDevice,
     LinkStatus, Manifiesto, ParqueoPlaza, PosicionPatio, Retencion, Turno,
-    Transportista, Usuario, make_db,
+    Transportista, Usuario, Vehiculo, make_db,
 )
 from security import verify_password
 
@@ -128,6 +129,13 @@ def on_message(client, userdata, msg):
             )
         )
         db.commit()
+
+    # Fase 1: los eventos de garitas y pesaje avanzan el turno solos.
+    try:
+        orquestador.procesar_evento(SessionLocal, lambda t, p: mqttc.publish(t, p), topic,
+                                    payload.get("data", {}))
+    except Exception as exc:  # un evento malo no debe tumbar el hilo MQTT
+        print(f"[ORQUESTADOR] error procesando {topic}: {exc!r}")
 
     if topic == "portus/evt/estado":
         upsert_link_status(True, last_ts=int(time.time()), origin=origin)
@@ -274,6 +282,7 @@ class ManifiestoIn(BaseModel):
     tolerancia_pct: float = 5.0
     naviera_usuario_id: Optional[int] = None
     transportista_id: Optional[int] = None
+    vehiculo_uid: Optional[str] = None
     observaciones: Optional[str] = None
 
 
@@ -347,6 +356,39 @@ def generar_codigo_vinculacion(transportista_id: int):
                 "expiraEnMinutos": MINUTOS_EXPIRA_CODIGO, "expiraLocal": servicios.hora_local(t.codigo_expira_at)}
 
 
+class VehiculoIn(BaseModel):
+    uid: str
+    transportista_id: Optional[int] = None
+    placa: str = ""
+    activo: bool = True
+
+
+@app.get("/vehiculos")
+def listar_vehiculos():
+    with SessionLocal() as db:
+        rows = db.scalars(select(Vehiculo).order_by(Vehiculo.uid)).all()
+        return [{"uid": v.uid, "transportistaId": v.transportista_id, "placa": v.placa, "activo": v.activo}
+                for v in rows]
+
+
+@app.post("/vehiculos")
+def registrar_vehiculo(body: VehiculoIn):
+    """Alta o cambio de la tarjeta RFID de un vehiculo (tarjeta -> transportista)."""
+    uid = servicios.normalizar_uid(body.uid)
+    if not uid:
+        raise HTTPException(400, "uid_obligatorio")
+    with SessionLocal() as db:
+        if body.transportista_id is not None and not db.get(Transportista, body.transportista_id):
+            raise HTTPException(404, "transportista_no_existe")
+        v = db.get(Vehiculo, uid) or Vehiculo(uid=uid)
+        v.transportista_id = body.transportista_id
+        v.placa = body.placa
+        v.activo = body.activo
+        db.add(v)
+        db.commit()
+        return {"uid": uid}
+
+
 @app.post("/manifiestos")
 def crear_manifiesto(body: ManifiestoIn):
     if body.tipo_operacion not in ("DEPOSITO", "RETIRO"):
@@ -356,7 +398,9 @@ def crear_manifiesto(body: ManifiestoIn):
     with SessionLocal() as db:
         if _tiene_manifiesto_pendiente(db, body.contenedor_id):
             raise HTTPException(409, "el_contenedor_ya_tiene_un_manifiesto_pendiente")
-        m = Manifiesto(**body.model_dump())
+        datos = body.model_dump()
+        datos["vehiculo_uid"] = servicios.normalizar_uid(datos["vehiculo_uid"]) or None
+        m = Manifiesto(**datos)
         db.add(m)
         db.commit()
         db.refresh(m)
@@ -377,6 +421,7 @@ def listar_manifiestos(naviera_usuario_id: Optional[int] = None, contenedor_id: 
              "pesoDeclaradoG": m.peso_declarado_g, "toleranciaPct": m.tolerancia_pct,
              "estadoDocumental": m.estado_documental, "canal": m.canal, "anulado": m.anulado,
              "navieraUsuarioId": m.naviera_usuario_id, "transportistaId": m.transportista_id,
+             "vehiculoUid": m.vehiculo_uid,
              "pesoDeclaradoAnteriorG": m.peso_declarado_anterior_g, "observaciones": m.observaciones,
              "createdAt": m.created_at.isoformat()}
             for m in rows
@@ -493,14 +538,12 @@ class IngresoIn(BaseModel):
 
 @app.post("/garita/ingreso")
 def garita_ingreso(body: IngresoIn):
-    """Pieza de servidor de la validacion de acceso (sec. 12). Falta que el
-    firmware de la garita llame esto en vez de decidir con su tabla local
-    (ver Observaciones_Firmware_PersonaA.md, punto 2 — dependencia conocida,
-    no resuelta en esta pasada de B)."""
+    """Ingreso manual por contenedor (pruebas sin maqueta). En operacion
+    normal la garita manda el UID y lo resuelve orquestador.py."""
     with SessionLocal() as db:
         try:
             turno = servicios.procesar_ingreso_garita(
-                db, body.contenedor_id, body.vehiculo_uid, body.transportista_id,
+                db, body.contenedor_id, servicios.normalizar_uid(body.vehiculo_uid), body.transportista_id,
                 publish_cmd=make_publish_and_audit(db),
             )
         except servicios.ReglaDeNegocioError as exc:
@@ -512,6 +555,22 @@ def garita_ingreso(body: IngresoIn):
             raise HTTPException(409, str(exc))
         db.commit()
         return {"turnoId": turno.id, "estado": turno.estado}
+
+
+@app.get("/garita/intentos")
+def listar_intentos(estacion: Optional[str] = None, limit: int = 100):
+    """Intentos rechazados en garita (sec. 7 regla 1): no crean turno."""
+    with SessionLocal() as db:
+        q = select(IntentoIngreso)
+        if estacion:
+            q = q.where(IntentoIngreso.estacion == estacion)
+        rows = db.scalars(q.order_by(IntentoIngreso.id.desc()).limit(limit)).all()
+        return [
+            {"id": i.id, "vehiculoUid": i.vehiculo_uid, "contenedorId": i.contenedor_id,
+             "estacion": i.estacion, "causa": i.causa, "decididoPor": i.decidido_por,
+             "ts": i.ts.isoformat()}
+            for i in rows
+        ]
 
 
 # ══════════════════════════════════════════════════════════════════════════

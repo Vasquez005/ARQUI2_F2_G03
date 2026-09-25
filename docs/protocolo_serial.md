@@ -67,3 +67,49 @@ Heartbeat:
 ```text
 <PORTUS|MEGA_GRUA|123|HBT|estado|modo=normal|01>
 ```
+
+## Garitas: el servidor decide el acceso (fase 1)
+
+La garita ya no autoriza con una tabla local. Manda el UID de la tarjeta y
+espera la respuesta del servidor (`backend/orquestador.py`). El vehiculo se
+asocia a su contenedor con la tabla `vehiculos` (tarjeta -> transportista) y el
+campo opcional `manifiestos.vehiculo_uid`.
+
+### Entrada (`UNO_ENTRADA`)
+
+| Paso | Frame |
+|---|---|
+| Lee tarjeta | `EVT garita evento=rfid;uid=E1 69 73 15` |
+| Servidor autoriza | `CMD cmd name=AbrirTalanquera;target=UNO_ENTRADA;uid=E1 69 73 15;op=DEPOSITO` |
+| Servidor rechaza | `CMD cmd name=RechazarIngreso;target=UNO_ENTRADA;uid=E1 69 73 15;motivo=Sin levante` |
+| Garita muestra el rechazo | `EVT garita evento=rechazado;motivo=...;uid=...;decision=servidor` |
+| Sin respuesta en 5 s o modo degradado | `EVT garita evento=rechazado;motivo=Sin respuesta;uid=...;decision=local` |
+| Pesaje (bascula simulada) | `EVT pesaje evento=meseta;resultado=ok;uid=...;op=...` (o `resultado=fuera_tolerancia`) |
+
+- `AbrirTalanquera` **sin** `uid` sigue siendo la apertura manual desde la terminal.
+- `motivo` llega ya recortado a 16 caracteres para el LCD.
+- El servidor convierte `resultado` en un peso (declarado si `ok`, declarado x
+  `PORTUS_FACTOR_PESO_FUERA`, 1.5 por defecto, si no). Si el controlador manda
+  `peso=<gramos>`, se usa ese valor.
+
+### Salida (`UNO_SALIDA`)
+
+| Paso | Frame |
+|---|---|
+| Lee tarjeta | `EVT salida evento=rfid_salida;uid=...` |
+| Servidor autoriza | `CMD cmd name=AbrirPuertaSalida;target=UNO_SALIDA;uid=...` |
+| Servidor rechaza | `CMD cmd name=RechazarSalida;target=UNO_SALIDA;uid=...;motivo=Retenido` |
+| Garita abre | `EVT salida evento=salida_autorizada;uid=...;decision=servidor` (o `local`) |
+| Vehiculo cruzo | `EVT salida evento=salida_completada;uid=...` (cierra el turno) |
+
+- Sin respuesta en 5 s, o en modo degradado, la salida decide con su lista local
+  de vehiculos dentro (sec. 12.1.2) y lo informa con `decision=local`.
+- `AbrirPuertaSalida` sin `uid` es apertura manual (por ejemplo, turno anulado).
+
+### Limitacion conocida
+
+Los comandos con `uid` miden ~96-107 bytes y el bufer de recepcion del UNO es
+de 64. Si el comando llega mientras el loop esta bloqueado (por ejemplo en el
+`Serial.flush()` de un latido), el frame puede cortarse, el checksum falla y la
+garita termina en "Sin respuesta". Si pasa en las pruebas: quitar el
+`Serial.flush()` de `sendFrame` en la entrada o acortar los parametros.
