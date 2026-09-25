@@ -1,12 +1,77 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Interfaz NAVIERA</h1>
-<section class="panel">
-  <h2>Manifiestos</h2>
-  <p>Crear manifiesto y consultar detalle (solo propios).</p>
-</section>
-<section class="panel">
-  <h2>Mis contenedores</h2>
-  <p>Consulta de ubicacion/estado solo de carga propia.</p>
-</section>
+<div id="naviera-root">
+  <section class="panel">
+    <h2>Crear manifiesto</h2>
+    <form id="naviera-form-manifiesto" class="grid-form">
+      <label>Contenedor ID
+        <input id="naviera-contenedor" required placeholder="CONT-001" />
+      </label>
+      <label>Tipo de operacion
+        <select id="naviera-operacion" required>
+          <option value="DEPOSITO">DEPOSITO</option>
+          <option value="RETIRO">RETIRO</option>
+        </select>
+      </label>
+      <label>Peso declarado (g)
+        <input id="naviera-peso" type="number" min="1" required value="1000" />
+      </label>
+      <label>Tolerancia (%)
+        <input id="naviera-tolerancia" type="number" min="0" step="0.1" value="5.0" />
+      </label>
+      <label>Transportista
+        <select id="naviera-transportista" required></select>
+      </label>
+      <label>Observaciones
+        <input id="naviera-observaciones" placeholder="Opcional" />
+      </label>
+      <div class="form-actions">
+        <button type="submit">Crear manifiesto</button>
+        <button type="button" id="naviera-refresh">Actualizar listado</button>
+      </div>
+    </form>
+    <pre id="naviera-result" class="command-result"></pre>
+  </section>
+
+  <section class="panel">
+    <h2>Mis manifiestos</h2>
+    <div class="table-wrap">
+      <table id="naviera-table-manifiestos" class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Contenedor</th>
+            <th>Operacion</th>
+            <th>Estado documental</th>
+            <th>Canal</th>
+            <th>Anulado</th>
+            <th>Creado</th>
+            <th>Accion</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Mis contenedores</h2>
+    <div class="table-wrap">
+      <table id="naviera-table-contenedores" class="data-table">
+        <thead>
+          <tr>
+            <th>Contenedor</th>
+            <th>Operacion</th>
+            <th>Estado</th>
+            <th>Canal</th>
+            <th>Ultimo manifiesto</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+<script src="/static/roles.js"></script>
 {% endblock %}

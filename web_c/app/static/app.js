@@ -18,11 +18,18 @@
   const refreshRetencionesBtn = document.getElementById("refresh-retenciones");
   const refreshPatioBtn = document.getElementById("refresh-patio");
   const refreshAlarmasBtn = document.getElementById("refresh-alarmas");
+  const refreshGruaBtn = document.getElementById("refresh-grua");
+  const refreshCitasBtn = document.getElementById("refresh-citas");
+  const refreshReportesBtn = document.getElementById("refresh-reportes");
   const turnosResult = document.getElementById("turnos-result");
   const retencionesResult = document.getElementById("retenciones-result");
   const patioResult = document.getElementById("patio-result");
   const alarmasResult = document.getElementById("alarmas-result");
+  const gruaResult = document.getElementById("grua-result");
+  const citasResult = document.getElementById("citas-result");
+  const reportesResult = document.getElementById("reportes-result");
   const loadedTabs = new Set();
+  const recentEvents = [];
 
   function setConnection(connected) {
     if (!elConnected) return;
@@ -37,6 +44,8 @@
 
   function appendLog(eventObj) {
     if (!elLog) return;
+    recentEvents.unshift(eventObj);
+    if (recentEvents.length > 200) recentEvents.pop();
     const row = document.createElement("div");
     row.className = "log-row";
     row.textContent = JSON.stringify(eventObj);
@@ -136,12 +145,70 @@
     }
   }
 
+  async function loadGrua() {
+    if (!gruaResult) return;
+    const eventosGrua = recentEvents.filter((e) => e && e.topic === "portus/evt/grua").slice(0, 40);
+    if (eventosGrua.length === 0) {
+      gruaResult.textContent = "Sin eventos de grua aun. Ejecuta un ciclo y vuelve a actualizar.";
+      return;
+    }
+    gruaResult.textContent = JSON.stringify(eventosGrua, null, 2);
+  }
+
+  async function loadCitas() {
+    if (!citasResult) return;
+    citasResult.textContent = "Cargando...";
+    try {
+      const { data } = await getJson("/api/terminal/turnos");
+      const resumen = (data || []).map((t) => ({
+        turno: t.id,
+        contenedor: t.contenedorId,
+        operacion: t.tipoOperacion,
+        estado: t.estado,
+        estacion: t.estacionActual,
+        creado: t.createdAt,
+      }));
+      citasResult.textContent = JSON.stringify(resumen, null, 2);
+    } catch (err) {
+      citasResult.textContent = `Error cargando citas: ${String(err)}`;
+    }
+  }
+
+  async function loadReportes() {
+    if (!reportesResult) return;
+    reportesResult.textContent = "Calculando...";
+    try {
+      const { data } = await getJson("/api/terminal/turnos");
+      const turnos = Array.isArray(data) ? data : [];
+      const porEstado = {};
+      let cerrados = 0;
+      turnos.forEach((t) => {
+        porEstado[t.estado] = (porEstado[t.estado] || 0) + 1;
+        if (t.estado === "CERRADO") cerrados++;
+      });
+      const eventosGrua = recentEvents.filter((e) => e && e.topic === "portus/evt/grua").length;
+      const resumen = {
+        total_turnos: turnos.length,
+        turnos_cerrados: cerrados,
+        turnos_por_estado: porEstado,
+        eventos_grua_en_memoria: eventosGrua,
+        generado_en: new Date().toISOString(),
+      };
+      reportesResult.textContent = JSON.stringify(resumen, null, 2);
+    } catch (err) {
+      reportesResult.textContent = `Error calculando reportes: ${String(err)}`;
+    }
+  }
+
   async function loadTabData(tab) {
     if (loadedTabs.has(tab)) return;
     if (tab === "turnos") await loadTurnos();
     if (tab === "retenciones") await loadRetenciones();
     if (tab === "patio") await loadPatio();
     if (tab === "alarmas") await loadAlarmas();
+    if (tab === "grua") await loadGrua();
+    if (tab === "citas") await loadCitas();
+    if (tab === "reportes") await loadReportes();
     loadedTabs.add(tab);
   }
 
@@ -165,6 +232,9 @@
   if (refreshRetencionesBtn) refreshRetencionesBtn.addEventListener("click", loadRetenciones);
   if (refreshPatioBtn) refreshPatioBtn.addEventListener("click", loadPatio);
   if (refreshAlarmasBtn) refreshAlarmasBtn.addEventListener("click", loadAlarmas);
+  if (refreshGruaBtn) refreshGruaBtn.addEventListener("click", loadGrua);
+  if (refreshCitasBtn) refreshCitasBtn.addEventListener("click", loadCitas);
+  if (refreshReportesBtn) refreshReportesBtn.addEventListener("click", loadReportes);
 
   async function loadTransportistas() {
     if (!transportistaSelect) return;

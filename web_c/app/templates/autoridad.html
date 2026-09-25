@@ -1,16 +1,68 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Interfaz AUTORIDAD</h1>
-<section class="panel">
-  <h2>Solicitudes de levante</h2>
-  <p>Otorgar/retenener levante y asignar canal.</p>
-</section>
-<section class="panel">
-  <h2>Retenciones aduaneras</h2>
-  <p>Resolver RT03/RT05 con acciones permitidas por rol.</p>
-</section>
-<section class="panel">
-  <h2>Consulta de carga</h2>
-  <p>Consulta completa de ubicacion/estado/autorizacion.</p>
-</section>
+<div id="autoridad-root">
+  <section class="panel">
+    <h2>Solicitudes de levante</h2>
+    <button type="button" id="autoridad-refresh-solicitudes">Actualizar solicitudes</button>
+    <div class="table-wrap">
+      <table id="autoridad-table-solicitudes" class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Contenedor</th>
+            <th>Operacion</th>
+            <th>Estado</th>
+            <th>Canal</th>
+            <th>Acciones</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <pre id="autoridad-solicitudes-result" class="command-result"></pre>
+  </section>
+
+  <section class="panel">
+    <h2>Retenciones aduaneras</h2>
+    <button type="button" id="autoridad-refresh-retenciones">Actualizar retenciones</button>
+    <div class="table-wrap">
+      <table id="autoridad-table-retenciones" class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Turno</th>
+            <th>Causa</th>
+            <th>Estado</th>
+            <th>Creada</th>
+            <th>Acciones</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <pre id="autoridad-retenciones-result" class="command-result"></pre>
+  </section>
+
+  <section class="panel">
+    <h2>Consulta de carga</h2>
+    <button type="button" id="autoridad-refresh-carga">Actualizar carga</button>
+    <div class="table-wrap">
+      <table id="autoridad-table-carga" class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Contenedor</th>
+            <th>Operacion</th>
+            <th>Estado documental</th>
+            <th>Canal</th>
+            <th>Anulado</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+<script src="/static/roles.js"></script>
 {% endblock %}

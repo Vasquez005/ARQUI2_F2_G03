@@ -1,12 +1,60 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Interfaz AGENTE</h1>
-<section class="panel">
-  <h2>Declaraciones</h2>
-  <p>Presentar declaracion y solicitar levante.</p>
-</section>
-<section class="panel">
-  <h2>Seguimiento</h2>
-  <p>Ver estado de solicitudes presentadas.</p>
-</section>
+<div id="agente-root">
+  <section class="panel">
+    <h2>Presentar declaracion</h2>
+    <form id="agente-form-declaracion" class="grid-form">
+      <label>Manifiesto
+        <select id="agente-manifiesto" required></select>
+      </label>
+      <label>Numero de declaracion
+        <input id="agente-numero" required placeholder="DECL-2026-001" />
+      </label>
+      <label>Regimen
+        <select id="agente-regimen" required>
+          <option value="importacion_definitiva">importacion_definitiva</option>
+          <option value="deposito_temporal">deposito_temporal</option>
+        </select>
+      </label>
+      <label>Valor declarado
+        <input id="agente-valor" type="number" min="0" step="0.01" required value="1000.00" />
+      </label>
+      <label class="full-width">Descripcion
+        <input id="agente-descripcion" required placeholder="Descripcion de mercancia" />
+      </label>
+      <div class="form-actions">
+        <button type="submit">Presentar declaracion</button>
+        <button type="button" id="agente-refresh">Actualizar datos</button>
+      </div>
+    </form>
+    <pre id="agente-result" class="command-result"></pre>
+  </section>
+
+  <section class="panel">
+    <h2>Solicitar levante</h2>
+    <p class="muted">Solo aparecen manifiestos activos que aun no completan levante.</p>
+    <div class="table-wrap">
+      <table id="agente-table-pendientes" class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Contenedor</th>
+            <th>Operacion</th>
+            <th>Estado documental</th>
+            <th>Canal</th>
+            <th>Accion</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Seguimiento</h2>
+    <pre id="agente-seguimiento" class="command-result">Sin datos cargados.</pre>
+  </section>
+</div>
+<script src="/static/roles.js"></script>
 {% endblock %}

@@ -18,7 +18,20 @@ body { margin: 0; font-family: Arial, sans-serif; background: #f5f6f8; color: #1
 .log-row { margin-bottom: 8px; }
 .inline-form { display: flex; gap: 8px; }
 .inline-form input { flex: 1; padding: 8px; }
+.inline-form select { padding: 8px; }
+.inline-form button { padding: 8px 12px; }
 .command-result { background: #f6f8fa; border: 1px solid #d8dee4; border-radius: 6px; padding: 8px; min-height: 50px; }
+.grid-form { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 10px; }
+.grid-form label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.grid-form input, .grid-form select { padding: 8px; }
+.grid-form .full-width { grid-column: 1 / -1; }
+.form-actions { grid-column: 1 / -1; display: flex; gap: 8px; }
+.form-actions button { padding: 8px 12px; }
+.table-wrap { overflow: auto; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.data-table th, .data-table td { border: 1px solid #d8dee4; padding: 8px; text-align: left; vertical-align: top; }
+.data-table th { background: #f6f8fa; }
+.data-table button { padding: 6px 10px; }
 .login-body { display: grid; place-items: center; min-height: 100vh; }
 .login-card { background: #fff; border: 1px solid #d8dee4; border-radius: 10px; padding: 20px; width: 320px; }
 .login-card form { display: grid; gap: 8px; }

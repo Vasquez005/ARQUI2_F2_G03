@@ -86,7 +86,10 @@
 
 <section class="panel tab-panel hidden" data-tab-panel="grua">
   <h2>Grua</h2>
-  <p class="muted">La telemetria en vivo de la grua aparece en la pestana Operacion (eventos MQTT).</p>
+  <div class="inline-form">
+    <button type="button" id="refresh-grua">Actualizar historial grua</button>
+  </div>
+  <pre id="grua-result" class="command-result">Sin datos cargados.</pre>
 </section>
 
 <section class="panel tab-panel hidden" data-tab-panel="alarmas">
@@ -99,12 +102,18 @@
 
 <section class="panel tab-panel hidden" data-tab-panel="citas">
   <h2>Citas</h2>
-  <p class="muted">Las citas se visualizan dentro de Turnos. Aqui se deja la pestana activa para navegacion del enunciado.</p>
+  <div class="inline-form">
+    <button type="button" id="refresh-citas">Actualizar citas (desde turnos)</button>
+  </div>
+  <pre id="citas-result" class="command-result">Sin datos cargados.</pre>
 </section>
 
 <section class="panel tab-panel hidden" data-tab-panel="reportes">
   <h2>Reportes</h2>
-  <p class="muted">Pendiente de reporte consolidado. Puedes exportar evidencia desde Eventos recientes y listados de Turnos/Alarmas.</p>
+  <div class="inline-form">
+    <button type="button" id="refresh-reportes">Calcular resumen</button>
+  </div>
+  <pre id="reportes-result" class="command-result">Sin datos cargados.</pre>
 </section>
 
 <script>
