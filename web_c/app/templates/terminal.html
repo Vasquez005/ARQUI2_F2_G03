@@ -3,15 +3,15 @@
 <h1>Interfaz TERMINAL</h1>
 
 <section class="panel">
-  <h2>Pestanas obligatorias</h2>
   <div class="tabs">
     {% for tab in tabs %}
-    <span class="tab">{{ tab }}</span>
+    {% set tab_key = tab.lower().replace(" ", "_") %}
+    <button type="button" class="tab tab-btn{% if loop.first %} active{% endif %}" data-tab="{{ tab_key }}">{{ tab }}</button>
     {% endfor %}
   </div>
 </section>
 
-<section class="panel">
+<section class="panel tab-panel" data-tab-panel="operacion">
   <h2>Operacion (sinoptico en vivo por MQTT)</h2>
   <div class="status-grid">
     <div>
@@ -26,12 +26,12 @@
   <p class="muted">Canal en tiempo real: WebSocket + suscripcion MQTT (sin polling a DB).</p>
 </section>
 
-<section class="panel">
+<section class="panel tab-panel" data-tab-panel="operacion">
   <h2>Eventos recientes</h2>
   <div id="event-log" class="event-log"></div>
 </section>
 
-<section class="panel">
+<section class="panel tab-panel" data-tab-panel="operacion">
   <h2>Comando remoto (TERMINAL)</h2>
   <form id="command-form" class="inline-form">
     <select id="command-input" required>
@@ -45,7 +45,7 @@
   <pre id="command-result" class="command-result"></pre>
 </section>
 
-<section class="panel">
+<section class="panel tab-panel" data-tab-panel="operacion">
   <h2>Vinculacion Bot Transportista (Integracion C + D)</h2>
   <div class="status-grid">
     <div>
@@ -58,6 +58,53 @@
     </div>
   </div>
   <pre id="link-code-result" class="command-result"></pre>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="turnos">
+  <h2>Turnos</h2>
+  <div class="inline-form">
+    <button type="button" id="refresh-turnos">Actualizar turnos</button>
+  </div>
+  <pre id="turnos-result" class="command-result">Sin datos cargados.</pre>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="retenciones">
+  <h2>Retenciones</h2>
+  <div class="inline-form">
+    <button type="button" id="refresh-retenciones">Actualizar retenciones</button>
+  </div>
+  <pre id="retenciones-result" class="command-result">Sin datos cargados.</pre>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="patio">
+  <h2>Patio</h2>
+  <div class="inline-form">
+    <button type="button" id="refresh-patio">Actualizar patio</button>
+  </div>
+  <pre id="patio-result" class="command-result">Sin datos cargados.</pre>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="grua">
+  <h2>Grua</h2>
+  <p class="muted">La telemetria en vivo de la grua aparece en la pestana Operacion (eventos MQTT).</p>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="alarmas">
+  <h2>Alarmas</h2>
+  <div class="inline-form">
+    <button type="button" id="refresh-alarmas">Actualizar alarmas</button>
+  </div>
+  <pre id="alarmas-result" class="command-result">Sin datos cargados.</pre>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="citas">
+  <h2>Citas</h2>
+  <p class="muted">Las citas se visualizan dentro de Turnos. Aqui se deja la pestana activa para navegacion del enunciado.</p>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="reportes">
+  <h2>Reportes</h2>
+  <p class="muted">Pendiente de reporte consolidado. Puedes exportar evidencia desde Eventos recientes y listados de Turnos/Alarmas.</p>
 </section>
 
 <script>
