@@ -206,6 +206,9 @@ class PosicionPatio(Base):
     contenedor_nivel1: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     contenedor_nivel2: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     remociones: Mapped[int] = mapped_column(Integer, default=0)
+    # Desde cuando esta cada contenedor en el patio (AL13: mas de 2 h).
+    nivel1_desde: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    nivel2_desde: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -242,6 +245,9 @@ class Alarma(Base):
     severidad: Mapped[str] = mapped_column(String(12))  # critica|alta|media|baja
     origen: Mapped[str] = mapped_column(String(32), default="")
     descripcion: Mapped[str] = mapped_column(String(200), default="")
+    # A que se refiere ("turno:5", "retencion:3", "contenedor:MSCU1", "comando:12"):
+    # sirve para no repetir una alarma por la misma causa.
+    referencia: Mapped[Optional[str]] = mapped_column(String(60), nullable=True, index=True)
     estado: Mapped[str] = mapped_column(String(16), default="activa", index=True)  # activa|reconocida
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     ack_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -286,9 +292,11 @@ def make_db(db_path: str):
 
 
 # create_all no agrega columnas a tablas que ya existen: una base creada antes
-# de la fase 1 (por ejemplo la de la Raspberry) necesita este ALTER TABLE.
+# de la fase 1 o 2 (por ejemplo la de la Raspberry) necesita este ALTER TABLE.
 _COLUMNAS_NUEVAS = {
     "manifiestos": {"vehiculo_uid": "VARCHAR(32)"},
+    "alarmas": {"referencia": "VARCHAR(60)"},
+    "patio": {"nivel1_desde": "DATETIME", "nivel2_desde": "DATETIME"},
 }
 
 

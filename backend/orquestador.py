@@ -10,6 +10,10 @@ fisico automatico (fase 1 del plan de trabajo):
     salida   evento=rfid_salida    -> el servidor decide: AbrirPuertaSalida o RechazarSalida
     salida   evento=salida_autorizada;decision=local -> reconcilia una salida sin servidor
     salida   evento=salida_completada -> cierra el turno
+    alarma   (cualquier placa)     -> se guarda en alarmas (fase 2)
+
+Fase 2: las alarmas nuevas se anuncian por MQTT (portus/srv/alarma) despues
+del commit, para que la web las muestre en vivo sin consultar.
 
 Los comandos se publican DESPUES del commit: si la transaccion se deshace
 (rechazo), nunca sale un AbrirTalanquera que la base no respalda.
@@ -18,11 +22,13 @@ Los comandos se publican DESPUES del commit: si la transaccion se deshace
 import json
 from typing import Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 import servicios
 from catalogos import ANULADO, EN_GARITA, EN_PESAJE_ENTRADA, EN_SALIDA, RETENIDO
-from models import CommandAudit, Turno
+from models import Alarma, CommandAudit, Turno
+
+TOPICO_ALARMAS_SERVIDOR = "portus/srv/alarma"
 
 EnviarMqtt = Callable[[str, str], None]  # (topic, payload_json)
 
@@ -103,9 +109,8 @@ def _pesaje_meseta(db, pub: PublicadorDiferido, datos: dict) -> None:
     if turno is None:
         return
     if turno.estado == RETENIDO:
-        # Ej. RT04 en garita: el turno ya espera resolucion; se deja constancia.
-        servicios.registrar_evento(db, turno.id, "controlador",
-                                   "Pesaje de entrada durante una retencion (no se procesa)", datos)
+        # Ej. RT04 en garita: el peso se guarda y se aplica al resolver la retencion.
+        servicios.guardar_pesaje_durante_retencion(db, turno, servicios.peso_simulado_entrada(turno, datos), datos)
         _confirmar(db, pub)
         return
     if turno.estado not in (EN_GARITA, EN_PESAJE_ENTRADA):
@@ -143,6 +148,12 @@ def _salida_rfid(db, pub: PublicadorDiferido, datos: dict) -> None:
             servicios.avanzar_hasta_salida(db, turno, publish_cmd=pub)
         servicios.registrar_intento_rechazado(db, uid, "garita_salida", causa,
                                               contenedor_id=turno.contenedor_id if turno else None)
+        if causa == "sin_turno":
+            # R14: la verificacion de salida no es valida. Una sola alarma
+            # activa por vehiculo aunque pase la tarjeta varias veces.
+            servicios.generar_alarma_unica(db, "AL10", f"vehiculo:{uid}", origen="garita_salida",
+                                           descripcion=f"Vehiculo {uid} en la salida sin turno activo",
+                                           solo_activas=True)
         pub("RechazarSalida", "UNO_SALIDA", {"uid": uid, "motivo": servicios.motivo_lcd(causa)})
         _confirmar(db, pub)
 
@@ -180,6 +191,11 @@ def _salida_completada(db, pub: PublicadorDiferido, datos: dict) -> None:
     _confirmar(db, pub)
 
 
+def _alarma_controlador(db, pub: PublicadorDiferido, datos: dict, origen: str = "") -> None:
+    servicios.registrar_alarma_controlador(db, origen or "controlador", datos)
+    _confirmar(db, pub)
+
+
 MANEJADORES = {
     ("portus/evt/garita", "rfid"): _garita_rfid,
     ("portus/evt/garita", "rechazado"): _garita_rechazado,
@@ -190,12 +206,47 @@ MANEJADORES = {
 }
 
 
-def procesar_evento(session_factory, enviar_mqtt: EnviarMqtt, topic: str, datos: dict) -> bool:
+def procesar_evento(session_factory, enviar_mqtt: EnviarMqtt, topic: str, datos: dict,
+                    origen: str = "") -> bool:
     """Punto de entrada desde app.py:on_message. Devuelve True si el evento
     tenia un manejador."""
+    if topic == "portus/evt/alarma":
+        with session_factory() as db:
+            _alarma_controlador(db, PublicadorDiferido(db, enviar_mqtt), datos, origen)
+        return True
     manejador = MANEJADORES.get((topic, datos.get("evento")))
     if manejador is None:
         return False
     with session_factory() as db:
         manejador(db, PublicadorDiferido(db, enviar_mqtt), datos)
     return True
+
+
+def alarma_dict(a: Alarma) -> dict:
+    return {"id": a.id, "codigo": a.codigo, "severidad": a.severidad, "origen": a.origen,
+            "descripcion": a.descripcion, "referencia": a.referencia, "estado": a.estado,
+            "createdAt": a.created_at.isoformat() if a.created_at else None,
+            "ackAt": a.ack_at.isoformat() if a.ack_at else None, "ackComentario": a.ack_comentario}
+
+
+def anunciar_alarmas_nuevas(session_factory, enviar_mqtt: EnviarMqtt) -> None:
+    """Toda alarma que se confirme en la base (desde cualquier hilo o endpoint)
+    sale por portus/srv/alarma. Si la transaccion se deshace, no sale nada."""
+
+    @event.listens_for(session_factory, "after_flush")
+    def _anotar(session, _ctx):
+        for obj in session.new:
+            if isinstance(obj, Alarma):
+                session.info.setdefault("alarmas_nuevas", []).append(alarma_dict(obj))
+
+    @event.listens_for(session_factory, "after_commit")
+    def _enviar(session):
+        for datos in session.info.pop("alarmas_nuevas", []):
+            try:
+                enviar_mqtt(TOPICO_ALARMAS_SERVIDOR, json.dumps(datos, ensure_ascii=False))
+            except Exception as exc:  # la alarma ya quedo guardada; solo falla el aviso en vivo
+                print(f"[ALARMAS] no se pudo anunciar {datos.get('codigo')}: {exc!r}")
+
+    @event.listens_for(session_factory, "after_soft_rollback")
+    def _descartar(session, _previous_transaction):
+        session.info.pop("alarmas_nuevas", None)

@@ -4,6 +4,8 @@ Todo lo que el PDF define como "exactamente los siguientes" vive aqui como
 constante, para que no queden numeros/strings mágicos repartidos en el codigo.
 """
 
+import os
+
 ROLES = ("TERMINAL", "NAVIERA", "AGENTE", "AUTORIDAD")  # TRANSPORTISTA vive en el bot (D)
 
 # ── Estados del turno (sec. 7) y sus transiciones permitidas ──
@@ -76,6 +78,12 @@ CATALOGO_ALARMAS = {
 }
 
 SEVERIDADES_AUTO_RECONOCIBLES = ("media", "baja")  # boton "Reconocer todas" (sec. 4.6)
+
+# Umbrales de las alarmas por tiempo. Se pueden bajar por variable de entorno
+# para la demostracion (no hay que esperar 2 h frente al catedratico).
+MINUTOS_AL12_RETENCION = int(os.getenv("PORTUS_MIN_AL12", "30"))
+MINUTOS_AL13_PATIO = int(os.getenv("PORTUS_MIN_AL13", "120"))
+SEGUNDOS_REVISION_ALARMAS = 30
 
 DISPOSITIVOS = ("UNO_ENTRADA", "UNO_SALIDA", "MEGA_GRUA")
 

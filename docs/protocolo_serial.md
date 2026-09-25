@@ -113,3 +113,21 @@ de 64. Si el comando llega mientras el loop esta bloqueado (por ejemplo en el
 `Serial.flush()` de un latido), el frame puede cortarse, el checksum falla y la
 garita termina en "Sin respuesta". Si pasa en las pruebas: quitar el
 `Serial.flush()` de `sendFrame` en la entrada o acortar los parametros.
+
+## Alarmas desde las placas (fase 2)
+
+Una placa reporta una alarma con un `EVT` de topico `alarma`; el bridge lo
+publica en `portus/evt/alarma` y el backend lo guarda en `alarmas`:
+
+```text
+<PORTUS|MEGA_GRUA|130|EVT|alarma|codigo=AL02;detalle=boton|..>
+```
+
+- `codigo` es obligatorio y debe estar en el catalogo (AL01-AL14); uno
+  desconocido se ignora.
+- La severidad la pone el servidor segun el catalogo (sec. 4.6); si la placa
+  manda `severidad`, no se usa.
+- Los demas campos se anexan a la descripcion (`detalle=boton`).
+- Mientras la alarma siga activa, repetirla desde la misma placa no crea otra.
+
+Un `REJ` en `portus/cmd/respuesta` genera AL14 con la `causa` del rechazo.

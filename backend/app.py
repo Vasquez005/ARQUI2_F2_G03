@@ -13,7 +13,8 @@ from sqlalchemy import select
 import orquestador
 import servicios
 from catalogos import (
-    CAUSAS_RETENCION, DISPOSITIVOS, MINUTOS_EXPIRA_CODIGO, ROLES, UMBRAL_ENLACE_PERDIDO_S,
+    CAUSAS_RETENCION, DISPOSITIVOS, MINUTOS_EXPIRA_CODIGO, ROLES, SEGUNDOS_REVISION_ALARMAS,
+    UMBRAL_ENLACE_PERDIDO_S,
 )
 from models import (
     Alarma, CommandAudit, Declaracion, EventLog, EventoTurno, IntentoIngreso, LinkDevice,
@@ -30,6 +31,8 @@ MQTT_PORT = int(os.getenv("PORTUS_MQTT_PORT", "1883"))
 app = FastAPI(title="PORTUS Backend Core (Persona B)")
 mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 started = False
+# Fase 2: cada alarma confirmada sale por portus/srv/alarma (la web la muestra en vivo)
+orquestador.anunciar_alarmas_nuevas(SessionLocal, lambda t, p: mqttc.publish(t, p))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -100,6 +103,19 @@ def link_watchdog_loop() -> None:
             db.commit()
 
 
+def alarmas_por_tiempo_loop() -> None:
+    """AL12 (retencion > 30 min) y AL13 (contenedor > 2 h en patio): nadie
+    manda un evento cuando pasa el tiempo, asi que se revisa periodicamente."""
+    while True:
+        time.sleep(SEGUNDOS_REVISION_ALARMAS)
+        try:
+            with SessionLocal() as db:
+                servicios.revisar_alarmas_por_tiempo(db)
+                db.commit()
+        except Exception as exc:  # que un error no mate el hilo
+            print(f"[ALARMAS] error revisando alarmas por tiempo: {exc!r}")
+
+
 def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe("portus/evt/#")
     client.subscribe("portus/cmd/respuesta")
@@ -133,7 +149,7 @@ def on_message(client, userdata, msg):
     # Fase 1: los eventos de garitas y pesaje avanzan el turno solos.
     try:
         orquestador.procesar_evento(SessionLocal, lambda t, p: mqttc.publish(t, p), topic,
-                                    payload.get("data", {}))
+                                    payload.get("data", {}), origen=origin)
     except Exception as exc:  # un evento malo no debe tumbar el hilo MQTT
         print(f"[ORQUESTADOR] error procesando {topic}: {exc!r}")
 
@@ -143,28 +159,10 @@ def on_message(client, userdata, msg):
             upsert_link_device(origin, int(time.time()))
 
     if topic == "portus/cmd/respuesta":
-        cmd_name = payload.get("data", {}).get("name", "UNKNOWN")
-        result = "ACK" if evt_type == "ACK" else "REJ"
+        # Auditoria del comando y, si fue REJ, AL14 con la causa (sec. 11.2)
         with SessionLocal() as db:
-            # Correlacion (Observaciones_Backend_PersonaB.md punto 2.4): se
-            # actualiza el PENDING mas reciente para ese target+comando en vez
-            # de insertar una fila nueva sin relacion. El protocolo serial no
-            # trae un id de correlacion propio (ver limitacion en el .md), asi
-            # que esto es "mejor esfuerzo", no una garantia bajo concurrencia.
-            pendiente = db.scalars(
-                select(CommandAudit)
-                .where(CommandAudit.target == origin, CommandAudit.cmd_name == cmd_name,
-                       CommandAudit.result == "PENDING")
-                .order_by(CommandAudit.id.desc())
-            ).first()
-            if pendiente:
-                pendiente.result = result
-                pendiente.response_json = json.dumps(payload, ensure_ascii=False)
-            else:
-                db.add(CommandAudit(
-                    cmd_name=cmd_name, target=origin, request_json="{}",
-                    result=result, response_json=json.dumps(payload, ensure_ascii=False),
-                ))
+            servicios.registrar_respuesta_comando(db, origin, evt_type, payload.get("data", {}),
+                                                  json.dumps(payload, ensure_ascii=False))
             db.commit()
 
 
@@ -188,6 +186,7 @@ def ensure_started():
     started = True
     threading.Thread(target=mqtt_loop, daemon=True).start()
     threading.Thread(target=link_watchdog_loop, daemon=True).start()
+    threading.Thread(target=alarmas_por_tiempo_loop, daemon=True).start()
 
 
 def make_publish_and_audit(db):
@@ -798,7 +797,9 @@ def listar_patio():
         rows = db.scalars(select(PosicionPatio).order_by(PosicionPatio.id)).all()
         return [
             {"id": p.id, "estado": p.estado, "contenedorNivel1": p.contenedor_nivel1,
-             "contenedorNivel2": p.contenedor_nivel2, "remociones": p.remociones}
+             "contenedorNivel2": p.contenedor_nivel2, "remociones": p.remociones,
+             "nivel1Desde": p.nivel1_desde.isoformat() if p.nivel1_desde else None,
+             "nivel2Desde": p.nivel2_desde.isoformat() if p.nivel2_desde else None}
             for p in rows
         ]
 
@@ -849,11 +850,7 @@ def listar_alarmas(estado: Optional[str] = None, severidad: Optional[str] = None
         if severidad:
             q = q.where(Alarma.severidad == severidad)
         rows = db.scalars(q.order_by(Alarma.id.desc())).all()
-        return [
-            {"id": a.id, "codigo": a.codigo, "severidad": a.severidad, "origen": a.origen,
-             "descripcion": a.descripcion, "estado": a.estado, "createdAt": a.created_at.isoformat()}
-            for a in rows
-        ]
+        return [orquestador.alarma_dict(a) for a in rows]
 
 
 class AckIn(BaseModel):

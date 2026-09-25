@@ -547,6 +547,7 @@ def start_mqtt_listener() -> None:
         event_bus.connected = rc == 0
         client.subscribe("portus/evt/#")
         client.subscribe("portus/cmd/respuesta")  # ACK/REJ que se le muestra al operador (sec. 11.1)
+        client.subscribe("portus/srv/alarma")  # alarmas nuevas que genera el backend (sec. 4.6)
         _publish_to_ws_from_thread({"kind": "status", "connected": event_bus.connected})
 
     def on_disconnect(client, userdata, flags, rc, properties=None):

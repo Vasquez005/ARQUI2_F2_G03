@@ -22,7 +22,9 @@ UID_FUERA = "E1 8E 3C 53"
 UID_DESCONOCIDO = "90 C7 3D 5F"
 
 
-class CicloFisicoTests(unittest.TestCase):
+class MaquetaBase(unittest.TestCase):
+    """Base de datos temporal con patio, parqueo, 2 tarjetas y sus manifiestos."""
+
     def setUp(self):
         fd, self.db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -63,7 +65,8 @@ class CicloFisicoTests(unittest.TestCase):
         with self.Session() as db:
             return db.scalars(select(Turno).where(Turno.vehiculo_uid == uid).order_by(Turno.id.desc())).first()
 
-    # ── pruebas ──
+
+class CicloFisicoTests(MaquetaBase):
     def test_deposito_completo_de_punta_a_punta(self):
         self.evento("garita", evento="rfid", uid=UID_OK)
         abrir = self.comandos("AbrirTalanquera")

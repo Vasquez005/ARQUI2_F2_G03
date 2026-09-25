@@ -32,6 +32,7 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
     orquestador.py    # eventos de la maqueta -> avance del turno (garitas, pesaje, salida)
     seed.py           # usuarios, transportistas y tarjetas RFID (--demo: manifiestos de prueba)
     test_orquestador.py
+    test_alarmas.py
     requirements.txt
   web_c/
     app/main.py       # web: sesion, permisos por rol, proxy hacia B, MQTT -> WebSocket
@@ -81,6 +82,9 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
    del turno: la garita manda el UID, el servidor decide y responde
    `AbrirTalanquera` / `RechazarIngreso` (y lo mismo en la salida). Ver
    `docs/protocolo_serial.md`.
+10. El backend genera las alarmas del catalogo (AL01, AL09-AL14 y las que
+    mandan las placas por `portus/evt/alarma`) y anuncia cada una nueva en
+    `portus/srv/alarma`; la web la reenvia por WebSocket.
 
 ---
 
@@ -97,6 +101,7 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
 - `portus/evt/estado`
 - `portus/cmd/solicitud`
 - `portus/cmd/respuesta`
+- `portus/srv/alarma` (del backend: cada alarma nueva, ya guardada)
 
 ---
 
@@ -138,6 +143,8 @@ Variables opcionales:
 | `PORTUS_BOT_TOKEN` | vacio | Token del bot de Telegram (Persona D) |
 | `PORTUS_SECRET_KEY` | clave de ejemplo | Firma de las cookies de sesion de la web. Cambiarla en la Pi |
 | `PORTUS_BACKEND_BIND` | `127.0.0.1` | Donde escucha el backend. Dejarlo local: la web aplica los permisos |
+| `PORTUS_MIN_AL12` | `30` | Minutos de retencion abierta para AL12 (bajarlo para la demostracion) |
+| `PORTUS_MIN_AL13` | `120` | Minutos de un contenedor en patio para AL13 (bajarlo para la demostracion) |
 
 Servicios:
 
@@ -217,9 +224,9 @@ Con `--demo` cada tarjeta registrada recibe un manifiesto con levante otorgado
 cd bridge
 python3 -m unittest test_protocol.py
 
-# Ciclo fisico del orquestador (sin MQTT ni Arduinos)
+# Ciclo fisico del orquestador y alarmas (sin MQTT ni Arduinos)
 cd backend
-.venv/bin/python3 -m unittest test_orquestador -v
+.venv/bin/python3 -m unittest test_orquestador test_alarmas -v
 ```
 
 ---

@@ -16,12 +16,12 @@ from sqlalchemy import select
 from catalogos import (
     ANULADO, CATALOGO_ALARMAS, CERRADO, EN_GARITA,
     EN_PESAJE_ENTRADA, EN_PESAJE_SALIDA, EN_RUTA, EN_SALIDA, EN_TRANSFERENCIA,
-    ESTADOS_FINALES, MINUTOS_EXPIRA_CODIGO, ROL_FACULTADO_POR_CAUSA, RESOLUCIONES, RETENIDO,
+    ESTADOS_FINALES, MINUTOS_AL12_RETENCION, MINUTOS_AL13_PATIO, MINUTOS_EXPIRA_CODIGO, ROL_FACULTADO_POR_CAUSA, RESOLUCIONES, RETENIDO,
     RT01, RT02, RT03, RT04, SEVERIDADES_AUTO_RECONOCIBLES, TOLERANCIA_VENTANA_MIN,
     TRANSICIONES, ZONA_HORARIA,
 )
 from models import (
-    Alarma, Cita, IntentoIngreso, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
+    Alarma, Cita, CommandAudit, IntentoIngreso, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
     Retencion, Transportista, Turno, EventoTurno, Vehiculo,
 )
 
@@ -169,9 +169,11 @@ def confirmar_deposito_patio(db, posicion_id: int, contenedor_id: str) -> None:
         raise ReglaDeNegocioError("posicion_invalida")
     if p.contenedor_nivel1 is None:
         p.contenedor_nivel1 = contenedor_id
+        p.nivel1_desde = datetime.utcnow()
         p.estado = "OCUPADA_1"
     elif p.contenedor_nivel2 is None:
         p.contenedor_nivel2 = contenedor_id
+        p.nivel2_desde = datetime.utcnow()
         p.estado = "OCUPADA_2"
     else:
         raise ReglaDeNegocioError("posicion_llena")
@@ -186,11 +188,13 @@ def confirmar_remocion_patio(db, posicion_id: int) -> Optional[str]:
     if p.contenedor_nivel2 is not None:
         cid = p.contenedor_nivel2
         p.contenedor_nivel2 = None
+        p.nivel2_desde = None
         p.remociones += 1
         p.estado = "OCUPADA_1"
     elif p.contenedor_nivel1 is not None:
         cid = p.contenedor_nivel1
         p.contenedor_nivel1 = None
+        p.nivel1_desde = None
         p.estado = "LIBRE"
     else:
         raise ReglaDeNegocioError("posicion_vacia")
@@ -212,7 +216,10 @@ def liberar_posicion_patio(db, posicion_id: int) -> None:
         raise ReglaDeNegocioError("posicion_invalida")
     if p.estado != "BLOQUEADA":
         raise ReglaDeNegocioError("posicion_no_bloqueada")
-    p.estado = "LIBRE" if not p.contenedor_nivel1 else "OCUPADA_1"
+    if p.contenedor_nivel2:
+        p.estado = "OCUPADA_2"
+    else:
+        p.estado = "OCUPADA_1" if p.contenedor_nivel1 else "LIBRE"
     p.updated_at = datetime.utcnow()
 
 
@@ -248,14 +255,116 @@ def parqueo_lleno(db) -> bool:
 #  Alarmas (catalogo sec. 4.6)
 # ══════════════════════════════════════════════════════════════════════════
 
-def generar_alarma(db, codigo: str, origen: str = "", descripcion: Optional[str] = None) -> Alarma:
+def generar_alarma(db, codigo: str, origen: str = "", descripcion: Optional[str] = None,
+                   referencia: Optional[str] = None) -> Alarma:
     if codigo not in CATALOGO_ALARMAS:
         raise ReglaDeNegocioError(f"codigo_alarma_desconocido:{codigo}")
     severidad, desc_default = CATALOGO_ALARMAS[codigo]
     alarma = Alarma(codigo=codigo, severidad=severidad, origen=origen,
-                     descripcion=descripcion or desc_default, estado="activa")
+                     descripcion=(descripcion or desc_default)[:200], referencia=referencia, estado="activa")
     db.add(alarma)
     return alarma
+
+
+def generar_alarma_unica(db, codigo: str, referencia: str, origen: str = "",
+                         descripcion: Optional[str] = None, solo_activas: bool = False,
+                         desde: Optional[datetime] = None) -> Optional[Alarma]:
+    """Como generar_alarma, pero no la repite si ya hay una con el mismo codigo
+    y referencia. solo_activas=True permite volver a generarla una vez
+    reconocida la anterior; desde ignora las alarmas anteriores a esa fecha."""
+    q = select(Alarma.id).where(Alarma.codigo == codigo, Alarma.referencia == referencia)
+    if solo_activas:
+        q = q.where(Alarma.estado == "activa")
+    if desde is not None:
+        q = q.where(Alarma.created_at >= desde)
+    if db.scalars(q).first() is not None:
+        return None
+    return generar_alarma(db, codigo, origen=origen, descripcion=descripcion, referencia=referencia)
+
+
+def alarma_pesaje(db, turno: Turno, estacion: str, declarado: int, medido: int, diferencia_pct: float) -> Alarma:
+    """AL09: acompania a RT01 / RT02 con la evidencia del pesaje."""
+    return generar_alarma(
+        db, "AL09", origen=estacion, referencia=f"turno:{turno.id}",
+        descripcion=(f"Pesaje fuera de tolerancia en {estacion} (turno {turno.id}): "
+                     f"declarado {declarado} g, medido {medido} g, diferencia {diferencia_pct:.1f} %"),
+    )
+
+
+def revisar_alarmas_por_tiempo(db, ahora: Optional[datetime] = None) -> list:
+    """AL12 (retencion abierta > 30 min) y AL13 (contenedor > 2 h en patio).
+    La llama un hilo de app.py. Cada caso genera su alarma una sola vez."""
+    ahora = ahora or datetime.utcnow()
+    nuevas = []
+
+    limite_retencion = ahora - timedelta(minutes=MINUTOS_AL12_RETENCION)
+    abiertas = db.scalars(
+        select(Retencion).where(Retencion.estado == "abierta", Retencion.created_at <= limite_retencion)
+    ).all()
+    for r in abiertas:
+        a = generar_alarma_unica(
+            db, "AL12", f"retencion:{r.id}", origen="parqueo",
+            descripcion=(f"Retencion {r.causa} del turno {r.turno_id} abierta hace "
+                         f"{duracion_texto(r.created_at, ahora)}"),
+        )
+        if a is not None:
+            nuevas.append(a)
+
+    limite_patio = ahora - timedelta(minutes=MINUTOS_AL13_PATIO)
+    for p in db.scalars(select(PosicionPatio).order_by(PosicionPatio.id)).all():
+        for nivel, contenedor, desde in ((1, p.contenedor_nivel1, p.nivel1_desde),
+                                         (2, p.contenedor_nivel2, p.nivel2_desde)):
+            if not contenedor or desde is None or desde > limite_patio:
+                continue
+            # desde: si el contenedor sale y vuelve a entrar, cuenta como estancia nueva
+            a = generar_alarma_unica(
+                db, "AL13", f"contenedor:{contenedor}", origen=f"patio_{p.id}", desde=desde,
+                descripcion=(f"Contenedor {contenedor} en posicion {p.id} nivel {nivel} desde hace "
+                             f"{duracion_texto(desde, ahora)}"),
+            )
+            if a is not None:
+                nuevas.append(a)
+    return nuevas
+
+
+def registrar_respuesta_comando(db, origen: str, tipo: str, datos: dict, payload_json: str) -> Optional[Alarma]:
+    """ACK/REJ de un controlador (portus/cmd/respuesta). Actualiza la auditoria
+    del comando y, si fue rechazado, genera AL14 con la causa (sec. 11.1 y 11.2).
+
+    Correlacion: se actualiza el PENDING mas reciente para ese target+comando.
+    El protocolo serial no trae un id de correlacion propio (ver limitacion en
+    docs/protocolo_serial.md), asi que es "mejor esfuerzo" bajo concurrencia."""
+    nombre = datos.get("name", "UNKNOWN")
+    resultado = "ACK" if tipo == "ACK" else "REJ"
+    pendiente = db.scalars(
+        select(CommandAudit)
+        .where(CommandAudit.target == origen, CommandAudit.cmd_name == nombre, CommandAudit.result == "PENDING")
+        .order_by(CommandAudit.id.desc())
+    ).first()
+    if pendiente is None:
+        pendiente = CommandAudit(cmd_name=nombre, target=origen, request_json="{}")
+        db.add(pendiente)
+    pendiente.result = resultado
+    pendiente.response_json = payload_json
+    if resultado == "ACK":
+        return None
+    db.flush()
+    causa = datos.get("causa") or "sin causa"
+    return generar_alarma(db, "AL14", origen=origen, referencia=f"comando:{pendiente.id}",
+                          descripcion=f"{origen} rechazo {nombre}: {causa}")
+
+
+def registrar_alarma_controlador(db, origen: str, datos: dict) -> Optional[Alarma]:
+    """Alarma que manda una placa por portus/evt/alarma (codigo=ALxx;...).
+    La severidad sale del catalogo, no de la placa. Mientras siga activa, la
+    misma alarma de la misma placa no se duplica."""
+    codigo = str(datos.get("codigo", "")).upper()
+    if codigo not in CATALOGO_ALARMAS:
+        return None
+    detalle = ", ".join(f"{k}={v}" for k, v in datos.items() if k not in ("codigo", "severidad", "evento"))
+    descripcion = CATALOGO_ALARMAS[codigo][1] + (f" ({detalle})" if detalle else "")
+    return generar_alarma_unica(db, codigo, f"{origen}:{codigo}", origen=origen,
+                                descripcion=descripcion, solo_activas=True)
 
 
 def reconocer_alarma(db, alarma_id: int, comentario: Optional[str] = None) -> Alarma:
@@ -370,7 +479,35 @@ def resolver_retencion(db, retencion_id: int, resolucion: str, rol_usuario: str,
     notificar_transportista(db, turno, "retencion_resuelta",
                              {"resolucion": resolucion, "motivo": motivo,
                               "peso_declarado_g": turno.peso_declarado_g if resolucion == "corregir" else None})
+
+    if turno.estado in (EN_GARITA, EN_PESAJE_ENTRADA) and turno.peso_medido_entrada_g is not None:
+        # El vehiculo ya cruzo la bascula mientras estaba retenido (ej. RT04 en
+        # garita): ese pesaje quedo guardado y se aplica ahora. Puede generar
+        # otra retencion (RT01 / RT03) con su propia plaza.
+        registrar_evento(db, turno.id, "servidor", "Se aplica el pesaje de entrada recibido durante la retencion",
+                          {"peso_g": turno.peso_medido_entrada_g})
+        procesar_pesaje_entrada(db, turno, turno.peso_medido_entrada_g, publish_cmd=publish_cmd)
     return retencion
+
+
+def guardar_pesaje_durante_retencion(db, turno: Turno, peso_g: int, datos: dict) -> bool:
+    """El pesaje de entrada llego con el turno Retenido. Si la retencion es de
+    antes de la bascula (RT04 en garita, o RT05/RT06 ordenadas ahi), se guarda
+    el peso para aplicarlo al resolverla. Devuelve True si lo guardo."""
+    retencion = db.scalars(
+        select(Retencion).where(Retencion.turno_id == turno.id, Retencion.estado == "abierta")
+        .order_by(Retencion.id.desc())
+    ).first()
+    if (retencion is None or retencion.estado_anterior not in (EN_GARITA, EN_PESAJE_ENTRADA)
+            or turno.peso_medido_entrada_g is not None):
+        registrar_evento(db, turno.id, "controlador",
+                          "Pesaje de entrada durante una retencion (no se procesa)", datos)
+        return False
+    turno.peso_medido_entrada_g = peso_g
+    registrar_evento(db, turno.id, "controlador",
+                      f"Pesaje de entrada durante la retencion {retencion.causa}; se aplica al resolverla",
+                      {**datos, "peso_g": peso_g})
+    return True
 
 
 def retener_manualmente(db, turno: Turno, causa: str, observacion: Optional[str] = None,
@@ -471,6 +608,7 @@ def procesar_pesaje_entrada(db, turno: Turno, peso_medido_g: int,
 
     diferencia_pct = abs(peso_medido_g - declarado) / declarado * 100 if declarado else 100
     if diferencia_pct > tolerancia_pct:
+        alarma_pesaje(db, turno, "pesaje_entrada", declarado, peso_medido_g, diferencia_pct)
         crear_retencion(db, turno, RT01, estado_resume=EN_RUTA, estacion="pesaje_entrada",
                          peso_declarado_g=declarado, peso_medido_g=peso_medido_g, publish_cmd=publish_cmd)
         return
@@ -502,6 +640,7 @@ def procesar_pesaje_salida(db, turno: Turno, peso_medido_g: int,
 
     diferencia_pct = abs(peso_medido_g - declarado) / declarado * 100 if declarado else 100
     if diferencia_pct > tolerancia_pct:
+        alarma_pesaje(db, turno, "pesaje_salida", declarado, peso_medido_g, diferencia_pct)
         crear_retencion(db, turno, RT02, estado_resume=EN_SALIDA, estacion="pesaje_salida",
                          peso_declarado_g=declarado, peso_medido_g=peso_medido_g, publish_cmd=publish_cmd)
         return

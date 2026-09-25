@@ -14,7 +14,7 @@ Responsables: **A** firmware, **B** backend, **C** web, **D** bot.
 |---|---|---|
 | Firmware (A) | Protocolo PORTUS, latido de 5 s, modo degradado con ping de la Pi, 13 comandos. **Desde la fase 1, las garitas le preguntan al servidor.** | Eventos de ciclo y fallas del Mega, AL02, búfer local, calibración |
 | Bridge | Serial ↔ MQTT de las 3 placas, ping cada 3 s | — |
-| Backend (B) | Cadena documental, turnos, RT01–RT06, parqueo, patio, AL01 y AL11, avisos al bot. **Desde la fase 1, los eventos de la maqueta mueven el turno solos.** | AL09, AL10, AL12, AL13, AL14; rutas para Grúa, Citas y Reportes |
+| Backend (B) | Cadena documental, turnos, RT01–RT06, parqueo, patio, avisos al bot. **Desde la fase 1, los eventos de la maqueta mueven el turno solos. Desde la fase 2, genera AL01 y AL09–AL14, guarda las alarmas de las placas y las anuncia en vivo.** | Rutas para Grúa, Citas y Reportes; AL03–AL08 esperan los eventos del Mega (fase 5) |
 | Web (C) | Login y permisos en servidor, las 8 pestañas de la terminal ya se pueden abrir, naviera, agente y autoridad tienen tablas y acciones básicas | 7 de las 8 pestañas de la terminal muestran JSON crudo; falta el sinóptico y los filtros |
 | Bot (D) | Vinculación, 7 comandos, citas, 8 de 9 avisos, aislamiento entre transportistas | Cancelar y reprogramar citas, bloquear franjas |
 
@@ -50,12 +50,12 @@ Responsables: **A** firmware, **B** backend, **C** web, **D** bot.
 - [ ] Subir los 2 firmwares y correr: tarjeta autorizada → pesaje → salida → turno Cerrado.
 - [ ] Riesgo conocido: los comandos con `uid` miden ~96–107 bytes y el búfer de recepción del UNO es de 64. Si aparecen rechazos "Sin respuesta" sin motivo, quitar el `Serial.flush()` de `sendFrame` en la entrada (ver `docs/protocolo_serial.md`).
 - [ ] RT03 (canal rojo) y RT04: el servidor retiene el turno, pero la aguja del UNO de entrada igual se abre si el pesaje fue `ok`. Se resuelve con la decisión de la aguja (fase 6).
-- [ ] RT04 en garita: el pesaje físico llega con el turno retenido y no se procesa. Después de Aclarar, el pesaje se registra desde la API (`/turnos/{id}/pesaje-entrada`).
+- [x] RT04 en garita: el pesaje físico llega con el turno retenido. **Resuelto en la fase 2:** el servidor guarda ese peso y lo aplica al Aclarar (puede terminar en EnRuta o en una retención nueva RT01 / RT03). Si se Rechaza, no se aplica.
 - [ ] La grúa todavía no informa la transferencia. Al llegar a la salida, el servidor pasa por EnTransferencia y lo anota en la línea de tiempo. Se completa en la fase 5.
 
 ---
 
-## Fase 2: alarmas en el backend (B), sin tocar firmware
+## Fase 2: alarmas en el backend (B), sin tocar firmware — ✅ HECHA (2026-09-25)
 
 Todo en el servidor. Las alarmas quedan guardadas aunque la web esté cerrada y **no desaparecen solas** (sec. 4.6).
 
@@ -67,6 +67,29 @@ Todo en el servidor. Las alarmas quedan guardadas aunque la web esté cerrada y 
 | 2.4 | AL12 Retención de más de 30 min | Temporizador | Hilo como `link_watchdog_loop`, sin repetir la alarma |
 | 2.5 | AL13 Más de 2 h en patio | Temporizador | Guardar la **fecha de ingreso** de cada contenedor en `patio` (nivel 1 y 2) |
 | 2.6 | Alarmas que manden las placas | `portus/evt/alarma` | Procesar el tópico y guardar en `alarmas` |
+
+### Lo que se hizo
+
+1. **AL09** en `procesar_pesaje_entrada` y `procesar_pesaje_salida` (junto con RT01 / RT02), con el declarado, el medido y la diferencia en %. También sale si el pesaje llega por la API.
+2. **AL10** cuando la salida rechaza por `sin_turno`. Una sola alarma activa por vehículo aunque pase la tarjeta varias veces; si se reconoce y vuelve a pasar, sale otra.
+3. **AL14** con cada `REJ` de `portus/cmd/respuesta`: "MEGA_GRUA rechazo GruaReferenciar: grua_en_movimiento". La correlación con `command_audit` se movió a `servicios.registrar_respuesta_comando`.
+4. **AL12 y AL13**: hilo `alarmas_por_tiempo_loop` cada 30 s. Cada retención y cada estancia de un contenedor en el patio generan su alarma **una sola vez**. Los umbrales se bajan con `PORTUS_MIN_AL12` y `PORTUS_MIN_AL13` para la demostración.
+5. **Patio:** columnas `nivel1_desde` y `nivel2_desde`, que se llenan en `confirmar_deposito_patio` y se borran en `confirmar_remocion_patio`. `GET /patio` las devuelve (sirve también para 3.5, ordenar por permanencia). De paso se corrigió `liberar_posicion_patio`, que dejaba OCUPADA_1 una posición con dos contenedores.
+6. **Alarmas de las placas:** `portus/evt/alarma` con `codigo=ALxx`. La severidad sale del catálogo, un código desconocido se ignora y no se duplica mientras siga activa. Formato en `docs/protocolo_serial.md`.
+7. **Aviso en vivo:** toda alarma confirmada en la base sale por `portus/srv/alarma` (si la transacción se deshace, no sale). La web ya se suscribe y la reenvía por el WebSocket de la terminal; la pestaña Alarmas (3.3) puede usarlo sin polling.
+8. Columna nueva `alarmas.referencia` (`turno:5`, `retencion:3`, `contenedor:X`, `comando:12`) y `GET /alarmas` devuelve también `referencia`, `ackAt` y `ackComentario` (para el historial de 3.3).
+
+### Verificación
+
+- `backend/test_alarmas.py`: 18 pruebas nuevas; con las 10 de `test_orquestador.py`, 28 pasan.
+- Migración probada sobre una copia de `portus_core.db`.
+- `on_message` probado con un `REJ` y un `portus/evt/alarma` simulados: se guardan y se anuncian.
+
+### Pendiente de la fase 2
+
+- [ ] **AL14 en cada retención:** el servidor manda `AgujaParqueo` / `AgujaLiberar` al Mega, que hoy los rechaza con `causa=pesaje_externo`. Cada retención y cada resolución generan una AL14 baja. Es correcto según la sec. 11.2 pero ensucia la demostración: se resuelve con la decisión de la aguja (6.3).
+- [ ] **AL13** funciona, pero el patio solo se llena cuando la grúa informe los depósitos (5.1). Hasta entonces no se puede ver en la maqueta.
+- [ ] Ninguna placa emite todavía `portus/evt/alarma` (AL02 en 6.1; AL03–AL08 en 5.1).
 
 ---
 
