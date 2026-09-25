@@ -6,24 +6,120 @@
   <div class="tabs">
     {% for tab in tabs %}
     {% set tab_key = tab.lower().replace(" ", "_") %}
-    <button type="button" class="tab tab-btn{% if loop.first %} active{% endif %}" data-tab="{{ tab_key }}">{{ tab }}</button>
+    <button type="button" class="tab tab-btn{% if loop.first %} active{% endif %}" data-tab="{{ tab_key }}">
+      {{ tab }}{% if tab_key == "alarmas" %} <span id="badge-alarmas" class="badge hidden">0</span>{% endif %}
+    </button>
     {% endfor %}
   </div>
 </section>
 
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<!-- ═══════════════════════ 1. Operacion ═══════════════════════ -->
 <section class="panel tab-panel" data-tab-panel="operacion">
-  <h2>Operacion (sinoptico en vivo por MQTT)</h2>
-  <div class="status-grid">
-    <div>
-      <strong>Enlace MQTT:</strong>
-      <span id="mqtt-connected">Desconectado</span>
-    </div>
-    <div>
-      <strong>Ultimo heartbeat:</strong>
-      <span id="mqtt-heartbeat">N/A</span>
+  <div class="sin-header">
+    <h2>Sinoptico en vivo</h2>
+    <div class="sin-status">
+      <span>Modo: <strong id="sin-modo" class="chip">-</strong></span>
+      <span>Broker MQTT: <strong id="mqtt-connected" class="chip chip-bad">Desconectado</strong></span>
     </div>
   </div>
-  <p class="muted">Canal en tiempo real: WebSocket + suscripcion MQTT (sin polling a DB).</p>
+  <div class="enlaces" id="sin-enlaces"></div>
+  <p id="sin-aviso-enlace" class="aviso-enlace hidden"></p>
+
+  <div class="sinoptico">
+    <div class="sin-el" data-el="espera" data-dev="UNO_ENTRADA">
+      <div class="sin-tit">Zona de espera</div>
+      <div class="sin-val" id="el-espera">-</div>
+      <div class="sin-sub">vehiculos autorizados esperando el pesaje</div>
+    </div>
+    <div class="sin-flecha">&rarr;</div>
+    <div class="sin-el" data-el="garita" data-dev="UNO_ENTRADA">
+      <div class="sin-tit">Garita</div>
+      <div class="sin-val" id="el-garita">Libre</div>
+      <div class="sin-sub" id="el-garita-sub"></div>
+    </div>
+    <div class="sin-flecha">&rarr;</div>
+    <div class="sin-el" data-el="talanquera" data-dev="UNO_ENTRADA">
+      <div class="sin-tit">Talanquera</div>
+      <div class="sin-val" id="el-talanquera">-</div>
+    </div>
+    <div class="sin-flecha">&rarr;</div>
+    <div class="sin-el" data-el="pesaje" data-dev="UNO_ENTRADA">
+      <div class="sin-tit">Plataforma de pesaje</div>
+      <div class="sin-val" id="el-pesaje">Libre</div>
+      <div class="sin-sub" id="el-pesaje-sub"></div>
+    </div>
+    <div class="sin-flecha">&rarr;</div>
+    <div class="sin-el" data-el="aguja" data-dev="UNO_ENTRADA">
+      <div class="sin-tit">Aguja desviadora</div>
+      <div class="sin-val" id="el-aguja">-</div>
+    </div>
+    <div class="sin-flecha">&rarr;</div>
+    <div class="sin-el" data-el="transferencia">
+      <div class="sin-tit">Zona de transferencia</div>
+      <div class="sin-val" id="el-transferencia">Libre</div>
+      <div class="sin-sub" id="el-transferencia-sub"></div>
+    </div>
+    <div class="sin-flecha">&rarr;</div>
+    <div class="sin-el" data-el="salida" data-dev="UNO_SALIDA">
+      <div class="sin-tit">Puerta de salida</div>
+      <div class="sin-val" id="el-salida">-</div>
+      <div class="sin-sub" id="el-salida-sub"></div>
+    </div>
+  </div>
+
+  <div class="sin-fila2">
+    <div class="sin-bloque" data-el="parqueo">
+      <div class="sin-tit">Parqueo de retencion</div>
+      <div class="plazas" id="el-parqueo"></div>
+    </div>
+    <div class="sin-bloque" data-el="grua" data-dev="MEGA_GRUA">
+      <div class="sin-tit">Grua</div>
+      <div class="sin-val" id="el-grua">-</div>
+      <div class="sin-sub" id="el-grua-sub"></div>
+      <div class="sin-tit sin-tit-2">Cola de trabajos</div>
+      <div class="sin-sub" id="el-cola">-</div>
+    </div>
+    <div class="sin-bloque" data-el="patio">
+      <div class="sin-tit">Posiciones del patio</div>
+      <div class="patio-grid" id="el-patio"></div>
+    </div>
+  </div>
+  <p class="muted">Se actualiza por suscripcion (MQTT &rarr; WebSocket), sin consultas periodicas.
+    Transferencia, zona de espera y cola de grua se deducen de los turnos hasta que la grua informe sus eventos (fase 5).</p>
+</section>
+
+<section class="panel tab-panel" data-tab-panel="operacion">
+  <h2>Controles</h2>
+  <div class="controles">
+    <button type="button" id="btn-suspender">Suspender grua</button>
+    <button type="button" id="btn-reanudar">Reanudar grua</button>
+    <button type="button" id="btn-referenciar">Referenciar grua</button>
+    <button type="button" id="btn-talanquera" class="btn-warn">Abrir talanquera</button>
+    <button type="button" id="btn-puerta" class="btn-warn">Abrir puerta de salida</button>
+    <button type="button" id="btn-mantenimiento" class="btn-warn">Modo mantenimiento</button>
+    <button type="button" id="btn-silenciar">Silenciar alarma</button>
+  </div>
+  <p class="muted">Liberar parqueo: en cada plaza del sinoptico. Bloquear / Liberar posicion: clic sobre la posicion del patio.
+    Clic sobre un vehiculo: detalle de su turno.</p>
+  <h3>Respuestas del controlador</h3>
+  <div id="respuestas" class="respuestas"><div class="muted">Sin comandos enviados.</div></div>
+</section>
+
+<section class="panel tab-panel" data-tab-panel="operacion">
+  <details>
+    <summary><strong>Todos los comandos remotos (sec. 11)</strong></summary>
+    <form id="command-form" class="inline-form form-comando">
+      <select id="command-input" required>
+        {% for c in comandos %}
+        <option value="{{ c }}">{{ c }}</option>
+        {% endfor %}
+      </select>
+      <input id="command-params" placeholder="parametros, ej. plaza=1 o pos=2 o valor=activar" />
+      <button type="submit">Enviar</button>
+    </form>
+  </details>
 </section>
 
 <section class="panel tab-panel" data-tab-panel="operacion">
@@ -32,92 +128,154 @@
 </section>
 
 <section class="panel tab-panel" data-tab-panel="operacion">
-  <h2>Comando remoto (TERMINAL)</h2>
-  <form id="command-form" class="inline-form">
-    <select id="command-input" required>
-      {% for c in comandos %}
-      <option value="{{ c }}">{{ c }}</option>
-      {% endfor %}
-    </select>
-    <button type="submit">Enviar</button>
-  </form>
-  <p class="muted">La respuesta del controlador (ACK/REJ) aparece en Eventos recientes, topico portus/cmd/respuesta.</p>
-  <pre id="command-result" class="command-result"></pre>
+  <h2>Vinculacion Bot Transportista</h2>
+  <div class="inline-form">
+    <select id="transportista-select"></select>
+    <button id="refresh-transportistas" type="button">Actualizar lista</button>
+    <button id="generate-link-code" type="button">Generar codigo</button>
+  </div>
+  <p id="link-code-result" class="resultado"></p>
 </section>
 
-<section class="panel tab-panel" data-tab-panel="operacion">
-  <h2>Vinculacion Bot Transportista (Integracion C + D)</h2>
-  <div class="status-grid">
-    <div>
-      <label for="transportista-select"><strong>Transportista:</strong></label>
-      <select id="transportista-select"></select>
-    </div>
-    <div>
-      <button id="refresh-transportistas" type="button">Actualizar lista</button>
-      <button id="generate-link-code" type="button">Generar codigo</button>
-    </div>
-  </div>
-  <pre id="link-code-result" class="command-result"></pre>
+<!-- ═══════════════════════ 2. Turnos ═══════════════════════ -->
+<section class="panel tab-panel hidden" data-tab-panel="turnos">
+  <h2>Turnos</h2>
+  <form id="turnos-filtros" class="filtros">
+    <label>Estado
+      <select name="estado">
+        <option value="">Todos</option>
+        {% for e in estados_turno %}<option value="{{ e }}">{{ e }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Operacion
+      <select name="tipo_operacion">
+        <option value="">Ambas</option>
+        <option value="DEPOSITO">Deposito</option>
+        <option value="RETIRO">Retiro</option>
+      </select>
+    </label>
+    <label>Desde <input type="date" name="desde" /></label>
+    <label>Hasta <input type="date" name="hasta" /></label>
+    <label>Contenedor o vehiculo <input name="q" placeholder="MSCU... o E1 69..." /></label>
+    <button type="submit">Filtrar</button>
+  </form>
+  <h3>Turnos activos</h3>
+  <div class="table-wrap"><table class="data-table" id="tabla-turnos-activos"></table></div>
+  <h3>Turnos historicos</h3>
+  <p class="muted">El rango de fechas aplica a los historicos.</p>
+  <div class="table-wrap"><table class="data-table" id="tabla-turnos-historicos"></table></div>
 </section>
 
 <section class="panel tab-panel hidden" data-tab-panel="turnos">
-  <h2>Turnos</h2>
-  <div class="inline-form">
-    <button type="button" id="refresh-turnos">Actualizar turnos</button>
-  </div>
-  <pre id="turnos-result" class="command-result">Sin datos cargados.</pre>
+  <h2>Intentos de ingreso y salida rechazados</h2>
+  <div class="table-wrap"><table class="data-table" id="tabla-intentos"></table></div>
 </section>
 
+<section class="panel tab-panel hidden" data-tab-panel="turnos">
+  <h2>Vehiculos (tarjetas RFID)</h2>
+  <form id="form-vehiculo" class="filtros">
+    <label>UID de la tarjeta <input name="uid" required placeholder="E1 69 73 15" /></label>
+    <label>Transportista <select name="transportista_id" id="vehiculo-transportista"></select></label>
+    <label>Placa <input name="placa" /></label>
+    <label class="check"><input type="checkbox" name="activo" checked /> Activo</label>
+    <button type="submit">Guardar tarjeta</button>
+  </form>
+  <div class="table-wrap"><table class="data-table" id="tabla-vehiculos"></table></div>
+</section>
+
+<!-- ═══════════════════════ 3. Retenciones ═══════════════════════ -->
 <section class="panel tab-panel hidden" data-tab-panel="retenciones">
   <h2>Retenciones</h2>
-  <div class="inline-form">
-    <button type="button" id="refresh-retenciones">Actualizar retenciones</button>
-  </div>
-  <pre id="retenciones-result" class="command-result">Sin datos cargados.</pre>
+  <form id="retenciones-filtros" class="filtros">
+    <label>Causa
+      <select name="causa">
+        <option value="">Todas</option>
+        {% for c in causas_retencion %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Estado
+      <select name="estado">
+        <option value="">Abiertas y resueltas</option>
+        <option value="abierta">Abiertas</option>
+        <option value="resuelta">Resueltas</option>
+      </select>
+    </label>
+  </form>
+  <h3>Abiertas</h3>
+  <div class="table-wrap"><table class="data-table" id="tabla-ret-abiertas"></table></div>
+  <h3>Resueltas</h3>
+  <div class="table-wrap"><table class="data-table" id="tabla-ret-resueltas"></table></div>
 </section>
 
+<!-- ═══════════════════════ 4. Patio ═══════════════════════ -->
 <section class="panel tab-panel hidden" data-tab-panel="patio">
   <h2>Patio</h2>
-  <div class="inline-form">
-    <button type="button" id="refresh-patio">Actualizar patio</button>
-  </div>
-  <pre id="patio-result" class="command-result">Sin datos cargados.</pre>
+  <div class="patio-grid patio-grande" id="patio-posiciones"></div>
+  <h3>Inventario</h3>
+  <label class="check"><input type="checkbox" id="patio-orden" /> Ordenar por permanencia (mayor primero)</label>
+  <div class="table-wrap"><table class="data-table" id="tabla-inventario"></table></div>
 </section>
 
+<!-- ═══════════════════════ 5. Grua ═══════════════════════ -->
 <section class="panel tab-panel hidden" data-tab-panel="grua">
   <h2>Grua</h2>
-  <div class="inline-form">
-    <button type="button" id="refresh-grua">Actualizar historial grua</button>
+  <div class="status-grid">
+    <div><strong>Estado:</strong> <span id="grua-estado">-</span></div>
+    <div><strong>Posicion:</strong> <span id="grua-pos">-</span></div>
+    <div><strong>Suspendida:</strong> <span id="grua-susp">-</span></div>
+    <div><strong>Mantenimiento:</strong> <span id="grua-mant">-</span></div>
   </div>
-  <pre id="grua-result" class="command-result">Sin datos cargados.</pre>
+  <h3>Eventos recibidos</h3>
+  <div class="table-wrap"><table class="data-table" id="tabla-grua"></table></div>
+  <p class="muted">Historial, grafica de tiempos de ciclo y exportar CSV: fase 5 (el Mega todavia solo informa su estado).</p>
 </section>
 
+<!-- ═══════════════════════ 6. Alarmas ═══════════════════════ -->
 <section class="panel tab-panel hidden" data-tab-panel="alarmas">
   <h2>Alarmas</h2>
-  <div class="inline-form">
-    <button type="button" id="refresh-alarmas">Actualizar alarmas</button>
+  <div class="filtros">
+    <label>Severidad
+      <select id="alarmas-severidad">
+        <option value="">Todas</option>
+        <option value="critica">Critica</option>
+        <option value="alta">Alta</option>
+        <option value="media">Media</option>
+        <option value="baja">Baja</option>
+      </select>
+    </label>
+    <button type="button" id="btn-reconocer-todas">Reconocer todas (media y baja)</button>
   </div>
-  <pre id="alarmas-result" class="command-result">Sin datos cargados.</pre>
+  <h3>Activas</h3>
+  <div class="table-wrap"><table class="data-table" id="tabla-alarmas-activas"></table></div>
+  <h3>Historicas</h3>
+  <div class="table-wrap"><table class="data-table" id="tabla-alarmas-historicas"></table></div>
 </section>
 
+<!-- ═══════════════════════ 7. Citas / 8. Reportes ═══════════════════════ -->
 <section class="panel tab-panel hidden" data-tab-panel="citas">
   <h2>Citas</h2>
-  <div class="inline-form">
-    <button type="button" id="refresh-citas">Actualizar citas (desde turnos)</button>
-  </div>
-  <pre id="citas-result" class="command-result">Sin datos cargados.</pre>
+  <p class="muted">Agenda del dia, franjas bloqueadas y cancelar / reprogramar: fase 4.</p>
 </section>
 
 <section class="panel tab-panel hidden" data-tab-panel="reportes">
   <h2>Reportes</h2>
-  <div class="inline-form">
-    <button type="button" id="refresh-reportes">Calcular resumen</button>
-  </div>
-  <pre id="reportes-result" class="command-result">Sin datos cargados.</pre>
+  <p class="muted">Metricas de la corrida y exportar CSV: fase 5.</p>
 </section>
+
+<!-- ═══════════════════════ Dialogos ═══════════════════════ -->
+<dialog id="dlg-turno" class="dialogo">
+  <form method="dialog"><button class="cerrar" aria-label="Cerrar">&times;</button></form>
+  <div id="dlg-turno-body"></div>
+</dialog>
+
+<dialog id="dlg-posicion" class="dialogo">
+  <form method="dialog"><button class="cerrar" aria-label="Cerrar">&times;</button></form>
+  <div id="dlg-posicion-body"></div>
+</dialog>
 
 <script>
   window.PORTUS_WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + window.location.host + "/ws/terminal";
 </script>
+<script src="/static/roles.js"></script>
 <script src="/static/app.js"></script>
 {% endblock %}

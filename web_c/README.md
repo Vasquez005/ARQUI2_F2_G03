@@ -73,5 +73,9 @@ backend de B (`POST /auth/login`). Se crean con `backend/seed.py`
 - Necesita el backend corriendo (`PORTUS_BACKEND_URL`, por defecto `http://127.0.0.1:8100`).
 - Las rutas `/api/<rol>/...` revisan el rol de la sesion y llaman a B. La lista
   completa esta en `app/main.py`; lo que falta de interfaz: `docs originales/Plan_de_trabajo_final.md`.
-- Escucha `portus/evt/#` y `portus/cmd/respuesta` y los reenvia por `/ws/terminal`
-  (solo sesiones TERMINAL).
+- Escucha `portus/evt/#`, `portus/cmd/respuesta` y `portus/srv/#` y los reenvia
+  por `/ws/terminal` (solo sesiones TERMINAL). Al conectarse, el WebSocket manda
+  los eventos recientes y el ultimo mensaje de cada placa para armar el sinoptico.
+- La terminal (`static/app.js`) no consulta periodicamente: cambia con los eventos
+  de las placas y, cuando llega `portus/srv/cambio`, vuelve a pedir solo lo que
+  cambio (turnos, retenciones, parqueo, patio o intentos).

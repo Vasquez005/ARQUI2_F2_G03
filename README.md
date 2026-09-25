@@ -33,6 +33,7 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
     seed.py           # usuarios, transportistas y tarjetas RFID (--demo: manifiestos de prueba)
     test_orquestador.py
     test_alarmas.py
+    test_terminal.py
     requirements.txt
   web_c/
     app/main.py       # web: sesion, permisos por rol, proxy hacia B, MQTT -> WebSocket
@@ -102,6 +103,7 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
 - `portus/cmd/solicitud`
 - `portus/cmd/respuesta`
 - `portus/srv/alarma` (del backend: cada alarma nueva, ya guardada)
+- `portus/srv/cambio` (del backend: `{entidad, id}` de cada turno, retencion, plaza, posicion o intento que cambio)
 
 ---
 
@@ -226,7 +228,7 @@ python3 -m unittest test_protocol.py
 
 # Ciclo fisico del orquestador y alarmas (sin MQTT ni Arduinos)
 cd backend
-.venv/bin/python3 -m unittest test_orquestador test_alarmas -v
+.venv/bin/python3 -m unittest test_orquestador test_alarmas test_terminal -v
 ```
 
 ---

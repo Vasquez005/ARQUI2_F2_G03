@@ -13,7 +13,7 @@ from sqlalchemy import select
 import orquestador
 import servicios
 from catalogos import (
-    CAUSAS_RETENCION, DISPOSITIVOS, MINUTOS_EXPIRA_CODIGO, ROLES, SEGUNDOS_REVISION_ALARMAS,
+    CAUSAS_RETENCION, ESTADOS_FINALES, ROL_FACULTADO_POR_CAUSA, DISPOSITIVOS, MINUTOS_EXPIRA_CODIGO, ROLES, SEGUNDOS_REVISION_ALARMAS,
     UMBRAL_ENLACE_PERDIDO_S,
 )
 from models import (
@@ -31,8 +31,9 @@ MQTT_PORT = int(os.getenv("PORTUS_MQTT_PORT", "1883"))
 app = FastAPI(title="PORTUS Backend Core (Persona B)")
 mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 started = False
-# Fase 2: cada alarma confirmada sale por portus/srv/alarma (la web la muestra en vivo)
-orquestador.anunciar_alarmas_nuevas(SessionLocal, lambda t, p: mqttc.publish(t, p))
+# Cada alarma nueva (portus/srv/alarma) y cada cambio de turnos, retenciones,
+# parqueo y patio (portus/srv/cambio) sale por MQTT al confirmarse: la web lo muestra en vivo.
+orquestador.anunciar_cambios(SessionLocal, lambda t, p: mqttc.publish(t, p))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -576,27 +577,55 @@ def listar_intentos(estacion: Optional[str] = None, limit: int = 100):
 #  Turnos
 # ══════════════════════════════════════════════════════════════════════════
 
-def _turno_dict(t: Turno) -> dict:
+def _turno_dict(t: Turno, nombres: Optional[dict] = None) -> dict:
+    fin = t.closed_at or datetime.utcnow()
     return {
         "id": t.id, "manifiestoId": t.manifiesto_id, "vehiculoUid": t.vehiculo_uid,
+        "transportistaId": t.transportista_id,
+        "transportistaNombre": (nombres or {}).get(t.transportista_id),
         "contenedorId": t.contenedor_id, "tipoOperacion": t.tipo_operacion, "estado": t.estado,
         "estacionActual": t.estacion_actual, "pesoDeclaradoG": t.peso_declarado_g,
         "pesoMedidoEntradaG": t.peso_medido_entrada_g, "pesoMedidoSalidaG": t.peso_medido_salida_g,
         "posicionPatio": t.posicion_patio, "createdAt": t.created_at.isoformat(),
         "closedAt": t.closed_at.isoformat() if t.closed_at else None,
+        "tiempoEnTerminalS": int((fin - t.created_at).total_seconds()),
     }
 
 
+def _nombres_transportistas(db) -> dict:
+    return {t.id: t.nombre for t in db.scalars(select(Transportista)).all()}
+
+
 @app.get("/turnos")
-def listar_turnos(estado: Optional[str] = None, tipo_operacion: Optional[str] = None):
+def listar_turnos(estado: Optional[str] = None, tipo_operacion: Optional[str] = None,
+                  activos: Optional[bool] = None, desde: Optional[str] = None, hasta: Optional[str] = None,
+                  q: Optional[str] = None, limit: int = 500):
+    """Sec. 4.2: activos / historicos, filtros por estado, tipo, rango de fechas
+    (YYYY-MM-DD en hora local) y busqueda por contenedor o vehiculo."""
     with SessionLocal() as db:
-        q = select(Turno)
+        query = select(Turno)
         if estado:
-            q = q.where(Turno.estado == estado)
+            query = query.where(Turno.estado == estado)
         if tipo_operacion:
-            q = q.where(Turno.tipo_operacion == tipo_operacion)
-        rows = db.scalars(q.order_by(Turno.id.desc())).all()
-        return [_turno_dict(t) for t in rows]
+            query = query.where(Turno.tipo_operacion == tipo_operacion)
+        if activos is True:
+            query = query.where(Turno.estado.not_in(ESTADOS_FINALES))
+        elif activos is False:
+            query = query.where(Turno.estado.in_(ESTADOS_FINALES))
+        try:
+            inicio, fin = servicios.rango_utc(desde, hasta)
+        except ValueError:
+            raise HTTPException(400, "fecha_invalida_usar_YYYY-MM-DD")
+        if inicio:
+            query = query.where(Turno.created_at >= inicio)
+        if fin:
+            query = query.where(Turno.created_at < fin)
+        if q:
+            patron = f"%{q.strip().upper()}%"
+            query = query.where(Turno.contenedor_id.ilike(patron) | Turno.vehiculo_uid.ilike(patron))
+        rows = db.scalars(query.order_by(Turno.id.desc()).limit(limit)).all()
+        nombres = _nombres_transportistas(db)
+        return [_turno_dict(t, nombres) for t in rows]
 
 
 @app.get("/turnos/{turno_id}")
@@ -608,7 +637,7 @@ def detalle_turno(turno_id: int):
         eventos = db.scalars(
             select(EventoTurno).where(EventoTurno.turno_id == turno_id).order_by(EventoTurno.ts)
         ).all()
-        data = _turno_dict(t)
+        data = _turno_dict(t, _nombres_transportistas(db))
         data["lineaDeTiempo"] = [
             {"ts": e.ts.isoformat(), "origen": e.origen, "descripcion": e.descripcion,
              "valores": json.loads(e.valores_json)}
@@ -751,13 +780,30 @@ def listar_retenciones(estado: Optional[str] = None, causa: Optional[str] = None
                 raise HTTPException(400, "causa_invalida")
             q = q.where(Retencion.causa == causa)
         rows = db.scalars(q.order_by(Retencion.id.desc())).all()
-        return [
-            {"id": r.id, "turnoId": r.turno_id, "causa": r.causa, "estacion": r.estacion,
-             "plaza": r.plaza, "estado": r.estado, "resolucion": r.resolucion,
-             "pesoDeclaradoG": r.peso_declarado_g, "pesoMedidoG": r.peso_medido_g,
-             "createdAt": r.created_at.isoformat()}
-            for r in rows
-        ]
+        turnos = {t.id: t for t in db.scalars(select(Turno).where(Turno.id.in_({r.turno_id for r in rows}))).all()}
+        return [_retencion_dict(r, turnos.get(r.turno_id)) for r in rows]
+
+
+def _retencion_dict(r: Retencion, t: Optional[Turno]) -> dict:
+    """Sec. 4.3: la evidencia de peso solo aplica a las causas de peso."""
+    fin = r.resolved_at or datetime.utcnow()
+    datos = {
+        "id": r.id, "turnoId": r.turno_id, "causa": r.causa, "estacion": r.estacion,
+        "plaza": r.plaza, "estado": r.estado, "resolucion": r.resolucion,
+        "motivo": r.motivo, "observacion": r.observacion,
+        "vehiculoUid": t.vehiculo_uid if t else None, "contenedorId": t.contenedor_id if t else None,
+        "rolFacultado": ROL_FACULTADO_POR_CAUSA.get(r.causa),
+        "pesoDeclaradoG": r.peso_declarado_g, "pesoMedidoG": r.peso_medido_g,
+        "diferenciaG": None, "diferenciaPct": None,
+        "createdAt": r.created_at.isoformat(),
+        "resolvedAt": r.resolved_at.isoformat() if r.resolved_at else None,
+        "tiempoRetencionS": int((fin - r.created_at).total_seconds()),
+    }
+    if r.causa in ("RT01", "RT02") and r.peso_declarado_g and r.peso_medido_g is not None:
+        diferencia = r.peso_medido_g - r.peso_declarado_g
+        datos["diferenciaG"] = abs(diferencia)
+        datos["diferenciaPct"] = round(abs(diferencia) / r.peso_declarado_g * 100, 1)
+    return datos
 
 
 class ResolverRetencionIn(BaseModel):
@@ -804,6 +850,36 @@ def listar_patio():
         ]
 
 
+@app.get("/patio/inventario")
+def inventario_patio():
+    """Sec. 4.4: un renglon por contenedor en el patio."""
+    with SessionLocal() as db:
+        navieras = {u.id: (u.nombre or u.username) for u in db.scalars(select(Usuario)).all()}
+        filas = []
+        for p in db.scalars(select(PosicionPatio).order_by(PosicionPatio.id)).all():
+            for nivel, contenedor, desde in ((1, p.contenedor_nivel1, p.nivel1_desde),
+                                             (2, p.contenedor_nivel2, p.nivel2_desde)):
+                if not contenedor:
+                    continue
+                m = db.scalars(select(Manifiesto).where(Manifiesto.contenedor_id == contenedor)
+                               .order_by(Manifiesto.id.desc())).first()
+                t = db.scalars(select(Turno).where(Turno.contenedor_id == contenedor)
+                               .order_by(Turno.id.desc())).first()
+                filas.append({
+                    "contenedorId": contenedor, "posicion": p.id, "nivel": nivel,
+                    "naviera": navieras.get(m.naviera_usuario_id) if m else None,
+                    "pesoDeclaradoG": m.peso_declarado_g if m else None,
+                    "estadoAutorizacion": m.estado_documental if m else None,
+                    "ingresoTerminal": t.created_at.isoformat() if t else None,
+                    "enPatioDesde": desde.isoformat() if desde else None,
+                    "permanenciaS": int((datetime.utcnow() - desde).total_seconds()) if desde else None,
+                    # El patio lleva las remociones por posicion; el Mega todavia
+                    # no informa movimientos por contenedor (fase 5).
+                    "remociones": p.remociones,
+                })
+        return filas
+
+
 @app.post("/patio/{posicion_id}/bloquear")
 def bloquear_patio(posicion_id: int):
     with SessionLocal() as db:
@@ -832,9 +908,35 @@ def liberar_patio(posicion_id: int):
 
 @app.get("/parqueo")
 def listar_parqueo():
+    """Plazas con el vehiculo que la ocupa, su tiempo y si la retencion ya
+    fue resuelta (condicion del boton Liberar parqueo, sec. 4.1)."""
     with SessionLocal() as db:
         rows = db.scalars(select(ParqueoPlaza).order_by(ParqueoPlaza.id)).all()
-        return [{"id": p.id, "ocupada": p.ocupada, "turnoId": p.turno_id} for p in rows]
+        salida = []
+        for p in rows:
+            t = db.get(Turno, p.turno_id) if p.turno_id else None
+            abierta = servicios.retencion_abierta_de_turno(db, p.turno_id) if p.turno_id else None
+            salida.append({
+                "id": p.id, "ocupada": p.ocupada, "turnoId": p.turno_id,
+                "vehiculoUid": t.vehiculo_uid if t else None, "contenedorId": t.contenedor_id if t else None,
+                "desde": p.desde.isoformat() if p.desde else None,
+                "retencionAbiertaId": abierta.id if abierta else None,
+                "causa": abierta.causa if abierta else None,
+                "retencionResuelta": bool(p.ocupada and t is not None and abierta is None),
+            })
+        return salida
+
+
+@app.post("/parqueo/{plaza_id}/liberar")
+def liberar_parqueo(plaza_id: int):
+    with SessionLocal() as db:
+        try:
+            servicios.solicitar_liberar_parqueo(db, plaza_id, publish_cmd=make_publish_and_audit(db))
+        except servicios.ReglaDeNegocioError as exc:
+            db.rollback()
+            raise HTTPException(409, str(exc))
+        db.commit()
+        return {"ok": True, "enviado": "AgujaLiberar", "plaza": plaza_id}
 
 
 # ══════════════════════════════════════════════════════════════════════════

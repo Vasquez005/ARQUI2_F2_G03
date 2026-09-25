@@ -62,6 +62,9 @@ COMANDOS_REMOTOS = {
 }
 
 CAUSAS_ADUANERAS = ("RT03", "RT05")
+CAUSAS_RETENCION = ("RT01", "RT02", "RT03", "RT04", "RT05", "RT06")
+ESTADOS_TURNO = ("EnGarita", "EnPesajeEntrada", "EnRuta", "EnTransferencia", "EnPesajeSalida",
+                 "EnSalida", "Retenido", "Cerrado", "Anulado")
 ESTADOS_SIN_LEVANTE = ("declarado", "declaracion_presentada", "levante_solicitado")
 
 
@@ -101,6 +104,9 @@ class EventBus:
         self.last_heartbeat_iso: Optional[str] = None
         self.connected = False
         self.recent_events: deque = deque(maxlen=100)
+        # Ultimo mensaje por topico y origen: el sinoptico arma el estado de
+        # cada placa al abrir la pagina aunque el evento sea viejo (ej. la barra).
+        self.last_by_key: dict = {}
         self.lock = threading.Lock()
 
     async def register(self, ws: WebSocket) -> None:
@@ -113,6 +119,7 @@ class EventBus:
                 "connected": self.connected,
                 "lastHeartbeat": self.last_heartbeat_iso,
                 "events": list(self.recent_events),
+                "ultimos": sorted(self.last_by_key.values(), key=lambda e: e["ts"]),
             }
         )
 
@@ -126,8 +133,10 @@ class EventBus:
             "ts": datetime.now(timezone.utc).isoformat(),
             "payload": payload,
         }
+        origin = payload.get("origin", "") if isinstance(payload, dict) else ""
         with self.lock:
             self.recent_events.appendleft(event)
+            self.last_by_key[f"{topic}|{origin}"] = event
 
     async def broadcast(self, payload: dict) -> None:
         with self.lock:
@@ -261,7 +270,8 @@ def dashboard(request: Request):
 def terminal_page(request: Request, user: dict = Depends(require_role(Role.TERMINAL))):
     return templates.TemplateResponse(
         "terminal.html",
-        {"request": request, "user": user, "tabs": terminal_tab_list(), "comandos": list(COMANDOS_REMOTOS)},
+        {"request": request, "user": user, "tabs": terminal_tab_list(), "comandos": list(COMANDOS_REMOTOS),
+         "estados_turno": ESTADOS_TURNO, "causas_retencion": CAUSAS_RETENCION},
     )
 
 
@@ -314,8 +324,33 @@ def generar_codigo_vinculacion(req: LinkCodeRequest, user: dict = Depends(requir
 
 @app.get("/api/terminal/turnos")
 def terminal_turnos(estado: Optional[str] = None, tipo_operacion: Optional[str] = None,
-                    user: dict = Depends(require_role(Role.TERMINAL))):
-    return backend("GET", "/turnos", params={"estado": estado, "tipo_operacion": tipo_operacion})
+                    activos: Optional[bool] = None, desde: Optional[str] = None, hasta: Optional[str] = None,
+                    q: Optional[str] = None, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/turnos", params={"estado": estado, "tipo_operacion": tipo_operacion,
+                                             "activos": None if activos is None else str(activos).lower(),
+                                             "desde": desde, "hasta": hasta, "q": q})
+
+
+@app.get("/api/terminal/intentos")
+def terminal_intentos(estacion: Optional[str] = None, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/garita/intentos", params={"estacion": estacion})
+
+
+@app.get("/api/terminal/vehiculos")
+def terminal_vehiculos(user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/vehiculos")
+
+
+class VehiculoIn(BaseModel):
+    uid: str
+    transportista_id: Optional[int] = None
+    placa: str = ""
+    activo: bool = True
+
+
+@app.post("/api/terminal/vehiculos")
+def terminal_registrar_vehiculo(body: VehiculoIn, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", "/vehiculos", body.model_dump())
 
 
 @app.get("/api/terminal/turnos/{turno_id}")
@@ -369,6 +404,17 @@ def terminal_resolver(retencion_id: int, body: ResolverIn, user: dict = Depends(
 @app.get("/api/terminal/patio")
 def terminal_patio(user: dict = Depends(require_role(Role.TERMINAL))):
     return {"patio": backend("GET", "/patio"), "parqueo": backend("GET", "/parqueo")}
+
+
+@app.get("/api/terminal/patio/inventario")
+def terminal_inventario(user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/patio/inventario")
+
+
+@app.post("/api/terminal/parqueo/{plaza_id}/liberar")
+def terminal_liberar_parqueo(plaza_id: int, user: dict = Depends(require_role(Role.TERMINAL))):
+    # B valida que la plaza este ocupada y su retencion resuelta (sec. 4.1)
+    return backend("POST", f"/parqueo/{plaza_id}/liberar")
 
 
 @app.post("/api/terminal/patio/{posicion_id}/{accion}")
@@ -547,7 +593,8 @@ def start_mqtt_listener() -> None:
         event_bus.connected = rc == 0
         client.subscribe("portus/evt/#")
         client.subscribe("portus/cmd/respuesta")  # ACK/REJ que se le muestra al operador (sec. 11.1)
-        client.subscribe("portus/srv/alarma")  # alarmas nuevas que genera el backend (sec. 4.6)
+        # Del backend: alarmas nuevas y cambios de turnos, retenciones, parqueo y patio
+        client.subscribe("portus/srv/#")
         _publish_to_ws_from_thread({"kind": "status", "connected": event_bus.connected})
 
     def on_disconnect(client, userdata, flags, rc, properties=None):

@@ -30,7 +30,7 @@ class AlarmasTests(MaquetaBase):
     def setUp(self):
         super().setUp()
         self.mqtt = []
-        orquestador.anunciar_alarmas_nuevas(self.Session, lambda t, p: self.mqtt.append((t, p)))
+        orquestador.anunciar_cambios(self.Session, lambda t, p: self.mqtt.append((t, p)))
 
     # ── 2.1 AL09 ──
     def test_pesaje_fuera_de_tolerancia_genera_al09_con_la_evidencia(self):

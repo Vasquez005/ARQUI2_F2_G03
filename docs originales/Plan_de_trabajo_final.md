@@ -15,7 +15,7 @@ Responsables: **A** firmware, **B** backend, **C** web, **D** bot.
 | Firmware (A) | Protocolo PORTUS, latido de 5 s, modo degradado con ping de la Pi, 13 comandos. **Desde la fase 1, las garitas le preguntan al servidor.** | Eventos de ciclo y fallas del Mega, AL02, búfer local, calibración |
 | Bridge | Serial ↔ MQTT de las 3 placas, ping cada 3 s | — |
 | Backend (B) | Cadena documental, turnos, RT01–RT06, parqueo, patio, avisos al bot. **Desde la fase 1, los eventos de la maqueta mueven el turno solos. Desde la fase 2, genera AL01 y AL09–AL14, guarda las alarmas de las placas y las anuncia en vivo.** | Rutas para Grúa, Citas y Reportes; AL03–AL08 esperan los eventos del Mega (fase 5) |
-| Web (C) | Login y permisos en servidor, las 8 pestañas de la terminal ya se pueden abrir, naviera, agente y autoridad tienen tablas y acciones básicas | 7 de las 8 pestañas de la terminal muestran JSON crudo; falta el sinóptico y los filtros |
+| Web (C) | Login y permisos en servidor. **Desde la fase 3:** sinóptico en vivo con los 13 elementos, controles con confirmación y ACK/REJ legible; Turnos, Retenciones, Patio y Alarmas completas, todo por WebSocket | Grúa, Citas y Reportes (fases 4 y 5); ver detalle en naviera / agente / autoridad (5.5) |
 | Bot (D) | Vinculación, 7 comandos, citas, 8 de 9 avisos, aislamiento entre transportistas | Cancelar y reprogramar citas, bloquear franjas |
 
 ---
@@ -87,13 +87,13 @@ Todo en el servidor. Las alarmas quedan guardadas aunque la web esté cerrada y 
 
 ### Pendiente de la fase 2
 
-- [ ] **AL14 en cada retención:** el servidor manda `AgujaParqueo` / `AgujaLiberar` al Mega, que hoy los rechaza con `causa=pesaje_externo`. Cada retención y cada resolución generan una AL14 baja. Es correcto según la sec. 11.2 pero ensucia la demostración: se resuelve con la decisión de la aguja (6.3).
+- [ ] **AL14 en cada retención y resolución:** el servidor manda `AgujaParqueo` / `AgujaLiberar` al Mega, que hoy los rechaza con `causa=pesaje_externo`. Cada retención y cada resolución generan una AL14 baja. Es correcto según la sec. 11.2 pero ensucia la demostración: se resuelve con la decisión de la aguja (6.3).
 - [ ] **AL13** funciona, pero el patio solo se llena cuando la grúa informe los depósitos (5.1). Hasta entonces no se puede ver en la maqueta.
 - [ ] Ninguna placa emite todavía `portus/evt/alarma` (AL02 en 6.1; AL03–AL08 en 5.1).
 
 ---
 
-## Fase 3: terminal web (C). Es lo más evaluado
+## Fase 3: terminal web (C). Es lo más evaluado — ✅ HECHA (2026-09-25)
 
 Regla general: nada de `setInterval` + `fetch` para el estado en vivo (se penaliza); todo por WebSocket.
 
@@ -106,6 +106,34 @@ Regla general: nada de `setInterval` + `fetch` para el estado en vivo (se penali
 | 3.5 | **Patio** | 4 posiciones × 2 niveles, Bloquear / Liberar, ordenar por permanencia, resaltar los de más de 2 h (depende de 2.5). |
 | 3.6 | Intentos y vehículos | Mostrar `GET /garita/intentos` (Operación o Turnos) y un formulario para registrar tarjetas (`POST /vehiculos`). Hace falta el proxy en `web_c`. |
 | 3.7 | Permisos en la interfaz | Ocultar los botones a los roles que no pueden usarlos (el servidor ya los rechaza). |
+
+### Lo que se hizo
+
+1. **Tiempo real sin polling.** El backend anuncia en `portus/srv/cambio` (`{entidad, id}`) cada cambio confirmado de turnos, retenciones, plazas, posiciones del patio e intentos; la web se suscribe a `portus/srv/#` y recarga **solo** lo que cambió cuando llega el aviso. El único temporizador de la página redibuja relojes y la antigüedad del enlace; no consulta nada.
+2. **3.1 Operación:** sinóptico con los 13 elementos. Garita, talanquera, pesaje, aguja, puerta de salida, grúa y modo salen de los eventos y latidos de las placas; parqueo y patio, del servidor. Transferencia, zona de espera y cola de grúa se deducen de los turnos (rotulado en pantalla) hasta la fase 5. Enlace por placa con la hora del último mensaje: sin latido por 15 s, esa parte se pone gris con un aviso de "último estado conocido" y el modo pasa a Degradado. Botones Suspender / Reanudar (solo suspendida) / Referenciar (solo en reposo o suspendida), Abrir talanquera, Abrir puerta y Modo mantenimiento con confirmación, Liberar parqueo por plaza, clic en posición (Bloquear / Liberar) y en vehículo (detalle del turno). Respuestas "MEGA_GRUA RECHAZO AgujaLiberar: pesaje_externo" o "sin respuesta en 6 s". Se conserva un formulario con los 13 comandos y sus parámetros.
+3. **3.2 Retenciones:** abiertas y resueltas, evidencia de peso (declarado, medido, diferencia en g y %), tiempo de retención en vivo, rol facultado, Aclarar / Corregir (solo RT01-RT02) / Rechazar (pide motivo), filtros por causa y estado.
+4. **3.3 Alarmas:** activas e históricas, Reconocer con comentario, Reconocer todas (media y baja), filtro por severidad, contador en la pestaña y aviso emergente al llegar una nueva.
+5. **3.4 Turnos:** activos e históricos, filtros por estado, tipo, fecha (históricos) y búsqueda; transportista, pesos y tiempo en terminal; Ver detalle con la línea de tiempo al segundo; Retener (observación) y Anular. **B:** `GET /turnos` acepta `activos`, `desde`, `hasta` y `q`, y devuelve `transportistaNombre` y `tiempoEnTerminalS`.
+6. **3.5 Patio:** 4 posiciones × 2 niveles con Bloquear / Liberar, inventario (`GET /patio/inventario`) con naviera, peso, autorización, ingreso, reloj de permanencia, remociones, orden por permanencia y resaltado de más de 2 h.
+7. **3.6:** tabla de intentos rechazados y registro de tarjetas RFID en la pestaña Turnos (proxies nuevos en `web_c`).
+8. **3.7:** en Retenciones, las causas aduaneras muestran "Resuelve AUTORIDAD" en lugar de los botones.
+
+### Correcciones de fases anteriores en este sprint
+
+- **Plaza del parqueo (fase 1):** Aclarar liberaba la plaza aunque el camión seguía estacionado, así que el botón Liberar parqueo (plaza ocupada con retención resuelta) nunca podía habilitarse. Ahora la plaza queda ocupada hasta que el vehículo sale del parqueo: ACK de `AgujaLiberar`, llegada a la garita de salida o cierre del turno. Si el mismo turno vuelve a retenerse, reutiliza su plaza. Nueva ruta `POST /parqueo/{id}/liberar`.
+- **Retención manual (fase 1):** RT05 / RT06 fallaban con 409 en EnRuta y EnTransferencia porque el mapa de transiciones no permitía pasar a Retenido; ahora se puede "en cualquier momento" (sec. 8.2). Solo manda el vehículo al parqueo si todavía no llegó a la transferencia (sec. 4.2), y la observación se guarda.
+- **Horas en la web:** el backend manda UTC sin zona y el navegador lo tomaba como hora local (6 h de diferencia). `roles.js` lo interpreta como UTC; aplica también a naviera, agente y autoridad.
+
+### Verificación
+
+- `backend/test_terminal.py`: 12 pruebas nuevas; con `test_orquestador` y `test_alarmas`, 40 pasan.
+- Prueba de punta a punta con Mosquitto, backend y web reales y un simulador del bridge: depósito, RT01 con AL09, AL14 por la aguja, AL10, intentos, Aclarar desde la web (la plaza pasa a "resuelta" en vivo), Liberar parqueo, Suspender / Reanudar y pérdida de enlace (gris, Degradado y AL01 en vivo). Sin errores en la consola del navegador.
+
+### Pendiente de la fase 3
+
+- [ ] Con el Mega actual, `AgujaLiberar` siempre recibe REJ: la plaza se libera cuando el vehículo llega a la salida. Se resuelve con 6.3.
+- [ ] Las confirmaciones y motivos usan los diálogos nativos del navegador (`confirm` / `prompt`); funcionan, pero se pueden reemplazar por formularios propios si hay tiempo.
+- [ ] La pestaña Grúa muestra estado y eventos en vivo; historial, gráfica y CSV quedan para la fase 5. Citas (fase 4) y Reportes (fase 5) siguen como marcadores.
 
 ---
 

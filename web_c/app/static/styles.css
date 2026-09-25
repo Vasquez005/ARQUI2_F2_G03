@@ -5,7 +5,7 @@ body { margin: 0; font-family: Arial, sans-serif; background: #f5f6f8; color: #1
 .session-info { display: flex; gap: 14px; align-items: center; font-size: 14px; }
 .session-info form { margin: 0; }
 .session-info button { padding: 6px 10px; }
-.container { max-width: 1080px; margin: 16px auto; padding: 0 12px 28px; }
+.container { max-width: 1320px; margin: 16px auto; padding: 0 12px 28px; }
 .panel { background: #fff; border: 1px solid #d8dee4; border-radius: 8px; padding: 14px; margin-bottom: 12px; }
 .tabs { display: flex; flex-wrap: wrap; gap: 8px; }
 .tab { border: 1px solid #d0d7de; background: #f6f8fa; border-radius: 999px; padding: 6px 12px; font-size: 14px; }
@@ -38,3 +38,74 @@ body { margin: 0; font-family: Arial, sans-serif; background: #f5f6f8; color: #1
 .login-card input { padding: 8px; }
 .login-card button { margin-top: 8px; padding: 8px; }
 .error { background: #ffebe9; border: 1px solid #ff8182; color: #cf222e; padding: 8px; border-radius: 6px; margin: 8px 0; }
+
+/* ── Terminal (fase 3) ── */
+.badge { background: #cf222e; color: #fff; border-radius: 999px; padding: 0 7px; font-size: 12px; margin-left: 4px; }
+.chip { display: inline-block; border: 1px solid #d0d7de; border-radius: 999px; padding: 2px 9px; font-size: 13px; background: #f6f8fa; }
+.chip small { color: #57606a; margin-left: 4px; }
+.chip-ok { background: #dafbe1; border-color: #4ac26b; color: #116329; }
+.chip-warn { background: #fff8c5; border-color: #d4a72c; color: #7d4e00; }
+.chip-bad { background: #ffebe9; border-color: #ff8182; color: #a40e26; }
+.sin-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+.sin-header h2 { margin: 0; }
+.sin-status { display: flex; gap: 14px; flex-wrap: wrap; font-size: 14px; }
+.enlaces { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.aviso-enlace { background: #ffebe9; border: 1px solid #ff8182; color: #a40e26; padding: 8px; border-radius: 6px; font-weight: 700; }
+.sinoptico { display: flex; align-items: stretch; gap: 4px; flex-wrap: wrap; margin-top: 8px; }
+.sin-flecha { align-self: center; color: #8c959f; font-size: 20px; }
+.sin-el, .sin-bloque { border: 1px solid #d0d7de; border-radius: 8px; padding: 8px; background: #fbfcfd; min-width: 140px; flex: 1; transition: opacity .3s; }
+.sin-tit { font-size: 12px; text-transform: uppercase; letter-spacing: .03em; color: #57606a; margin-bottom: 4px; }
+.sin-tit-2 { margin-top: 10px; }
+.sin-val { font-weight: 700; padding: 4px 6px; border-radius: 6px; display: inline-block; }
+.sin-sub { font-size: 12px; color: #424a53; margin-top: 4px; }
+.est-idle { background: #eaeef2; color: #424a53; }
+.est-ok { background: #dafbe1; color: #116329; }
+.est-warn { background: #fff8c5; color: #7d4e00; }
+.est-bad { background: #ffebe9; color: #a40e26; }
+.est-movimiento { background: #ddf4ff; color: #0550ae; animation: pulso 1.2s infinite; }
+@keyframes pulso { 50% { opacity: .6; } }
+.stale { opacity: .45; filter: grayscale(1); }
+.sin-fila2 { display: grid; grid-template-columns: 1.3fr 1fr 1.3fr; gap: 8px; margin-top: 8px; }
+@media (max-width: 900px) { .sin-fila2 { grid-template-columns: 1fr; } }
+.plazas { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.plaza { border-radius: 6px; padding: 6px; font-size: 12px; }
+.plaza button { margin-top: 4px; font-size: 12px; }
+.patio-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.posicion { border: 1px solid #d0d7de; border-radius: 6px; padding: 6px; cursor: pointer; text-align: left; font: inherit; font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
+.posicion .nivel { font-family: monospace; }
+.patio-grande .posicion { font-size: 14px; padding: 12px; }
+.vehiculo { font-family: monospace; font-size: 12px; background: #0b1f3a; color: #fff; border: 0; border-radius: 4px; padding: 1px 6px; cursor: pointer; }
+.vehiculo.sin-turno { background: #8c959f; }
+.controles { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.controles button { padding: 8px 12px; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.btn-warn { border: 1px solid #d4a72c; background: #fff8c5; }
+.respuestas { max-height: 180px; overflow: auto; font-family: monospace; font-size: 13px; }
+.respuesta { padding: 4px 8px; border-left: 4px solid #d0d7de; margin-bottom: 3px; }
+.respuesta.ok { border-color: #2da44e; background: #f0fff4; }
+.respuesta.bad { border-color: #cf222e; background: #fff5f5; }
+.respuesta.pendiente { border-color: #0969da; background: #f6fbff; }
+.form-comando { margin-top: 8px; }
+.filtros { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 8px; }
+.filtros label { display: flex; flex-direction: column; font-size: 13px; gap: 3px; }
+.filtros input, .filtros select, .filtros button { padding: 6px; }
+.filtros label.check, label.check { flex-direction: row; align-items: center; gap: 6px; }
+.acciones { white-space: nowrap; }
+.acciones button { margin: 1px 0; }
+.fila-excedida td { background: #fff1e5; }
+tr.sev-critica td:first-child, tr.sev-alta td:first-child { border-left: 4px solid #cf222e; }
+tr.sev-media td:first-child { border-left: 4px solid #d4a72c; }
+tr.sev-baja td:first-child { border-left: 4px solid #8c959f; }
+.log-row { margin-bottom: 3px; }
+.log-srv { color: #79c0ff; }
+.resultado { margin: 8px 0 0; }
+.codigo { font-family: monospace; font-size: 20px; font-weight: 700; letter-spacing: .1em; }
+.dialogo { border: 1px solid #d0d7de; border-radius: 10px; max-width: 960px; width: 92vw; padding: 16px 20px; }
+.dialogo::backdrop { background: rgba(0, 0, 0, .35); }
+.dialogo .cerrar { float: right; border: 0; background: none; font-size: 24px; cursor: pointer; }
+.toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 6px; z-index: 50; max-width: 420px; }
+.toast { background: #24292f; color: #fff; padding: 10px 14px; border-radius: 6px; font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,.2); }
+.toast-ok { background: #1a7f37; }
+.toast-warn { background: #9a6700; }
+.toast-bad { background: #cf222e; }
+h3 { margin: 14px 0 6px; font-size: 16px; }

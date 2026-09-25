@@ -12,10 +12,20 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+// El backend guarda UTC y lo manda sin zona ("2026-09-25T16:00:00"): sin la
+// Z, el navegador lo tomaria como hora local y mostraria 6 h de diferencia.
+function parseUtc(value) {
+  if (!value) return null;
+  const texto = String(value);
+  const tieneZona = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(texto);
+  const d = new Date(tieneZona ? texto : `${texto}Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 function fmtDate(value) {
   if (!value) return "-";
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return toText(value);
+  const d = parseUtc(value);
+  if (!d) return toText(value);
   return d.toLocaleString();
 }
 

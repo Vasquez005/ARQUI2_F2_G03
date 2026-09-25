@@ -59,6 +59,8 @@ def transicionar_turno(db, turno: Turno, nuevo_estado: str, origen: str = "servi
     turno.estado = nuevo_estado
     if nuevo_estado in ESTADOS_FINALES:
         turno.closed_at = datetime.utcnow()
+    if nuevo_estado == CERRADO:
+        liberar_plazas_de_turno(db, turno.id)
     registrar_evento(db, turno.id, origen, descripcion or f"Turno pasa a {nuevo_estado}", valores)
 
 
@@ -72,6 +74,24 @@ def hora_local(dt_utc: Optional[datetime], formato: str = "%d/%m/%Y %H:%M") -> s
     except Exception:
         tz = timezone(timedelta(hours=-6))
     return dt_utc.replace(tzinfo=timezone.utc).astimezone(tz).strftime(formato)
+
+
+def rango_utc(desde: Optional[str], hasta: Optional[str]) -> tuple:
+    """Fechas YYYY-MM-DD en hora local -> [inicio, fin) en UTC para filtrar
+    created_at. hasta es inclusivo (se toma el dia completo)."""
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(ZONA_HORARIA)
+    except Exception:
+        tz = timezone(timedelta(hours=-6))
+
+    def a_utc(fecha: str) -> datetime:
+        local = datetime.strptime(fecha, "%Y-%m-%d").replace(tzinfo=tz)
+        return local.astimezone(timezone.utc).replace(tzinfo=None)
+
+    inicio = a_utc(desde) if desde else None
+    fin = a_utc(hasta) + timedelta(days=1) if hasta else None
+    return inicio, fin
 
 
 def duracion_texto(desde: Optional[datetime], hasta: Optional[datetime] = None) -> str:
@@ -230,6 +250,11 @@ def liberar_posicion_patio(db, posicion_id: int) -> None:
 def asignar_plaza_parqueo(db, turno_id: int) -> Optional[int]:
     plazas = db.scalars(select(ParqueoPlaza).order_by(ParqueoPlaza.id)).all()
     for p in plazas:
+        if p.ocupada and p.turno_id == turno_id:
+            # El vehiculo sigue fisicamente en su plaza (ej. RT04 aclarada y luego RT01)
+            p.desde = datetime.utcnow()
+            return p.id
+    for p in plazas:
         if not p.ocupada:
             p.ocupada = True
             p.turno_id = turno_id
@@ -244,6 +269,41 @@ def liberar_plaza_parqueo(db, plaza_id: int) -> None:
         p.ocupada = False
         p.turno_id = None
         p.desde = None
+
+
+def liberar_plazas_de_turno(db, turno_id: int) -> list:
+    """El vehiculo ya no esta en el parqueo (salio, llego a otra estacion o el
+    controlador confirmo AgujaLiberar). Devuelve las plazas liberadas."""
+    liberadas = []
+    for p in db.scalars(select(ParqueoPlaza).where(ParqueoPlaza.turno_id == turno_id)).all():
+        liberar_plaza_parqueo(db, p.id)
+        liberadas.append(p.id)
+    if liberadas:
+        registrar_evento(db, turno_id, "servidor", f"Vehiculo fuera del parqueo, plaza {liberadas[0]} libre")
+    return liberadas
+
+
+def retencion_abierta_de_turno(db, turno_id: int) -> Optional[Retencion]:
+    return db.scalars(
+        select(Retencion).where(Retencion.turno_id == turno_id, Retencion.estado == "abierta")
+        .order_by(Retencion.id.desc())
+    ).first()
+
+
+def solicitar_liberar_parqueo(db, plaza_id: int, publish_cmd: PublishFn = _noop_publish) -> ParqueoPlaza:
+    """Boton Liberar parqueo (sec. 4.1): solo si la plaza esta ocupada y su
+    retencion ya fue resuelta. La plaza se libera cuando el controlador
+    confirma AgujaLiberar (ACK) o cuando el vehiculo aparece en la salida."""
+    p = db.get(ParqueoPlaza, plaza_id)
+    if p is None:
+        raise ReglaDeNegocioError("plaza_invalida")
+    if not p.ocupada or p.turno_id is None:
+        raise ReglaDeNegocioError("plaza_libre")
+    if retencion_abierta_de_turno(db, p.turno_id) is not None:
+        raise ReglaDeNegocioError("retencion_sin_resolver")
+    publish_cmd("AgujaLiberar", "MEGA_GRUA", {"plaza": plaza_id})
+    registrar_evento(db, p.turno_id, "usuario", f"Liberar parqueo: AgujaLiberar para la plaza {plaza_id}")
+    return p
 
 
 def parqueo_lleno(db) -> bool:
@@ -347,11 +407,26 @@ def registrar_respuesta_comando(db, origen: str, tipo: str, datos: dict, payload
     pendiente.result = resultado
     pendiente.response_json = payload_json
     if resultado == "ACK":
+        if nombre == "AgujaLiberar":
+            _liberar_plaza_por_ack(db, pendiente)
         return None
     db.flush()
     causa = datos.get("causa") or "sin causa"
     return generar_alarma(db, "AL14", origen=origen, referencia=f"comando:{pendiente.id}",
                           descripcion=f"{origen} rechazo {nombre}: {causa}")
+
+
+def _liberar_plaza_por_ack(db, audit: CommandAudit) -> None:
+    """El controlador confirmo AgujaLiberar: el vehiculo salio de su plaza."""
+    import json
+    try:
+        plaza_id = int(json.loads(audit.request_json or "{}").get("params", {}).get("plaza"))
+    except (TypeError, ValueError):
+        return
+    p = db.get(ParqueoPlaza, plaza_id)
+    if p is not None and p.ocupada and p.turno_id is not None:
+        if retencion_abierta_de_turno(db, p.turno_id) is None:
+            liberar_plazas_de_turno(db, p.turno_id)
 
 
 def registrar_alarma_controlador(db, origen: str, datos: dict) -> Optional[Alarma]:
@@ -393,10 +468,12 @@ def reconocer_todas_media_baja(db) -> int:
 
 def crear_retencion(db, turno: Turno, causa: str, estado_resume: str, estacion: str = "",
                      peso_declarado_g: Optional[int] = None, peso_medido_g: Optional[int] = None,
-                     publish_cmd: PublishFn = _noop_publish) -> Retencion:
-    plaza = asignar_plaza_parqueo(db, turno.id)
-    if plaza is None:
-        generar_alarma(db, "AL11", origen="parqueo", descripcion="Parqueo de retencion lleno")
+                     publish_cmd: PublishFn = _noop_publish, al_parqueo: bool = True) -> Retencion:
+    plaza = None
+    if al_parqueo:
+        plaza = asignar_plaza_parqueo(db, turno.id)
+        if plaza is None:
+            generar_alarma(db, "AL11", origen="parqueo", descripcion="Parqueo de retencion lleno")
 
     retencion = Retencion(
         turno_id=turno.id, causa=causa, estacion=estacion, estado_anterior=estado_resume,
@@ -448,7 +525,8 @@ def resolver_retencion(db, retencion_id: int, resolucion: str, rol_usuario: str,
         raise ReglaDeNegocioError("turno_no_existe")
 
     if retencion.plaza is not None:
-        liberar_plaza_parqueo(db, retencion.plaza)
+        # La plaza sigue ocupada hasta que el vehiculo salga del parqueo: el
+        # ACK de AgujaLiberar o su llegada a la salida la liberan.
         publish_cmd("AgujaLiberar", "MEGA_GRUA", {"plaza": retencion.plaza})
 
     if resolucion == "rechazar":
@@ -473,7 +551,8 @@ def resolver_retencion(db, retencion_id: int, resolucion: str, rol_usuario: str,
     retencion.estado = "resuelta"
     retencion.resolucion = resolucion
     retencion.motivo = motivo
-    retencion.observacion = observacion
+    if observacion:
+        retencion.observacion = observacion
     retencion.resolved_at = datetime.utcnow()
 
     notificar_transportista(db, turno, "retencion_resuelta",
@@ -513,9 +592,16 @@ def guardar_pesaje_durante_retencion(db, turno: Turno, peso_g: int, datos: dict)
 def retener_manualmente(db, turno: Turno, causa: str, observacion: Optional[str] = None,
                          publish_cmd: PublishFn = _noop_publish) -> Retencion:
     """RT05 (AUTORIDAD) / RT06 (TERMINAL): se ordena en cualquier momento, el
-    turno vuelve a su MISMO estado al resolverse (no representa una estacion)."""
-    return crear_retencion(db, turno, causa, estado_resume=turno.estado,
-                            estacion=turno.estacion_actual, publish_cmd=publish_cmd)
+    turno vuelve a su MISMO estado al resolverse (no representa una estacion).
+    Sec. 4.2: el vehiculo va al parqueo solo si todavia no llego a la transferencia."""
+    if turno.estado in ESTADOS_FINALES or turno.estado == RETENIDO:
+        raise ReglaDeNegocioError(f"no_se_puede_retener_desde:{turno.estado}")
+    antes_de_transferencia = turno.estado in (EN_GARITA, EN_PESAJE_ENTRADA, EN_RUTA)
+    retencion = crear_retencion(db, turno, causa, estado_resume=turno.estado,
+                                estacion=turno.estacion_actual, publish_cmd=publish_cmd,
+                                al_parqueo=antes_de_transferencia)
+    retencion.observacion = observacion
+    return retencion
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -830,6 +916,7 @@ def salida_por_rfid(db, vehiculo_uid: str, publish_cmd: PublishFn = _noop_publis
             raise ReglaDeNegocioError("retenido")
 
     registrar_evento(db, turno.id, "servidor", "Salida autorizada por servidor", {"uid": vehiculo_uid})
+    liberar_plazas_de_turno(db, turno.id)  # si llego a la salida, ya no esta en el parqueo
     turno.estacion_actual = "salida"
     publish_cmd("AbrirPuertaSalida", "UNO_SALIDA", {"uid": vehiculo_uid})
     return turno
@@ -841,6 +928,7 @@ def registrar_salida_fisica(db, turno: Turno, publish_cmd: PublishFn = _noop_pub
     if ya_salio(db, turno):
         return
     registrar_evento(db, turno.id, "controlador", DESC_SALIO)
+    liberar_plazas_de_turno(db, turno.id)
     if turno.estado == EN_SALIDA:
         cerrar_turno(db, turno, publish_cmd=publish_cmd)
 

@@ -14,6 +14,8 @@ fisico automatico (fase 1 del plan de trabajo):
 
 Fase 2: las alarmas nuevas se anuncian por MQTT (portus/srv/alarma) despues
 del commit, para que la web las muestre en vivo sin consultar.
+Fase 3: los cambios de turnos, retenciones, parqueo, patio e intentos se
+anuncian en portus/srv/cambio ({entidad, id}); la web recarga solo eso.
 
 Los comandos se publican DESPUES del commit: si la transaccion se deshace
 (rechazo), nunca sale un AbrirTalanquera que la base no respalda.
@@ -26,9 +28,15 @@ from sqlalchemy import event, select
 
 import servicios
 from catalogos import ANULADO, EN_GARITA, EN_PESAJE_ENTRADA, EN_SALIDA, RETENIDO
-from models import Alarma, CommandAudit, Turno
+from models import Alarma, CommandAudit, IntentoIngreso, ParqueoPlaza, PosicionPatio, Retencion, Turno
 
 TOPICO_ALARMAS_SERVIDOR = "portus/srv/alarma"
+TOPICO_CAMBIOS_SERVIDOR = "portus/srv/cambio"
+
+ENTIDADES_ANUNCIADAS = {
+    Turno: "turno", Retencion: "retencion", ParqueoPlaza: "parqueo",
+    PosicionPatio: "patio", IntentoIngreso: "intento",
+}
 
 EnviarMqtt = Callable[[str, str], None]  # (topic, payload_json)
 
@@ -229,24 +237,38 @@ def alarma_dict(a: Alarma) -> dict:
             "ackAt": a.ack_at.isoformat() if a.ack_at else None, "ackComentario": a.ack_comentario}
 
 
-def anunciar_alarmas_nuevas(session_factory, enviar_mqtt: EnviarMqtt) -> None:
-    """Toda alarma que se confirme en la base (desde cualquier hilo o endpoint)
-    sale por portus/srv/alarma. Si la transaccion se deshace, no sale nada."""
+def anunciar_cambios(session_factory, enviar_mqtt: EnviarMqtt) -> None:
+    """Lo que se confirme en la base (desde cualquier hilo o endpoint) se
+    anuncia por MQTT: cada alarma nueva completa en portus/srv/alarma, y cada
+    cambio de las entidades del sinoptico en portus/srv/cambio. Si la
+    transaccion se deshace, no sale nada."""
 
     @event.listens_for(session_factory, "after_flush")
     def _anotar(session, _ctx):
-        for obj in session.new:
+        alarmas = session.info.setdefault("alarmas_nuevas", [])
+        cambios = session.info.setdefault("cambios", set())
+        for obj in list(session.new) + list(session.dirty):
             if isinstance(obj, Alarma):
-                session.info.setdefault("alarmas_nuevas", []).append(alarma_dict(obj))
+                if obj in session.new:
+                    alarmas.append(alarma_dict(obj))
+                continue
+            entidad = ENTIDADES_ANUNCIADAS.get(type(obj))
+            if entidad is not None:
+                cambios.add((entidad, obj.id))
 
     @event.listens_for(session_factory, "after_commit")
     def _enviar(session):
-        for datos in session.info.pop("alarmas_nuevas", []):
+        mensajes = [(TOPICO_ALARMAS_SERVIDOR, d) for d in session.info.pop("alarmas_nuevas", [])]
+        mensajes += [(TOPICO_CAMBIOS_SERVIDOR, {"entidad": e, "id": i})
+                     for e, i in sorted(session.info.pop("cambios", set()))]
+        for topico, datos in mensajes:
             try:
-                enviar_mqtt(TOPICO_ALARMAS_SERVIDOR, json.dumps(datos, ensure_ascii=False))
-            except Exception as exc:  # la alarma ya quedo guardada; solo falla el aviso en vivo
-                print(f"[ALARMAS] no se pudo anunciar {datos.get('codigo')}: {exc!r}")
+                enviar_mqtt(topico, json.dumps(datos, ensure_ascii=False))
+            except Exception as exc:  # ya quedo guardado; solo falla el aviso en vivo
+                print(f"[ANUNCIO] no se pudo publicar en {topico}: {exc!r}")
 
     @event.listens_for(session_factory, "after_soft_rollback")
     def _descartar(session, _previous_transaction):
         session.info.pop("alarmas_nuevas", None)
+        session.info.pop("cambios", None)
+
