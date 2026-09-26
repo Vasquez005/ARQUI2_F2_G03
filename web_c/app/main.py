@@ -63,9 +63,18 @@ COMANDOS_REMOTOS = {
 
 CAUSAS_ADUANERAS = ("RT03", "RT05")
 CAUSAS_RETENCION = ("RT01", "RT02", "RT03", "RT04", "RT05", "RT06")
-ESTADOS_TURNO = ("EnGarita", "EnPesajeEntrada", "EnRuta", "EnTransferencia", "EnPesajeSalida",
+ESTADOS_TURNO = ("Programado", "EnGarita", "EnPesajeEntrada", "EnRuta", "EnTransferencia", "EnPesajeSalida",
                  "EnSalida", "Retenido", "Cerrado", "Anulado")
 ESTADOS_SIN_LEVANTE = ("declarado", "declaracion_presentada", "levante_solicitado")
+
+# Que cambios de portus/srv/cambio le interesan a cada rol (sin la terminal).
+# Solo se reenvia el NOMBRE de la entidad, nunca el id ni datos: la pagina
+# vuelve a pedir su lista por /api/<rol>/..., que ya filtra lo que le toca ver.
+ENTIDADES_POR_ROL = {
+    "NAVIERA": {"manifiesto", "turno", "patio", "retencion"},
+    "AGENTE": {"manifiesto", "declaracion"},
+    "AUTORIDAD": {"manifiesto", "declaracion", "retencion", "turno", "patio"},
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -117,6 +126,7 @@ def backend_csv(path: str, params: Optional[dict] = None) -> PlainTextResponse:
 class EventBus:
     def __init__(self) -> None:
         self.clients: set = set()
+        self.role_clients: dict = {}  # ws -> rol (naviera, agente, autoridad)
         self.last_heartbeat_iso: Optional[str] = None
         self.connected = False
         self.recent_events: deque = deque(maxlen=100)
@@ -142,6 +152,24 @@ class EventBus:
     def unregister(self, ws: WebSocket) -> None:
         with self.lock:
             self.clients.discard(ws)
+            self.role_clients.pop(ws, None)
+
+    async def register_role(self, ws: WebSocket, role: str) -> None:
+        await ws.accept()
+        with self.lock:
+            self.role_clients[ws] = role
+        await ws.send_json({"kind": "status", "connected": self.connected})
+
+    async def broadcast_roles(self, payload: dict, entidad: Optional[str] = None) -> None:
+        """A las paginas de rol: el estado del broker y el nombre de lo que cambio."""
+        with self.lock:
+            destinos = [ws for ws, role in self.role_clients.items()
+                        if entidad is None or entidad in ENTIDADES_POR_ROL.get(role, ())]
+        for ws in destinos:
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                self.unregister(ws)
 
     def store_event(self, topic: str, payload: dict) -> None:
         event = {
@@ -740,6 +768,21 @@ async def terminal_ws(websocket: WebSocket):
         event_bus.unregister(websocket)
 
 
+@app.websocket("/ws/rol")
+async def rol_ws(websocket: WebSocket):
+    """Naviera, agente y autoridad: avisos de cambio para recargar su lista en vivo."""
+    user = read_session_cookie(websocket.cookies.get("portus_session"))
+    if not user or user.get("role") not in ENTIDADES_POR_ROL:
+        await websocket.close(code=4403)
+        return
+    await event_bus.register_role(websocket, user["role"])
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        event_bus.unregister(websocket)
+
+
 def _safe_json_decode(raw: bytes) -> dict:
     try:
         text = raw.decode("utf-8", errors="replace").strip()
@@ -756,6 +799,12 @@ def _publish_to_ws_from_thread(payload: dict) -> None:
     asyncio.run_coroutine_threadsafe(event_bus.broadcast(payload), main_loop)
 
 
+def _publish_to_roles_from_thread(payload: dict, entidad: Optional[str] = None) -> None:
+    if main_loop is None:
+        return
+    asyncio.run_coroutine_threadsafe(event_bus.broadcast_roles(payload, entidad), main_loop)
+
+
 def start_mqtt_listener() -> None:
     mqtt_host = os.getenv("PORTUS_MQTT_HOST", "localhost")
     mqtt_port = int(os.getenv("PORTUS_MQTT_PORT", "1883"))
@@ -767,10 +816,12 @@ def start_mqtt_listener() -> None:
         # Del backend: alarmas nuevas y cambios de turnos, retenciones, parqueo y patio
         client.subscribe("portus/srv/#")
         _publish_to_ws_from_thread({"kind": "status", "connected": event_bus.connected})
+        _publish_to_roles_from_thread({"kind": "status", "connected": event_bus.connected})
 
     def on_disconnect(client, userdata, flags, rc, properties=None):
         event_bus.connected = False
         _publish_to_ws_from_thread({"kind": "status", "connected": event_bus.connected})
+        _publish_to_roles_from_thread({"kind": "status", "connected": event_bus.connected})
 
     def on_message(client, userdata, msg):
         payload = _safe_json_decode(msg.payload)
@@ -787,6 +838,9 @@ def start_mqtt_listener() -> None:
                 "lastHeartbeat": event_bus.last_heartbeat_iso,
             }
         )
+        if topic == "portus/srv/cambio" and isinstance(payload, dict) and payload.get("entidad"):
+            entidad = str(payload["entidad"])
+            _publish_to_roles_from_thread({"kind": "cambio", "entidad": entidad}, entidad)
 
     def loop_thread() -> None:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)

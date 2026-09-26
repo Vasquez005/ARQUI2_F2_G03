@@ -30,9 +30,10 @@ from models import (  # noqa: E402
 from servicios import estado_cita, proximas_franjas, texto_franja  # noqa: E402
 
 try:
-    from telegram import Update
+    from telegram import BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
     from telegram.ext import Application, ContextTypes, MessageHandler, filters
 except Exception:
+    BotCommand = ReplyKeyboardMarkup = ReplyKeyboardRemove = None  # type: ignore
     Update = object  # type: ignore
     Application = None  # type: ignore
     ContextTypes = None  # type: ignore
@@ -55,8 +56,10 @@ def conectar_anuncios() -> None:
         print(f"[MQTT] sin anuncios en vivo: {exc}")
         return
     cliente = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    cliente.reconnect_delay_set(min_delay=1, max_delay=30)
     try:
-        cliente.connect(os.getenv("PORTUS_MQTT_HOST", "localhost"), int(os.getenv("PORTUS_MQTT_PORT", "1883")))
+        # connect_async + loop_start: si el broker aun no esta arriba, paho reintenta solo
+        cliente.connect_async(os.getenv("PORTUS_MQTT_HOST", "localhost"), int(os.getenv("PORTUS_MQTT_PORT", "1883")))
     except Exception as exc:
         print(f"[MQTT] sin anuncios en vivo: {exc}")
         return
@@ -84,6 +87,18 @@ MSG_NO_VINCULADO = (
     "/vincular CODIGO"
 )
 MSG_NO_RECONOCIDO = "Comando no reconocido. Escribe /ayuda para ver los comandos disponibles."
+MSG_SOLO_TEXTO = "Solo entiendo mensajes de texto. " + MSG_NO_RECONOCIDO
+MSG_ERROR = "No pude procesar tu mensaje en este momento. Intenta de nuevo o escribe /ayuda."
+
+
+class Respuesta(str):
+    """Texto de respuesta con botones sugeridos (en Telegram, un teclado de
+    respuesta rapida). Sigue siendo un str: el modo CLI y las pruebas no cambian."""
+
+    def __new__(cls, texto: str, opciones: Optional[list] = None):
+        obj = super().__new__(cls, texto)
+        obj.opciones = opciones or []
+        return obj
 MSG_SIN_CARGA = "No tienes carga asociada a ese identificador."
 
 ESTADO_DOCUMENTAL_TEXTO = {
@@ -184,7 +199,8 @@ def cmd_cita(db: Session, trans: Transportista, args: list) -> str:
         if not elegibles:
             return "No tienes contenedores con levante otorgado pendientes de cita."
         lista = "\n".join(f"- {m.contenedor_id} ({m.tipo_operacion}, canal {(m.canal or '-').upper()})" for m in elegibles)
-        return f"Contenedores disponibles para cita:\n{lista}\n\nEscribe /cita CONTENEDOR para ver los horarios."
+        return Respuesta(f"Contenedores disponibles para cita:\n{lista}\n\nEscribe /cita CONTENEDOR para ver los horarios.",
+                         [f"/cita {m.contenedor_id}" for m in elegibles])
 
     contenedor = args[0].upper()
     m = manifiesto_del_transportista(db, trans, contenedor)
@@ -203,8 +219,9 @@ def cmd_cita(db: Session, trans: Transportista, args: list) -> str:
 
     if len(args) < 2:
         lineas = [f"{i}. {texto_franja(s, e)}" for i, (s, e) in enumerate(franjas, start=1)]
-        return (f"Proximas franjas con capacidad para {contenedor}:\n" + "\n".join(lineas) +
-                f"\n\nEscribe /cita {contenedor} NUMERO para confirmar (ej. /cita {contenedor} 1).")
+        return Respuesta(f"Proximas franjas con capacidad para {contenedor}:\n" + "\n".join(lineas) +
+                         f"\n\nEscribe /cita {contenedor} NUMERO para confirmar (ej. /cita {contenedor} 1).",
+                         [f"/cita {contenedor} {i}" for i in range(1, len(franjas) + 1)])
 
     try:
         eleccion = int(args[1])
@@ -369,24 +386,51 @@ async def despachar_notificaciones(send) -> None:
 #  Modos de ejecucion
 # ══════════════════════════════════════════════════════════════════════════
 
+def responder(chat_id: str, texto: Optional[str]) -> str:
+    """Nunca lanza ni devuelve vacio (sec. 6.2): un mensaje sin texto (sticker,
+    foto, audio) o un error interno tambien reciben respuesta."""
+    if texto is None:
+        return MSG_SOLO_TEXTO
+    try:
+        with SessionLocal() as db:
+            return process_command(db, chat_id, texto)
+    except Exception as exc:
+        print(f"[BOT] error procesando {texto!r} de {chat_id}: {exc!r}")
+        return MSG_ERROR
+
+
+def teclado(respuesta: str):
+    """Botones de /cita (contenedores o franjas); si no hay, se quita el teclado anterior."""
+    opciones = getattr(respuesta, "opciones", [])
+    if ReplyKeyboardMarkup is None:
+        return None
+    if not opciones:
+        return ReplyKeyboardRemove()
+    return ReplyKeyboardMarkup([[o] for o in opciones], resize_keyboard=True, one_time_keyboard=True)
+
+
 async def telegram_mode(token: str) -> None:
     app = Application.builder().token(token).build()
 
-    async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_chat or not update.effective_message:
             return
-        with SessionLocal() as db:
-            reply = process_command(db, str(update.effective_chat.id), update.effective_message.text or "")
-        await update.effective_message.reply_text(reply)
+        reply = responder(str(update.effective_chat.id), update.effective_message.text)
+        await update.effective_message.reply_text(reply, reply_markup=teclado(reply))
 
-    # Un solo handler para TODO texto (comandos y no comandos): asi cualquier
-    # cosa recibe respuesta, incluido lo que no es un comando valido.
-    app.add_handler(MessageHandler(filters.TEXT, on_text))
+    # Un solo handler para TODO mensaje nuevo (comandos, texto libre, stickers, fotos...):
+    # el servicio nunca queda sin responder. Las ediciones no se contestan dos veces.
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, on_message))
 
     async def send(chat_id: str, text: str) -> None:
         await app.bot.send_message(chat_id=chat_id, text=text)
 
     await app.initialize()
+    try:
+        # Menu de comandos del telefono (el boton "/" de Telegram)
+        await app.bot.set_my_commands([BotCommand(c.split()[0].lstrip("/"), d) for c, d in COMANDOS])
+    except Exception as exc:
+        print(f"[BOT] no se pudo registrar el menu de comandos: {exc}")
     await app.start()
     await app.updater.start_polling()
     print("Bot Telegram activo.")
@@ -431,8 +475,10 @@ def cli_mode() -> None:
             if len(parts) < 3:
                 print("Uso: chat <chat_id> <texto>")
                 continue
-            with SessionLocal() as db:
-                print(process_command(db, parts[1], parts[2]))
+            reply = responder(parts[1], parts[2])
+            print(reply)
+            if getattr(reply, "opciones", None):
+                print("  [botones] " + " | ".join(reply.opciones))
             continue
         if line == "notifs":
             asyncio.run(despachar_notificaciones(send))

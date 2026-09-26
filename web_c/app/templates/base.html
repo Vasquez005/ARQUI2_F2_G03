@@ -20,5 +20,23 @@
       {% endif %}
     </header>
     <main class="container">{% block content %}{% endblock %}</main>
+    {% if user %}
+    <!-- Confirmaciones y motivos (reemplaza confirm / prompt del navegador); lo usa roles.js -->
+    <dialog id="dlg-pregunta" class="dialogo dialogo-chico">
+      <form id="form-pregunta" method="dialog" novalidate>
+        <h2 id="pregunta-titulo"></h2>
+        <p id="pregunta-texto"></p>
+        <label id="pregunta-campo" class="campo-pregunta hidden">
+          <span id="pregunta-etiqueta"></span>
+          <textarea id="pregunta-valor" rows="3"></textarea>
+        </label>
+        <p id="pregunta-error" class="resultado error hidden"></p>
+        <div class="form-actions">
+          <button type="submit" id="pregunta-aceptar" value="aceptar">Aceptar</button>
+          <button type="button" id="pregunta-cancelar">Cancelar</button>
+        </div>
+      </form>
+    </dialog>
+    {% endif %}
   </body>
 </html>

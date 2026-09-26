@@ -76,6 +76,11 @@ backend de B (`POST /auth/login`). Se crean con `backend/seed.py`
 - Escucha `portus/evt/#`, `portus/cmd/respuesta` y `portus/srv/#` y los reenvia
   por `/ws/terminal` (solo sesiones TERMINAL). Al conectarse, el WebSocket manda
   los eventos recientes y el ultimo mensaje de cada placa para armar el sinoptico.
+- Naviera, agente y autoridad abren `/ws/rol`: por ahi llega solo el nombre de la
+  entidad que cambio (`manifiesto`, `declaracion`, `turno`...), filtrado por rol y sin
+  ids ni datos, y la pagina vuelve a pedir su pestaña visible por `/api/<rol>/...`.
+- Confirmaciones y motivos usan un dialogo propio (`preguntar()` / `confirmar()` en
+  `static/roles.js`), no `confirm` / `prompt` del navegador.
 - La terminal (`static/app.js`) no consulta periodicamente: cambia con los eventos
   de las placas y, cuando llega `portus/srv/cambio`, vuelve a pedir solo lo que
   cambio (turnos, retenciones, parqueo, patio o intentos).

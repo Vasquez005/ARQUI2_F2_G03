@@ -38,6 +38,7 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
     test_terminal.py
     test_citas.py
     test_grua.py
+    test_vivo.py      # avisos en vivo por rol y bot que siempre responde
     requirements.txt
   web_c/
     app/main.py       # web: sesion, permisos por rol, proxy hacia B, MQTT -> WebSocket
@@ -75,7 +76,9 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
 2. `bridge.py` valida checksum y secuencia.
 3. El bridge publica los eventos en MQTT `portus/evt/<topic>`.
 4. El backend consume `portus/evt/#` y guarda los eventos. La web tambien se
-   suscribe y los reenvia por WebSocket al sinoptico (sin polling).
+   suscribe y los reenvia por WebSocket al sinoptico (sin polling). Naviera,
+   agente y autoridad reciben por `/ws/rol` solo el nombre de lo que cambio y
+   recargan su pestaña.
 5. Los comandos remotos salen de la web -> backend (`POST /commands/send`) y se
    publican en `portus/cmd/solicitud`.
 6. El bridge envia el comando al Arduino correcto y espera ACK/REJ.
@@ -107,7 +110,7 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
 - `portus/cmd/solicitud`
 - `portus/cmd/respuesta`
 - `portus/srv/alarma` (del backend: cada alarma nueva, ya guardada)
-- `portus/srv/cambio` (del backend y del bot: `{entidad, id}` de cada turno, retencion, plaza, posicion, intento, cita o franja que cambio)
+- `portus/srv/cambio` (del backend y del bot: `{entidad, id}` de cada turno, retencion, plaza, posicion, intento, cita, franja, ciclo, manifiesto, declaracion, transportista o vehiculo que cambio)
 
 ---
 
@@ -235,7 +238,7 @@ python3 -m unittest test_protocol.py
 
 # Ciclo fisico del orquestador y alarmas (sin MQTT ni Arduinos)
 cd backend
-.venv/bin/python3 -m unittest test_orquestador test_alarmas test_terminal test_citas test_grua -v
+.venv/bin/python3 -m unittest test_orquestador test_alarmas test_terminal test_citas test_grua test_vivo -v
 ```
 
 ---
@@ -245,13 +248,17 @@ cd backend
 | Area | Endpoints |
 | --- | --- |
 | Sistema | `GET /health`, `GET /events/recent`, `POST /commands/send` |
-| Transportistas | `GET/POST /transportistas` |
-| Manifiestos | `GET/POST /manifiestos`, `POST /manifiestos/{id}/anular`, `POST /manifiestos/{id}/solicitar-levante`, `POST /manifiestos/{id}/levante` |
-| Declaraciones | `POST /declaraciones` |
-| Garita y turnos | `POST /garita/ingreso`, `GET /turnos`, `GET /turnos/{id}`, `POST /turnos/{id}/pesaje-entrada`, `POST /turnos/{id}/pesaje-salida`, `POST /turnos/{id}/avanzar`, `POST /turnos/{id}/cerrar`, `POST /turnos/{id}/retener` |
+| Usuarios | `POST /auth/login`, `GET /usuarios` |
+| Transportistas y vehiculos | `GET/POST /transportistas`, `POST /transportistas/{id}/codigo-vinculacion`, `GET/POST /vehiculos` |
+| Citas | `GET /citas/agenda`, `GET /citas/{id}/franjas-disponibles`, `POST /citas/{id}/cancelar`, `POST /citas/{id}/reprogramar`, `POST /franjas/bloquear`, `POST /franjas/desbloquear` |
+| Manifiestos y carga | `GET/POST /manifiestos`, `GET /manifiestos/{id}`, `POST /manifiestos/{id}/observaciones`, `POST /manifiestos/{id}/anular`, `POST /manifiestos/{id}/solicitar-levante`, `POST /manifiestos/{id}/levante`, `GET /contenedores`, `GET /carga` |
+| Declaraciones | `GET/POST /declaraciones` |
+| Garita y turnos | `POST /garita/ingreso`, `GET /garita/intentos`, `GET /turnos`, `GET /turnos/{id}`, `POST /turnos/{id}/pesaje-entrada`, `POST /turnos/{id}/pesaje-salida`, `POST /turnos/{id}/avanzar`, `POST /turnos/{id}/cerrar`, `POST /turnos/{id}/anular`, `POST /turnos/{id}/retener` |
 | Retenciones | `GET /retenciones`, `POST /retenciones/{id}/resolver` |
-| Patio y parqueo | `GET /patio`, `POST /patio/{id}/bloquear`, `POST /patio/{id}/liberar`, `GET /parqueo` |
+| Patio y parqueo | `GET /patio`, `GET /patio/inventario`, `POST /patio/{id}/bloquear`, `POST /patio/{id}/liberar`, `GET /parqueo`, `POST /parqueo/{id}/liberar` |
 | Alarmas | `GET /alarmas`, `POST /alarmas/{id}/reconocer`, `POST /alarmas/reconocer-todas` |
+| Grua | `GET /grua/estado`, `GET /grua/ciclos`, `GET /grua/ciclos.csv`, `GET/POST /config/politica-patio` |
+| Reportes | `GET/POST /reportes`, `GET /reportes/{id}.csv` |
 
 El detalle de cada endpoint esta en http://localhost:8100/docs (Swagger de FastAPI).
 

@@ -44,6 +44,109 @@ async function apiFetch(url, options = {}) {
   return data;
 }
 
+// ════════════════════════ dialogo propio (en lugar de confirm / prompt) ════════════════════════
+
+// Abre #dlg-pregunta (base.html). Devuelve una promesa:
+//   sin campo   -> true (Aceptar) o false (Cancelar / Esc)
+//   con campo   -> el texto escrito ("" si es opcional y se dejo vacio) o null si se cancelo
+// Con obligatorio: true no deja aceptar sin texto (ej. el motivo de Rechazar).
+function preguntar({ titulo, texto = "", campo = null, obligatorio = false, aceptar = "Aceptar", peligro = false }) {
+  const dlg = document.getElementById("dlg-pregunta");
+  if (!dlg) return Promise.resolve(campo ? window.prompt(texto, "") : window.confirm(texto));
+  const $ = (id) => document.getElementById(id);
+  $("pregunta-titulo").textContent = titulo || "Confirmar";
+  $("pregunta-texto").textContent = texto;
+  $("pregunta-campo").classList.toggle("hidden", !campo);
+  $("pregunta-etiqueta").textContent = campo ? `${campo}${obligatorio ? " (obligatorio)" : " (opcional)"}` : "";
+  $("pregunta-valor").value = "";
+  $("pregunta-error").classList.add("hidden");
+  const boton = $("pregunta-aceptar");
+  boton.textContent = aceptar;
+  boton.className = peligro ? "btn-warn" : "";
+
+  return new Promise((resolve) => {
+    let resuelto = false;
+    const terminar = (valor) => {
+      if (resuelto) return;
+      resuelto = true;
+      $("form-pregunta").removeEventListener("submit", alAceptar);
+      $("pregunta-cancelar").removeEventListener("click", alCancelar);
+      dlg.removeEventListener("close", alCerrar);
+      if (dlg.open) dlg.close();
+      resolve(valor);
+    };
+    const alAceptar = (ev) => {
+      ev.preventDefault();
+      if (!campo) return terminar(true);
+      const valor = $("pregunta-valor").value.trim();
+      if (obligatorio && !valor) {
+        $("pregunta-error").textContent = `${campo} es obligatorio.`;
+        $("pregunta-error").classList.remove("hidden");
+        $("pregunta-valor").focus();
+        return;
+      }
+      terminar(valor);
+    };
+    const alCancelar = () => terminar(campo ? null : false);
+    const alCerrar = () => terminar(campo ? null : false); // Esc
+    $("form-pregunta").addEventListener("submit", alAceptar);
+    $("pregunta-cancelar").addEventListener("click", alCancelar);
+    dlg.addEventListener("close", alCerrar);
+    dlg.showModal();
+    (campo ? $("pregunta-valor") : boton).focus();
+  });
+}
+
+function confirmar(titulo, texto, opciones = {}) {
+  return preguntar({ titulo, texto, ...opciones });
+}
+
+// ════════════════════════ cambios en vivo para naviera, agente y autoridad ════════════════════════
+
+// /ws/rol manda {kind: "cambio", entidad} cuando el backend confirma un cambio que
+// le interesa al rol (sin ids ni datos). La pagina vuelve a pedir SOLO la
+// pestaña visible; no hay consultas periodicas.
+function escucharCambios(alCambiar) {
+  const indicador = document.createElement("span");
+  indicador.className = "chip en-vivo";
+  document.querySelector(".container h1")?.append(" ", indicador);
+  const marcar = (ok) => {
+    indicador.textContent = ok ? "En vivo" : "Sin conexion en vivo";
+    indicador.className = `chip en-vivo ${ok ? "chip-ok" : "chip-bad"}`;
+    indicador.title = ok ? "Los cambios de estado aparecen sin recargar" : "Reconectando...";
+  };
+  marcar(false);
+
+  const pendientes = new Set();
+  let temporizador = null;
+  let reintentoMs = 1000;
+  const conectar = () => {
+    const ws = new WebSocket(`${location.protocol === "https:" ? "wss://" : "ws://"}${location.host}/ws/rol`);
+    ws.addEventListener("open", () => { reintentoMs = 1000; });
+    ws.addEventListener("message", (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg.kind === "status") marcar(!!msg.connected);
+      if (msg.kind === "cambio") {
+        marcar(true);
+        pendientes.add(msg.entidad);
+        clearTimeout(temporizador); // varios cambios seguidos -> una sola recarga
+        temporizador = setTimeout(() => {
+          const lista = Array.from(pendientes);
+          pendientes.clear();
+          alCambiar(lista);
+        }, 300);
+      }
+    });
+    ws.addEventListener("close", () => {
+      marcar(false);
+      setTimeout(conectar, reintentoMs);
+      reintentoMs = Math.min(reintentoMs * 2, 15000);
+    });
+  };
+  conectar();
+}
+
 
 // ════════════════════════ comunes a naviera, agente y autoridad ════════════════════════
 
@@ -106,6 +209,7 @@ function initTabs(root) {
   const botones = Array.from(root.querySelectorAll(".tab-btn"));
   const paneles = Array.from(root.querySelectorAll(".tab-panel"));
   const activar = (tab) => {
+    root.dataset.pestana = tab; // la usa escucharCambios para recargar solo lo visible
     botones.forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
     paneles.forEach((p) => p.classList.toggle("hidden", p.dataset.tabPanel !== tab));
     if (window.location.hash !== `#${tab}`) window.history.replaceState(null, "", `#${tab}`);
@@ -244,7 +348,8 @@ function initNaviera() {
     if (!b) return;
     if (b.dataset.detalle) abrirDetalle(`/api/naviera/manifiestos/${b.dataset.detalle}`);
     if (b.dataset.anular) {
-      if (!window.confirm(`Anular el manifiesto ${b.dataset.anular}?`)) return;
+      if (!await confirmar("Anular manifiesto", `Anular el manifiesto ${b.dataset.anular}? Esta accion no se puede deshacer.`,
+        { aceptar: "Anular", peligro: true })) return;
       try {
         await postJson(`/api/naviera/manifiestos/${b.dataset.anular}/anular`);
         mensaje(result, `Manifiesto ${b.dataset.anular} anulado.`);
@@ -259,6 +364,8 @@ function initNaviera() {
 
   cargarFormulario().catch((err) => mensaje(result, `Error: ${err.message}`, false));
   initTabs(root);
+  // Levante, retenciones, turnos y patio cambian el estado documental / operativo y la ubicacion
+  escucharCambios(() => (root.dataset.pestana === "contenedores" ? cargarContenedores() : cargarManifiestos()));
 }
 
 // ════════════════════════ AGENTE (sec. 5.3 y 5.4) ════════════════════════
@@ -344,8 +451,10 @@ function initAgente() {
         cargarPendientes();
       }
       if (b.dataset.observar) {
-        const texto = window.prompt("Observacion para la autoridad:", "");
-        if (!texto || !texto.trim()) return;
+        const texto = await preguntar({ titulo: `Adjuntar observacion - manifiesto ${b.dataset.observar}`,
+          texto: "La nota queda en el historial del manifiesto y la ve la autoridad.",
+          campo: "Observacion", obligatorio: true, aceptar: "Adjuntar" });
+        if (!texto) return;
         await postJson(`/api/agente/manifiestos/${b.dataset.observar}/observaciones`, { texto });
         mensaje(result, `Observacion adjuntada al manifiesto ${b.dataset.observar}.`);
       }
@@ -357,6 +466,8 @@ function initAgente() {
   $("agente-filtros").addEventListener("submit", (ev) => { ev.preventDefault(); cargarSeguimiento(); });
   root.addEventListener("pestana", (ev) => (ev.detail === "seguimiento" ? cargarSeguimiento() : cargarPendientes()));
   initTabs(root);
+  // Manifiestos nuevos de las navieras y levantes otorgados / retenidos por la autoridad
+  escucharCambios(() => (root.dataset.pestana === "seguimiento" ? cargarSeguimiento() : cargarPendientes()));
 }
 
 // ════════════════════════ AUTORIDAD (sec. 5.5, 5.6 y 5.7) ════════════════════════
@@ -370,6 +481,9 @@ function initAutoridad() {
   async function cargarSolicitudes() {
     try {
       const items = await apiFetch("/api/autoridad/solicitudes");
+      // Una recarga en vivo no debe borrar el canal que la autoridad ya eligio
+      const elegidos = Object.fromEntries(Array.from(root.querySelectorAll("select[data-canal]"))
+        .filter((sel) => sel.value).map((sel) => [sel.dataset.canal, sel.value]));
       llenarTabla($("autoridad-table-solicitudes"),
         ["Manifiesto", "Contenedor", "Naviera", "Agente", "Declaracion", "Peso declarado", "Canal", "Acciones"],
         items, (m) => `<tr>
@@ -381,6 +495,10 @@ function initAutoridad() {
             <button type="button" data-retener="${m.id}" class="btn-warn">Retener</button>
             <button type="button" data-declaracion="${m.id}">Ver declaracion</button></td></tr>`,
         "No hay solicitudes pendientes.");
+      Object.entries(elegidos).forEach(([id, canal]) => {
+        const sel = root.querySelector(`select[data-canal="${id}"]`);
+        if (sel) sel.value = canal;
+      });
     } catch (err) {
       mensaje(result, `Error: ${err.message}`, false);
     }
@@ -433,28 +551,36 @@ function initAutoridad() {
       if (b.dataset.otorgar) {
         const canal = root.querySelector(`select[data-canal="${b.dataset.otorgar}"]`).value;
         if (!canal) return mensaje(result, "Elige el canal de selectivo antes de otorgar el levante.", false);
-        if (!window.confirm(`Otorgar el levante del manifiesto ${b.dataset.otorgar} con canal ${canal}?`)) return;
+        const aviso = canal === "rojo" ? " Con canal rojo el vehiculo va al parqueo despues del pesaje de entrada (RT03)." : "";
+        if (!await confirmar("Otorgar levante", `Otorgar el levante del manifiesto ${b.dataset.otorgar} con canal ${canal}?${aviso}`,
+          { aceptar: `Otorgar (canal ${canal})` })) return;
         await postJson(`/api/autoridad/manifiestos/${b.dataset.otorgar}/levante`, { otorgar: true, canal });
         mensaje(result, `Levante otorgado (canal ${canal}).`);
         cargarSolicitudes();
       }
       if (b.dataset.retener) {
-        const motivo = window.prompt("Causa de la retencion del levante (obligatoria):", "");
-        if (!motivo || !motivo.trim()) return;
+        const motivo = await preguntar({ titulo: `Retener levante - manifiesto ${b.dataset.retener}`,
+          texto: "Se deniega temporalmente la autorizacion y se avisa al transportista.",
+          campo: "Causa de la retencion", obligatorio: true, aceptar: "Retener", peligro: true });
+        if (!motivo) return;
         await postJson(`/api/autoridad/manifiestos/${b.dataset.retener}/levante`, { otorgar: false, motivo_retencion: motivo });
         mensaje(result, "Levante retenido; se aviso al transportista.");
         cargarSolicitudes();
       }
       if (b.dataset.aclarar) {
-        const observacion = window.prompt("Aclarar: el turno continua. Observacion opcional:", "");
+        const observacion = await preguntar({ titulo: `Aclarar retencion ${b.dataset.aclarar}`,
+          texto: "El turno continua sin modificar el manifiesto; se libera la plaza y se avisa al transportista.",
+          campo: "Observacion", aceptar: "Aclarar" });
         if (observacion === null) return;
         await postJson(`/api/autoridad/retenciones/${b.dataset.aclarar}/resolver`,
           { resolucion: "aclarar", observacion: observacion || null });
         cargarRetenciones();
       }
       if (b.dataset.rechazar) {
-        const motivo = window.prompt("Rechazar: se anula el turno. Motivo (obligatorio):", "");
-        if (!motivo || !motivo.trim()) return;
+        const motivo = await preguntar({ titulo: `Rechazar retencion ${b.dataset.rechazar}`,
+          texto: "Se anula el turno y el vehiculo sale sin completar la operacion.",
+          campo: "Motivo", obligatorio: true, aceptar: "Rechazar", peligro: true });
+        if (!motivo) return;
         await postJson(`/api/autoridad/retenciones/${b.dataset.rechazar}/resolver`, { resolucion: "rechazar", motivo });
         cargarRetenciones();
       }
@@ -472,6 +598,12 @@ function initAutoridad() {
     else cargarSolicitudes();
   });
   initTabs(root);
+  // Solicitudes nuevas del agente, retenciones RT03 / RT05 y movimientos de carga
+  escucharCambios(() => {
+    if (root.dataset.pestana === "retenciones") cargarRetenciones();
+    else if (root.dataset.pestana === "carga") cargarCarga();
+    else cargarSolicitudes();
+  });
 }
 
 initNaviera();

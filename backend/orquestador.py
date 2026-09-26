@@ -20,6 +20,8 @@ del commit, para que la web las muestre en vivo sin consultar.
 Fase 3: los cambios de turnos, retenciones, parqueo, patio e intentos se
 anuncian en portus/srv/cambio ({entidad, id}); la web recarga solo eso.
 Fase 4: tambien las citas y las franjas bloqueadas (el bot usa el mismo anuncio).
+Fase 6: tambien manifiestos, declaraciones, transportistas y vehiculos, para
+que naviera, agente y autoridad vean los cambios de estado sin recargar.
 
 Los comandos se publican DESPUES del commit: si la transaccion se deshace
 (rechazo), nunca sale un AbrirTalanquera que la base no respalda.
@@ -34,8 +36,8 @@ import grua
 import servicios
 from catalogos import ANULADO, EN_GARITA, EN_PESAJE_ENTRADA, EN_SALIDA, RETENIDO
 from models import (
-    Alarma, Cita, CommandAudit, FranjaBloqueada, GruaCiclo, IntentoIngreso, ParqueoPlaza, PosicionPatio,
-    Retencion, Turno,
+    Alarma, Cita, CommandAudit, Declaracion, FranjaBloqueada, GruaCiclo, IntentoIngreso, Manifiesto,
+    ParqueoPlaza, PosicionPatio, Retencion, Transportista, Turno, Vehiculo,
 )
 
 TOPICO_ALARMAS_SERVIDOR = "portus/srv/alarma"
@@ -44,7 +46,8 @@ TOPICO_CAMBIOS_SERVIDOR = "portus/srv/cambio"
 ENTIDADES_ANUNCIADAS = {
     Turno: "turno", Retencion: "retencion", ParqueoPlaza: "parqueo",
     PosicionPatio: "patio", IntentoIngreso: "intento", Cita: "cita", FranjaBloqueada: "franja",
-    GruaCiclo: "ciclo",
+    GruaCiclo: "ciclo", Manifiesto: "manifiesto", Declaracion: "declaracion",
+    Transportista: "transportista", Vehiculo: "vehiculo",
 }
 
 EnviarMqtt = Callable[[str, str], None]  # (topic, payload_json)
@@ -323,8 +326,14 @@ def anunciar_cambios(session_factory, enviar_mqtt: EnviarMqtt) -> None:
                 continue
             entidad = ENTIDADES_ANUNCIADAS.get(type(obj))
             if entidad is not None:
-                # FranjaBloqueada no tiene id: su clave es la hora de inicio
-                cambios.add((entidad, obj.id if hasattr(obj, "id") else obj.inicio.isoformat()))
+                # FranjaBloqueada no tiene id (su clave es la hora de inicio) y Vehiculo usa el uid
+                if hasattr(obj, "id"):
+                    clave = obj.id
+                elif isinstance(obj, Vehiculo):
+                    clave = obj.uid
+                else:
+                    clave = obj.inicio.isoformat()
+                cambios.add((entidad, clave))
 
     @event.listens_for(session_factory, "after_commit")
     def _enviar(session):

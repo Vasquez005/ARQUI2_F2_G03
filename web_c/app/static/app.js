@@ -36,7 +36,10 @@
     pesaje: { estado: "Libre", clase: "idle", uid: null },
     aguja: { estado: null, clase: "idle" },
     salida: { estado: null, moviendo: false, garita: "Libre", uid: null, detalle: "" },
-    grua: { estado: null, pos: null, suspendida: false, mantenimiento: false },
+    grua: { estado: null, pos: null, suspendida: false, mantenimiento: false, trabajo: null },
+    // Estado que manda el Mega: alineado, en curso, abortado (null = se deduce de los turnos)
+    transferencia: { estado: null, clase: "idle", detalle: "" },
+    gruaServidor: { trabajoEnCurso: null, cola: [] }, // GET /grua/estado
     turnosActivos: [],
     parqueo: [],
     patio: [],
@@ -221,9 +224,23 @@
       }
     }
 
+    if (topic === "portus/evt/transferencia") {
+      const tr = st.transferencia;
+      if (d.evento === "alineado") Object.assign(tr, { estado: "Vehiculo alineado", clase: "ok", detalle: "" });
+      if (d.evento === "aborto") Object.assign(tr, { estado: "Operacion abortada", clase: "bad", detalle: d.causa || "" });
+      if (d.evento === "fin") Object.assign(tr, { estado: null, clase: "idle", detalle: "" });
+    }
+
     if (topic === "portus/evt/grua") {
       if (d.estado !== undefined && d.estado !== "boot") st.grua.estado = Number(d.estado);
-      if (d.pos !== undefined) st.grua.pos = Number(d.pos);
+      if (d.evt === "trabajo_inicio") {
+        st.grua.trabajo = { op: d.op, pos: d.pos };
+        Object.assign(st.transferencia, { estado: "Transferencia en curso", clase: "movimiento",
+          detalle: `${d.op || ""}${d.pos ? ` en P${d.pos}` : ""}` });
+      }
+      if (d.evt === "trabajo_fin") st.grua.trabajo = null;
+      // El Mega usa pos para el trabajo en trabajo_inicio / fin; la posicion de la grua va en los demas
+      if (d.pos !== undefined && !["trabajo_inicio", "trabajo_fin", "sin_posicion"].includes(d.evt)) st.grua.pos = Number(d.pos);
       st.eventosGrua.unshift({ ts, ...d });
       st.eventosGrua.length = Math.min(st.eventosGrua.length, 100);
     }
@@ -308,7 +325,13 @@
 
     const enTransf = activos.find((t) => t.estado === "EnTransferencia");
     const posicionando = activos.filter((t) => t.estado === "EnRuta");
-    if (enTransf) {
+    const tr = st.transferencia;
+    // El estado del Mega manda mientras haya un vehiculo en camino o en la zona;
+    // sin ninguno, un aborto viejo ya no es el estado actual.
+    if (tr.estado && (enTransf || posicionando.length)) {
+      setEl("el-transferencia", tr.estado, tr.clase);
+      $("el-transferencia-sub").innerHTML = `${chipVehiculo((enTransf || posicionando[0]).vehiculoUid)} ${escapeHtml(tr.detalle)}`;
+    } else if (enTransf) {
       setEl("el-transferencia", "Transferencia en curso", "movimiento");
       $("el-transferencia-sub").innerHTML = chipVehiculo(enTransf.vehiculoUid);
     } else if (posicionando.length) {
@@ -356,11 +379,18 @@
     const texto = g.suspendida ? `${nombre} (suspendida)` : nombre;
     setEl("el-grua", texto, g.suspendida ? "warn" : clase);
     const enTransf = st.turnosActivos.find((t) => t.estado === "EnTransferencia");
+    const enCurso = st.gruaServidor.trabajoEnCurso;
+    let trabajo = "ninguno";
+    if (enCurso) trabajo = `${enCurso.tipo} ${enCurso.contenedorId || ""}${enCurso.posicion ? ` en P${enCurso.posicion}` : ""}`;
+    else if (g.trabajo) trabajo = `${g.trabajo.op || ""}${g.trabajo.pos ? ` en P${g.trabajo.pos}` : ""}`;
+    else if (enTransf) trabajo = `${enTransf.tipoOperacion} ${enTransf.contenedorId}`;
     $("el-grua-sub").textContent = `Posicion: ${g.pos === null || g.pos < 0 ? "sin referencia" : `P${g.pos}`}`
-      + ` | Trabajo: ${enTransf ? `${enTransf.tipoOperacion} ${enTransf.contenedorId}` : "ninguno"}`;
-    const pendientes = st.turnosActivos.filter((t) => t.estado === "EnRuta");
-    $("el-cola").textContent = `${pendientes.length} pendiente(s)`
-      + (pendientes.length ? `: ${pendientes.map((t) => t.tipoOperacion).join(", ")}` : "");
+      + ` | Trabajo: ${trabajo}`;
+    const cola = st.gruaServidor.cola;
+    const tipoEnCurso = enCurso ? enCurso.tipo : (g.trabajo ? g.trabajo.op : null);
+    $("el-cola").textContent = `${cola.length} pendiente(s)`
+      + (cola.length ? `: ${cola.map((c) => c.tipo).join(", ")}` : "")
+      + ` | en curso: ${tipoEnCurso || "ninguno"}`;
 
     $("grua-estado").textContent = texto;
     $("grua-pos").textContent = g.pos === null ? "-" : String(g.pos);
@@ -391,6 +421,12 @@
     st.turnosActivos = await apiFetch("/api/terminal/turnos?activos=true");
   }
 
+  async function cargarGruaServidor() {
+    const e = await apiFetch("/api/terminal/grua/estado");
+    st.gruaServidor = { trabajoEnCurso: e.trabajoEnCurso, cola: e.cola || [] };
+    return e;
+  }
+
   async function cargarPatio() {
     const data = await apiFetch("/api/terminal/patio");
     st.patio = data.patio || [];
@@ -409,7 +445,7 @@
       pendientes.clear();
       try {
         const tareas = [];
-        if (lista.includes("sinoptico")) tareas.push(cargarTurnosActivos(), cargarPatio());
+        if (lista.includes("sinoptico")) tareas.push(cargarTurnosActivos(), cargarPatio(), cargarGruaServidor());
         await Promise.all(tareas);
         renderSinoptico();
         if (lista.includes("turnos") && cargadas.has("turnos")) cargarTurnos();
@@ -418,6 +454,8 @@
         if (lista.includes("patio") && cargadas.has("patio")) cargarPestanaPatio();
         if (lista.includes("citas") && cargadas.has("citas")) cargarAgenda();
         if (lista.includes("grua") && cargadas.has("grua")) cargarGrua();
+        if (lista.includes("transportistas")) await cargarTransportistas();
+        if ((lista.includes("vehiculos") || lista.includes("transportistas")) && cargadas.has("turnos")) cargarVehiculos();
       } catch (err) {
         toast(`No se pudo actualizar: ${err.message}`, "toast-bad");
       }
@@ -433,6 +471,8 @@
     intento: ["intentos"],
     cita: ["citas"],
     franja: ["citas"],
+    transportista: ["transportistas"], // vinculacion por el bot: "(vinculado)" aparece solo
+    vehiculo: ["vehiculos"],
   };
 
   // ════════════════════════ comandos remotos ════════════════════════
@@ -451,8 +491,8 @@
     return div;
   }
 
-  async function enviarComando(name, params = {}, confirmar = null) {
-    if (confirmar && !window.confirm(confirmar)) return;
+  async function enviarComando(name, params = {}, pregunta = null) {
+    if (pregunta && !await confirmar(`Enviar ${name}`, pregunta, { aceptar: "Enviar", peligro: true })) return;
     const hora = new Date().toLocaleTimeString();
     const extra = Object.keys(params).length ? ` (${Object.entries(params).map(([k, v]) => `${k}=${v}`).join(", ")})` : "";
     try {
@@ -531,7 +571,11 @@
 
   function recibir(topic, payload, enVivo) {
     if (topic === "portus/srv/cambio") {
-      if (enVivo) programarRecarga(...(RECARGA_POR_ENTIDAD[payload.entidad] || []));
+      if (!enVivo) return;
+      programarRecarga(...(RECARGA_POR_ENTIDAD[payload.entidad] || []));
+      if (payload.entidad === "turno" && $("dlg-turno").open && String(payload.id) === turnoAbierto) {
+        verTurno(turnoAbierto, true);
+      }
       return;
     }
     if (topic === "portus/srv/alarma") {
@@ -625,11 +669,16 @@
     }
   }
 
-  async function verTurno(id) {
+  let turnoAbierto = null; // si llega un cambio de este turno, la linea de tiempo se recarga sola
+
+  async function verTurno(id, refrescar = false) {
     const dlg = $("dlg-turno");
     const body = $("dlg-turno-body");
-    body.innerHTML = "Cargando...";
-    dlg.showModal();
+    turnoAbierto = String(id);
+    if (!refrescar) {
+      body.innerHTML = "Cargando...";
+      dlg.showModal();
+    }
     try {
       const t = await apiFetch(`/api/terminal/turnos/${id}`);
       const eventos = (t.lineaDeTiempo || []).map((e) => {
@@ -654,13 +703,17 @@
   }
 
   async function retenerTurno(id) {
-    const obs = window.prompt(`Retener el turno ${id} (RT06). Observacion opcional:`, "");
+    const obs = await preguntar({ titulo: `Retener el turno ${id} (RT06)`,
+      texto: "Retencion manual operativa. Si el vehiculo no llego a la transferencia, se envia al parqueo.",
+      campo: "Observacion", aceptar: "Retener", peligro: true });
     if (obs === null) return;
     await accion(post(`/api/terminal/turnos/${id}/retener`, { observacion: obs || null }), `Turno ${id} retenido`);
   }
 
   async function anularTurno(id) {
-    const causa = window.prompt(`Anular el turno ${id}: el vehiculo sale sin completar la operacion. Causa:`, "");
+    const causa = await preguntar({ titulo: `Anular el turno ${id}`,
+      texto: "El vehiculo sale sin completar la operacion; se avisa al transportista.",
+      campo: "Causa de la anulacion", aceptar: "Anular", peligro: true });
     if (causa === null) return;
     await accion(post(`/api/terminal/turnos/${id}/anular`, { causa: causa || null }), `Turno ${id} anulado`);
   }
@@ -754,17 +807,18 @@
     let motivo = null;
     let observacion = null;
     if (resolucion === "rechazar") {
-      motivo = window.prompt(`Rechazar la retencion ${id}: se anula el turno y el vehiculo sale. Motivo (obligatorio):`, "");
+      motivo = await preguntar({ titulo: `Rechazar la retencion ${id}`,
+        texto: "Se anula el turno, se libera la plaza y el vehiculo sale sin completar la operacion.",
+        campo: "Motivo", obligatorio: true, aceptar: "Rechazar", peligro: true });
       if (motivo === null) return;
-      if (!motivo.trim()) {
-        toast("Rechazar requiere un motivo.", "toast-bad");
-        return;
-      }
     } else {
-      const aviso = resolucion === "corregir"
-        ? `Corregir la retencion ${id}: el peso declarado pasa a ${boton.dataset.medido} g. Observacion opcional:`
-        : `Aclarar la retencion ${id}: el turno continua sin cambiar el manifiesto. Observacion opcional:`;
-      observacion = window.prompt(aviso, "");
+      const corregir = resolucion === "corregir";
+      observacion = await preguntar({
+        titulo: `${corregir ? "Corregir" : "Aclarar"} la retencion ${id}`,
+        texto: corregir
+          ? `El peso declarado del manifiesto pasa a ${boton.dataset.medido} g (el anterior queda en su historial) y el turno continua.`
+          : "El turno continua sin cambiar el manifiesto; se libera la plaza.",
+        campo: "Observacion", aceptar: corregir ? "Corregir" : "Aclarar" });
       if (observacion === null) return;
     }
     await accion(post(`/api/terminal/retenciones/${id}/resolver`, { resolucion, motivo, observacion: observacion || null }),
@@ -977,7 +1031,7 @@
     const limite = $("grua-rango").value;
     try {
       const [estado, historial] = await Promise.all([
-        apiFetch("/api/terminal/grua/estado"),
+        cargarGruaServidor(),
         apiFetch(`/api/terminal/grua/ciclos?limit=${limite}`),
       ]);
       const t = estado.trabajoEnCurso;
@@ -1125,7 +1179,8 @@
     }
     if (b.dataset.liberarPlaza) {
       const plaza = b.dataset.liberarPlaza;
-      if (!window.confirm(`Enviar AgujaLiberar para la plaza ${plaza}?`)) return;
+      if (!await confirmar("Liberar parqueo", `Enviar AgujaLiberar para la plaza ${plaza}? El vehiculo vuelve al carril principal.`,
+        { aceptar: "Liberar" })) return;
       await accion(post(`/api/terminal/parqueo/${plaza}/liberar`), `AgujaLiberar enviado (plaza ${plaza})`);
       return;
     }
@@ -1135,7 +1190,8 @@
       return;
     }
     if (b.dataset.cancelarCita) {
-      const motivo = window.prompt(`Cancelar la cita de ${b.dataset.contenedor}. Se avisa al transportista. Motivo (opcional):`, "");
+      const motivo = await preguntar({ titulo: `Cancelar la cita de ${b.dataset.contenedor}`,
+        texto: "Se avisa al transportista.", campo: "Motivo", aceptar: "Cancelar cita", peligro: true });
       if (motivo === null) return;
       await accion(post(`/api/terminal/citas/${b.dataset.cancelarCita}/cancelar`, { motivo: motivo || null }),
         `Cita de ${b.dataset.contenedor} cancelada`);
@@ -1146,7 +1202,9 @@
       const bloquear = b.dataset.franjaAccion === "bloquear";
       let motivo = null;
       if (bloquear) {
-        motivo = window.prompt("Bloquear la franja: no se asignaran citas nuevas (las que tiene se conservan). Motivo (opcional):", "");
+        motivo = await preguntar({ titulo: "Bloquear franja",
+          texto: "No se asignaran citas nuevas en esta franja (las que ya tiene se conservan).",
+          campo: "Motivo", aceptar: "Bloquear" });
         if (motivo === null) return;
       }
       await accion(post(`/api/terminal/franjas/${b.dataset.franjaAccion}`, { inicio: b.dataset.inicio, motivo: motivo || null }),
@@ -1154,7 +1212,8 @@
       return;
     }
     if (b.dataset.reconocer) {
-      const comentario = window.prompt(`Reconocer la alarma ${b.dataset.reconocer}. Comentario opcional:`, "");
+      const comentario = await preguntar({ titulo: `Reconocer la alarma ${b.dataset.reconocer}`,
+        texto: "La alarma pasa a la lista de historicas.", campo: "Comentario", aceptar: "Reconocer" });
       if (comentario === null) return;
       if (await accion(post(`/api/terminal/alarmas/${b.dataset.reconocer}/reconocer`, { comentario: comentario || null }))) {
         cargarAlarmas();
@@ -1189,7 +1248,8 @@
   $("patio-orden").addEventListener("change", cargarPestanaPatio);
   $("alarmas-severidad").addEventListener("change", cargarAlarmas);
   $("btn-reconocer-todas").addEventListener("click", async () => {
-    if (!window.confirm("Reconocer todas las alarmas activas de severidad media y baja?")) return;
+    if (!await confirmar("Reconocer todas", "Reconocer todas las alarmas activas de severidad media y baja? "
+      + "Las criticas y altas se reconocen una por una.", { aceptar: "Reconocer todas" })) return;
     const r = await accion(post("/api/terminal/alarmas/reconocer-todas"));
     if (r) {
       toast(`${r.reconocidas} alarma(s) reconocida(s). Las criticas y altas se reconocen una por una.`, "toast-ok");
@@ -1212,7 +1272,8 @@
     }
   });
   $("politica-patio").addEventListener("change", async (e) => {
-    if (!window.confirm(`Cambiar la politica de asignacion de posiciones a "${e.target.value}"?`)) return cargarReportes();
+    if (!await confirmar("Politica de patio", `Cambiar la politica de asignacion de posiciones a "${e.target.value}"?`,
+      { aceptar: "Cambiar" })) return cargarReportes();
     await accion(post("/api/terminal/politica-patio", { politica: e.target.value }), "Politica de patio cambiada");
   });
   $("citas-fecha").addEventListener("change", cargarAgenda);
@@ -1259,7 +1320,8 @@
 
   (async () => {
     try {
-      await Promise.all([cargarTurnosActivos(), cargarPatio(), cargarTransportistas(), contarAlarmasActivas()]);
+      await Promise.all([cargarTurnosActivos(), cargarPatio(), cargarGruaServidor(), cargarTransportistas(),
+        contarAlarmasActivas()]);
     } catch (err) {
       toast(`Error cargando datos iniciales: ${err.message}`, "toast-bad");
     }

@@ -22,6 +22,10 @@ Implementacion base de **Persona D**:
 - Si hay broker MQTT (`PORTUS_MQTT_HOST`, `PORTUS_MQTT_PORT`), anuncia las citas nuevas
   en `portus/srv/cambio` para que la agenda de la terminal se actualice en vivo.
 - Aislamiento por transportista (no ve carga ajena).
+- Nunca queda sin responder: stickers, fotos o audios reciben "Solo entiendo mensajes de texto",
+  y un error interno tambien recibe respuesta.
+- En Telegram registra el menu de comandos y `/cita` muestra botones con los contenedores y
+  despues con las franjas (en el modo CLI se imprimen como `[botones]`).
 
 > Usa la misma base de datos y modelos que el backend de B (`backend/portus_core.db`,
 > `backend/models.py`). Pendientes: `docs originales/Plan_de_trabajo_final.md` (fase 4).
