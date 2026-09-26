@@ -29,11 +29,15 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
     servicios.py      # reglas de negocio (turnos, patio, parqueo, retenciones, alarmas)
     catalogos.py      # roles, dispositivos, causas de retencion, umbrales
     security.py       # hash/verificacion de contrasenas
-    orquestador.py    # eventos de la maqueta -> avance del turno (garitas, pesaje, salida)
+    orquestador.py    # eventos de la maqueta -> avance del turno (garitas, pesaje, grua, salida)
+    grua.py           # trabajos de la grua, ciclos, inventario, remociones y politica de patio
+    reportes.py       # las 8 metricas de la sec. 13, CSV y consulta de carga
     seed.py           # usuarios, transportistas y tarjetas RFID (--demo: manifiestos de prueba)
     test_orquestador.py
     test_alarmas.py
     test_terminal.py
+    test_citas.py
+    test_grua.py
     requirements.txt
   web_c/
     app/main.py       # web: sesion, permisos por rol, proxy hacia B, MQTT -> WebSocket
@@ -103,7 +107,7 @@ Integracion de los 3 Arduinos de PORTUS con la Raspberry Pi:
 - `portus/cmd/solicitud`
 - `portus/cmd/respuesta`
 - `portus/srv/alarma` (del backend: cada alarma nueva, ya guardada)
-- `portus/srv/cambio` (del backend: `{entidad, id}` de cada turno, retencion, plaza, posicion o intento que cambio)
+- `portus/srv/cambio` (del backend y del bot: `{entidad, id}` de cada turno, retencion, plaza, posicion, intento, cita o franja que cambio)
 
 ---
 
@@ -147,6 +151,9 @@ Variables opcionales:
 | `PORTUS_BACKEND_BIND` | `127.0.0.1` | Donde escucha el backend. Dejarlo local: la web aplica los permisos |
 | `PORTUS_MIN_AL12` | `30` | Minutos de retencion abierta para AL12 (bajarlo para la demostracion) |
 | `PORTUS_MIN_AL13` | `120` | Minutos de un contenedor en patio para AL13 (bajarlo para la demostracion) |
+| `PORTUS_HORARIO_AGENDA` | `06:00-22:00` | Horario (hora local) que muestra la agenda de citas de la terminal |
+| `PORTUS_CONTENEDORES` | `MSCU0000001..MSCU0000008` | Catalogo de contenedores de la maqueta (separados por coma) |
+| `PORTUS_CM_POR_TRAMO` | `0` | Centimetros entre posiciones del riel, para reportar la distancia de la grua en cm |
 
 Servicios:
 
@@ -228,7 +235,7 @@ python3 -m unittest test_protocol.py
 
 # Ciclo fisico del orquestador y alarmas (sin MQTT ni Arduinos)
 cd backend
-.venv/bin/python3 -m unittest test_orquestador test_alarmas test_terminal -v
+.venv/bin/python3 -m unittest test_orquestador test_alarmas test_terminal test_citas test_grua -v
 ```
 
 ---

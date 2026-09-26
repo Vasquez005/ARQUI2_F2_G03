@@ -16,7 +16,7 @@ Responsables: **A** firmware, **B** backend, **C** web, **D** bot.
 | Bridge | Serial ↔ MQTT de las 3 placas, ping cada 3 s | — |
 | Backend (B) | Cadena documental, turnos, RT01–RT06, parqueo, patio, avisos al bot. **Desde la fase 1, los eventos de la maqueta mueven el turno solos. Desde la fase 2, genera AL01 y AL09–AL14, guarda las alarmas de las placas y las anuncia en vivo.** | Rutas para Grúa, Citas y Reportes; AL03–AL08 esperan los eventos del Mega (fase 5) |
 | Web (C) | Login y permisos en servidor. **Desde la fase 3:** sinóptico en vivo con los 13 elementos, controles con confirmación y ACK/REJ legible; Turnos, Retenciones, Patio y Alarmas completas, todo por WebSocket | Grúa, Citas y Reportes (fases 4 y 5); ver detalle en naviera / agente / autoridad (5.5) |
-| Bot (D) | Vinculación, 7 comandos, citas, 8 de 9 avisos, aislamiento entre transportistas | Cancelar y reprogramar citas, bloquear franjas |
+| Bot (D) | Vinculación, 7 comandos, citas, los 9 avisos, aislamiento entre transportistas. **Desde la fase 4:** respeta las franjas bloqueadas y anuncia sus citas en vivo | Demostración con 2 teléfonos (4.5, manual) |
 
 ---
 
@@ -89,7 +89,7 @@ Todo en el servidor. Las alarmas quedan guardadas aunque la web esté cerrada y 
 
 - [ ] **AL14 en cada retención y resolución:** el servidor manda `AgujaParqueo` / `AgujaLiberar` al Mega, que hoy los rechaza con `causa=pesaje_externo`. Cada retención y cada resolución generan una AL14 baja. Es correcto según la sec. 11.2 pero ensucia la demostración: se resuelve con la decisión de la aguja (6.3).
 - [ ] **AL13** funciona, pero el patio solo se llena cuando la grúa informe los depósitos (5.1). Hasta entonces no se puede ver en la maqueta.
-- [ ] Ninguna placa emite todavía `portus/evt/alarma` (AL02 en 6.1; AL03–AL08 en 5.1).
+- [ ] AL02 todavía no lo emite ninguna placa (6.1). AL03, AL06, AL07 y AL08 ya están en el firmware del Mega (fase 5, falta probarlo en la placa).
 
 ---
 
@@ -133,11 +133,11 @@ Regla general: nada de `setInterval` + `fetch` para el estado en vivo (se penali
 
 - [ ] Con el Mega actual, `AgujaLiberar` siempre recibe REJ: la plaza se libera cuando el vehículo llega a la salida. Se resuelve con 6.3.
 - [ ] Las confirmaciones y motivos usan los diálogos nativos del navegador (`confirm` / `prompt`); funcionan, pero se pueden reemplazar por formularios propios si hay tiempo.
-- [ ] La pestaña Grúa muestra estado y eventos en vivo; historial, gráfica y CSV quedan para la fase 5. Citas (fase 4) y Reportes (fase 5) siguen como marcadores.
+- [ ] La pestaña Grúa muestra estado y eventos en vivo; historial, gráfica y CSV quedan para la fase 5. Reportes (fase 5) sigue como marcador. (Citas: hecha en la fase 4.)
 
 ---
 
-## Fase 4: citas (D + B + C)
+## Fase 4: citas (D + B + C) — ✅ HECHA (2026-09-25), salvo 4.5 que es manual
 
 | # | Tarea | Responsable |
 |---|---|---|
@@ -147,9 +147,43 @@ Regla general: nada de `setInterval` + `fetch` para el estado en vivo (se penali
 | 4.4 | Pestaña **Citas** en la terminal; mover ahí la vinculación del bot | C |
 | 4.5 | Demostración con 2 teléfonos: vincular a los 2 transportistas y mostrar el aislamiento (E12) | D |
 
+### Lo que se hizo
+
+1. **Lógica compartida.** Franjas, capacidad, cita vigente y "vencida" pasaron del bot a `servicios.py` (`proximas_franjas`, `franja_disponible`, `asignar_cita`, `estado_cita`, `texto_franja`); el bot y la terminal usan las mismas reglas.
+2. **4.1 Franjas bloqueadas:** tabla `franjas_bloqueadas`. Una franja bloqueada no se ofrece ni se asigna; las citas que ya tenía se conservan. Solo se bloquean franjas que no han empezado.
+3. **4.2 Agenda del día:** `GET /citas/agenda?fecha=YYYY-MM-DD` con cada franja del horario (`PORTUS_HORARIO_AGENDA`, 06:00-22:00 por defecto) más las que tengan citas o bloqueos: capacidad, asignadas, estado (disponible, llena, bloqueada, en curso, pasada) y las citas con transportista, vehículo y contenedor. Cumplimiento = cumplidas / (cumplidas + vencidas), contando como vencidas las que no se presentaron.
+4. **4.3 Cancelar y reprogramar:** `POST /citas/{id}/cancelar` y `/reprogramar` (solo a una franja futura con capacidad y sin bloqueo; `GET /citas/{id}/franjas-disponibles` da las opciones). Cada una deja su aviso al transportista dueño, con la ventana nueva si fue reprogramada. Con esto salen los 9 avisos de la sec. 6.3.
+5. **4.4 Pestaña Citas:** selector de fecha, indicador de cumplimiento, "solo franjas con citas", Cancelar (motivo opcional), Reprogramar (diálogo con las franjas disponibles), Bloquear / Desbloquear franja. La vinculación del bot se movió aquí.
+6. **En vivo:** las citas y los bloqueos se anuncian en `portus/srv/cambio`; el bot también se conecta a MQTT para anunciar las citas que se piden por Telegram, así la agenda de la terminal cambia sin recargar.
+
+### Correcciones de fases anteriores en este sprint
+
+- **Bot, carrera al confirmar:** la cita se creaba sin volver a revisar la franja; si otro la llenaba entre la oferta y la elección, quedaban 3 citas. Ahora `asignar_cita` revalida y el bot responde "Esa franja ya no está disponible".
+- **Bot, recordatorio:** se marcaba una vez por cita, así que una cita reprogramada no volvía a recibir recordatorio. La referencia ahora incluye la ventana.
+- **Bot, `/estado`:** la permanencia se calculaba desde el cierre del turno de depósito; ahora usa la fecha de ingreso al patio (fase 2).
+- **Web, caché del navegador:** durante la prueba el navegador siguió usando un `app.js` viejo. Las plantillas piden los archivos con `?v=<fecha del archivo>`, así que cada cambio se descarga solo.
+
+### Verificación
+
+- `backend/test_citas.py`: 16 pruebas (reglas de la sec. 9, agenda, cancelar / reprogramar con aviso solo al dueño, bloqueos, bot con 2 transportistas, carrera, recordatorio, `/estado`). En total 56 pasan.
+- Punta a punta con Mosquitto, backend, web y el bot en modo CLI: 2 transportistas vinculados, cada uno pide su cita por el bot y la agenda se actualiza en vivo; desde la web se cancela, se reprograma y se bloquea una franja; el bot ya no ofrece la bloqueada y cada aviso llega solo al chat de su dueño.
+
+### 4.5 Guion para la demostración con 2 teléfonos (manual)
+
+1. `seed.py --demo` y levantar todo con `PORTUS_BOT_TOKEN`.
+2. Terminal → Citas → Vinculación: generar un código para cada transportista; en cada teléfono, `/vincular CODIGO`.
+3. En cada teléfono, `/cita`, elegir su contenedor y una franja. La agenda muestra las dos citas sin recargar.
+4. Aislamiento (E12): desde el teléfono 1, `/estado` con el contenedor del 2 → "No tienes carga asociada a ese identificador"; `/miscitas` solo lista lo propio.
+5. Desde la web, reprogramar la cita del teléfono 2: solo ese teléfono recibe el aviso con la ventana nueva.
+
+### Pendiente de la fase 4
+
+- [ ] 4.5 se hace con los teléfonos y el token real de Telegram; no se puede automatizar.
+- [ ] Las citas que no se presentan quedan "programadas" en la base y se muestran como vencidas por tiempo (para que la garita pueda aplicar RT04 si llegan tarde). La métrica ya las cuenta como vencidas.
+
 ---
 
-## Fase 5: grúa, reportes y el resto de roles (A + B + C)
+## Fase 5: grúa, reportes y el resto de roles (A + B + C) — ✅ HECHA en software (2026-09-25); el firmware del Mega falta probarlo en la maqueta
 
 | # | Tarea | Responsable |
 |---|---|---|
@@ -159,6 +193,37 @@ Regla general: nada de `setInterval` + `fetch` para el estado en vivo (se penali
 | 5.4 | Pestaña **Reportes**: rango, etiqueta de corrida, las 8 métricas, CSV | C |
 | 5.5 | Naviera, agente y autoridad: Ver detalle con historial, filtros y búsqueda, campo de tarjeta RFID en el manifiesto | C |
 | 5.6 | **Adjuntar observación** (agente) y **Ver declaración** (autoridad), con sus rutas nuevas | B + C |
+
+### Lo que se hizo
+
+1. **5.1 Mega (compila; sin probar en la placa):** acepta `TrabajoGrua;op=DEPOSITO|RETIRO[;pos=N]` del servidor (en mantenimiento lo rechaza, sec. 11 regla 4) y emite `transferencia evento=alineado`, `grua evt=trabajo_inicio;op;pos`, `patio evento=deposito|retiro;pos` (confirmado por el sensor de la celda), `grua evt=trabajo_fin;op;pos;ms;tramos` y, al abortar, `transferencia evento=aborto;causa` con AL03 (referencia o marca), AL07 (depósito no confirmado), AL08 (camión movido) y AL06. Sin `pos`, o si la celda no sirve, la grúa usa la política de la fase 1 (primera libre / ocupada). Flash 8 %, RAM 17 %.
+2. **Backend (`grua.py`):** el servidor manda el trabajo al turno más antiguo que espera la grúa (uno a la vez; al terminar, el siguiente; si la grúa lo rechaza, vuelve a la cola y se reenvía con GruaReanudar o al salir de mantenimiento). `trabajo_inicio` pasa el turno a **EnTransferencia de verdad** y abre el ciclo; el inventario solo cambia con la confirmación física (R09); `trabajo_fin` guarda duración y tramos; un aborto no toca el inventario y la grúa reintenta con el mismo turno. Cada paso queda en la línea de tiempo (E15).
+3. **Remociones:** en la maqueta hay un bloque por celda y el nivel 2 es lógico. Si al retirar un contenedor había otro encima en el inventario, el servidor registra la remoción (ciclo `REMOCION`, el de arriba pasa a la posición que da la política) y la línea de tiempo lo muestra. Si la grúa retira de otra posición que la del inventario, AL07.
+4. **Política de patio seleccionable (sec. 13):** `secuencial` (la de la fase 1) queda como modo del sistema, se elige en Reportes y cada corrida guarda con qué política se hizo. Para la Fase 3 se agrega la optimizada en `grua.POLITICAS`.
+5. **5.2 Métricas (`reportes.py`):** las 8 de la sec. 13 sobre un rango. La fila de espera sale de un historial nuevo de estados del turno (`turno_estados`, lo llena un listener de `Turno.estado`): vehículos en EnGarita o EnRuta al mismo tiempo. La distancia se reporta en tramos del riel (`PORTUS_CM_POR_TRAMO` la pasa a cm).
+6. **5.3 Pestaña Grúa:** estado y posición en vivo, trabajo en ejecución, cola con orden de atención, gráfica SVG de tiempos de ciclo (50 / 100 / 200) con promedio, historial, fallas (AL02–AL08 y ciclos abortados) y exportar CSV. Se actualiza con `portus/srv/cambio` (entidad `ciclo`).
+7. **5.4 Pestaña Reportes:** etiqueta, rango, Generar (guarda la corrida), las 8 métricas en tarjetas, retenciones por causa y resolución, Exportar CSV con el detalle de cada turno, y la lista de corridas guardadas.
+8. **5.5 y 5.6 Roles:** naviera, agente y autoridad ahora tienen **las pestañas con los nombres exactos de la sec. 3** (antes eran secciones sueltas). Naviera: Nuevo manifiesto con catálogo y tarjeta RFID, Ver detalle con historial, estado operativo, Mis contenedores con búsqueda, filtro, ubicación y reloj. Agente: Presentar declaración, Solicitar levante, Adjuntar observación; Seguimiento con filtro y búsqueda (pendiente / autorizada / retenida, canal y motivo). Autoridad: solicitudes con naviera, agente, declaración y peso; el canal es obligatorio antes de otorgar; Ver declaración con las observaciones del agente; Retenciones aduaneras con la información de la sec. 4.3; Consulta de carga con búsqueda por contenedor, naviera y autorización.
+
+### Correcciones de fases anteriores en este sprint
+
+- **Catálogo de contenedores (sec. 5.1):** el manifiesto aceptaba cualquier identificador. Tabla `contenedores` (se siembra al arrancar; `PORTUS_CONTENEDORES` la cambia) y el manifiesto se rechaza si el contenedor no está.
+- **Número de declaración repetido:** reventaba con un error 500 de la base; ahora es un 409 claro.
+- **Remociones mal contadas:** sacar el contenedor de arriba contaba como remoción; ahora solo cuenta la remoción real.
+- **Motivo de retención del levante:** se pegaba en las observaciones del manifiesto; ahora tiene su campo y aparece en Seguimiento y en el detalle.
+- **Historial del manifiesto (E08):** al Corregir se guardaba el peso anterior pero no había dónde verlo; ahora queda en el historial con los dos valores.
+- **Web:** la clase `hidden` no ocultaba los formularios con `grid-form` (el de nuevo manifiesto se veía siempre). Zona de espera del sinóptico = misma definición que la métrica.
+
+### Verificación
+
+- `backend/test_grua.py`: 17 pruebas (ciclo de depósito de punta a punta, cola, aborto y reintento, rechazo en mantenimiento, retiro con remoción, retiro del de arriba sin remoción, AL07, historial y CSV, política, las 8 métricas y su CSV, historial de estados, catálogo, declaración repetida, historial del manifiesto, seguimiento y carga por naviera). En total 73 pasan.
+- Punta a punta con Mosquitto, backend, web y un simulador que se porta como el Mega: el servidor asignó P1 al depósito (política) y P3 al retiro (inventario); el retiro registró la remoción de P3 a P2; el sinóptico, la pestaña Grúa (gráfica, historial) y el patio cambiaron en vivo; el reporte "prueba e2e fase 5" mostró las 8 métricas y el CSV se descargó. La cadena documental naviera → agente → autoridad se probó con los permisos (naviera 2 no ve lo de naviera 1; el agente no puede otorgar levante).
+
+### Pendiente de la fase 5 (para la sesión con la maqueta)
+
+- [ ] Subir el firmware del Mega y confirmar que los eventos salen en el momento físico correcto. El frame `TrabajoGrua` mide ~70 bytes y el búfer del Mega es de 64: mismo riesgo que en las garitas.
+- [ ] **Decidir el apilado físico.** Hoy el nivel 2 es lógico: la grúa física deja un bloque por celda. Para demostrar E15 con una remoción real, la grúa tendría que poder apilar (bajar menos en una celda ocupada) y hacer el movimiento de remoción; si no, la remoción se demuestra como registro del servidor.
+- [ ] AL04 (pérdida de carga) y AL05 (agarre no confirmado) no tienen sensor en la maqueta: documentarlo o agregar uno (fase 6).
 
 ---
 

@@ -118,6 +118,7 @@ if [[ -n "$BOT_TOKEN" ]]; then
     "cd '$ROOT_DIR/bot_d' && \
      python3 -m venv .venv >/dev/null 2>&1 || true && \
      .venv/bin/python3 -m pip install -q -r requirements.txt && \
+     PORTUS_MQTT_HOST='$MQTT_HOST' PORTUS_MQTT_PORT='$MQTT_PORT' \
      PORTUS_BOT_TOKEN='$BOT_TOKEN' .venv/bin/python3 -u app/main.py"
 else
   echo "[WARN] Bot D no iniciado (falta PORTUS_BOT_TOKEN). Para probarlo sin Telegram: cd bot_d && python3 app/main.py"

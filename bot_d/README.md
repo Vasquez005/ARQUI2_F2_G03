@@ -15,7 +15,12 @@ Implementacion base de **Persona D**:
   - Franjas de 15 minutos
   - Maximo 2 citas por franja
   - Solo contenedores con levante otorgado
-- Recordatorio automatico de cita 1 hora antes.
+- Recordatorio automatico de cita 1 hora antes (vuelve a salir si la cita se reprograma).
+- Las franjas, la capacidad y las franjas bloqueadas salen de `backend/servicios.py`,
+  las mismas reglas que usa la agenda de la terminal. La cita se revalida al confirmar.
+- Cancelar / reprogramar lo hace la terminal desde la web; el bot entrega el aviso.
+- Si hay broker MQTT (`PORTUS_MQTT_HOST`, `PORTUS_MQTT_PORT`), anuncia las citas nuevas
+  en `portus/srv/cambio` para que la agenda de la terminal se actualice en vivo.
 - Aislamiento por transportista (no ve carga ajena).
 
 > Usa la misma base de datos y modelos que el backend de B (`backend/portus_core.db`,

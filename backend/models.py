@@ -3,7 +3,7 @@ from typing import Optional
 from sqlalchemy import event
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 
 class Base(DeclarativeBase):
@@ -120,6 +120,7 @@ class Manifiesto(Base):
     # garita lo deduce por el transportista duenio de la tarjeta (ver Vehiculo).
     vehiculo_uid: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
     observaciones: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    motivo_levante: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # si la autoridad lo retuvo
     estado_documental: Mapped[str] = mapped_column(String(24), default="declarado")
     # declarado -> declaracion_presentada -> levante_solicitado -> levante_otorgado | levante_retenido
     canal: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # verde | rojo
@@ -141,15 +142,25 @@ class Declaracion(Base):
 
 
 class Cita(Base):
-    """Minimo indispensable para poder generar RT04 (fuera de ventana). La
-    logica completa de franjas/oferta de horarios es tarea de Persona D."""
+    """Cita de un contenedor en una franja de 15 min (sec. 9). La garita la usa
+    para RT04 y la marca cumplida / vencida al llegar el vehiculo."""
     __tablename__ = "citas"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     contenedor_id: Mapped[str] = mapped_column(String(32), index=True)
     transportista_id: Mapped[Optional[int]] = mapped_column(ForeignKey("transportistas.id"), nullable=True)
-    inicio: Mapped[datetime] = mapped_column(DateTime)
+    inicio: Mapped[datetime] = mapped_column(DateTime, index=True)
     fin: Mapped[datetime] = mapped_column(DateTime)
     estado: Mapped[str] = mapped_column(String(16), default="programada")  # programada|cumplida|vencida|cancelada
+    motivo: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # de la cancelacion o reprogramacion
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class FranjaBloqueada(Base):
+    """Boton Bloquear franja (sec. 4.7): no se asignan citas nuevas en ella.
+    Las citas que ya tenia se conservan."""
+    __tablename__ = "franjas_bloqueadas"
+    inicio: Mapped[datetime] = mapped_column(DateTime, primary_key=True)  # UTC, alineada a 15 min
+    motivo: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -167,8 +178,44 @@ class Turno(Base):
     peso_medido_entrada_g: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     peso_medido_salida_g: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     posicion_patio: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    trabajo_grua_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)  # TrabajoGrua enviado
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    historial_estados: Mapped[list["TurnoEstado"]] = relationship(cascade="all, delete-orphan")
+
+
+class TurnoEstado(Base):
+    """Cada estado por el que paso un turno y cuando (lo llena el listener de
+    Turno.estado). Con esto se calcula la fila de espera maxima (sec. 13)."""
+    __tablename__ = "turno_estados"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    turno_id: Mapped[int] = mapped_column(ForeignKey("turnos.id"), index=True)
+    estado: Mapped[str] = mapped_column(String(24))
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+@event.listens_for(Turno.estado, "set")
+def _historial_de_estado(turno, valor, anterior, _iniciador):
+    if valor != anterior:
+        turno.historial_estados.append(TurnoEstado(estado=valor, ts=datetime.utcnow()))
+
+
+class GruaCiclo(Base):
+    """Un trabajo de la grua (sec. 4.5 y 13): lo abre trabajo_inicio y lo cierra
+    trabajo_fin o un aborto. Las remociones del retiro quedan como ciclos REMOCION."""
+    __tablename__ = "grua_ciclos"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    turno_id: Mapped[Optional[int]] = mapped_column(ForeignKey("turnos.id"), nullable=True, index=True)
+    tipo: Mapped[str] = mapped_column(String(12))  # DEPOSITO | RETIRO | REMOCION
+    contenedor_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    posicion: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    posicion_destino: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # remocion: a donde se movio
+    resultado: Mapped[str] = mapped_column(String(12), default="en_curso", index=True)  # en_curso|completado|abortado
+    causa: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    duracion_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tramos: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # posiciones recorridas
+    inicio: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    fin: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class EventoTurno(Base):
@@ -254,6 +301,49 @@ class Alarma(Base):
     ack_comentario: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
+class ManifiestoEvento(Base):
+    """Historial del manifiesto (sec. 5.1 Ver detalle): declaracion, levante,
+    turnos, correccion de peso (con el valor anterior) y las observaciones que
+    adjunta el agente para la autoridad (tipo=observacion)."""
+    __tablename__ = "manifiesto_eventos"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    manifiesto_id: Mapped[int] = mapped_column(ForeignKey("manifiestos.id"), index=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    origen: Mapped[str] = mapped_column(String(16))  # naviera|agente|autoridad|terminal|servidor
+    tipo: Mapped[str] = mapped_column(String(16), default="historial")  # historial | observacion
+    descripcion: Mapped[str] = mapped_column(Text)
+    valores_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class ContenedorCatalogo(Base):
+    """Catalogo de contenedores de la maqueta (sec. 5.1: el manifiesto solo
+    acepta contenedores que existen aqui)."""
+    __tablename__ = "contenedores"
+    contenedor_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    descripcion: Mapped[str] = mapped_column(String(120), default="")
+    activo: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class Corrida(Base):
+    """Reporte guardado (sec. 4.8): rango, etiqueta y las 8 metricas. Es la
+    linea base que se compara en la Fase 3."""
+    __tablename__ = "corridas"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    etiqueta: Mapped[str] = mapped_column(String(120))
+    desde: Mapped[datetime] = mapped_column(DateTime)
+    hasta: Mapped[datetime] = mapped_column(DateTime)
+    politica_patio: Mapped[str] = mapped_column(String(24), default="secuencial")
+    metricas_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Configuracion(Base):
+    """Ajustes del sistema que cambia la terminal (ej. la politica de patio)."""
+    __tablename__ = "configuracion"
+    clave: Mapped[str] = mapped_column(String(40), primary_key=True)
+    valor: Mapped[str] = mapped_column(String(200))
+
+
 class Notificacion(Base):
     """Bandeja de salida hacia el bot (Persona D, Fase_2_PORTUS.md sec. 6.3).
 
@@ -294,8 +384,10 @@ def make_db(db_path: str):
 # create_all no agrega columnas a tablas que ya existen: una base creada antes
 # de la fase 1 o 2 (por ejemplo la de la Raspberry) necesita este ALTER TABLE.
 _COLUMNAS_NUEVAS = {
-    "manifiestos": {"vehiculo_uid": "VARCHAR(32)"},
     "alarmas": {"referencia": "VARCHAR(60)"},
+    "citas": {"motivo": "TEXT"},
+    "manifiestos": {"vehiculo_uid": "VARCHAR(32)", "motivo_levante": "TEXT"},
+    "turnos": {"trabajo_grua_at": "DATETIME"},
     "patio": {"nivel1_desde": "DATETIME", "nivel2_desde": "DATETIME"},
 }
 

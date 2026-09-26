@@ -17,11 +17,12 @@ from catalogos import (
     ANULADO, CATALOGO_ALARMAS, CERRADO, EN_GARITA,
     EN_PESAJE_ENTRADA, EN_PESAJE_SALIDA, EN_RUTA, EN_SALIDA, EN_TRANSFERENCIA,
     ESTADOS_FINALES, MINUTOS_AL12_RETENCION, MINUTOS_AL13_PATIO, MINUTOS_EXPIRA_CODIGO, ROL_FACULTADO_POR_CAUSA, RESOLUCIONES, RETENIDO,
+    CITAS_POR_FRANJA, HORARIO_AGENDA, MINUTOS_FRANJA,
     RT01, RT02, RT03, RT04, SEVERIDADES_AUTO_RECONOCIBLES, TOLERANCIA_VENTANA_MIN,
     TRANSICIONES, ZONA_HORARIA,
 )
 from models import (
-    Alarma, Cita, CommandAudit, IntentoIngreso, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
+    Alarma, Cita, CommandAudit, FranjaBloqueada, IntentoIngreso, ManifiestoEvento, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
     Retencion, Transportista, Turno, EventoTurno, Vehiculo,
 )
 
@@ -48,6 +49,17 @@ def registrar_evento(db, turno_id: int, origen: str, descripcion: str, valores: 
     ))
 
 
+def registrar_evento_manifiesto(db, manifiesto_id: Optional[int], origen: str, descripcion: str,
+                                valores: Optional[dict] = None, tipo: str = "historial") -> None:
+    """Historial del manifiesto (sec. 5.1 Ver detalle). tipo=observacion son
+    las notas que el agente adjunta para la autoridad (sec. 5.3)."""
+    import json
+    if manifiesto_id is None:
+        return
+    db.add(ManifiestoEvento(manifiesto_id=manifiesto_id, origen=origen, tipo=tipo, descripcion=descripcion,
+                            valores_json=json.dumps(valores or {}, ensure_ascii=False)))
+
+
 def transicionar_turno(db, turno: Turno, nuevo_estado: str, origen: str = "servidor",
                         descripcion: str = "", valores: Optional[dict] = None) -> None:
     permitidas = TRANSICIONES.get(turno.estado, ())
@@ -61,33 +73,37 @@ def transicionar_turno(db, turno: Turno, nuevo_estado: str, origen: str = "servi
         turno.closed_at = datetime.utcnow()
     if nuevo_estado == CERRADO:
         liberar_plazas_de_turno(db, turno.id)
+    if nuevo_estado in ESTADOS_FINALES:
+        registrar_evento_manifiesto(db, turno.manifiesto_id, origen, f"Turno {turno.id} {nuevo_estado.lower()}",
+                                    {"turno": turno.id})
     registrar_evento(db, turno.id, origen, descripcion or f"Turno pasa a {nuevo_estado}", valores)
+
+
+def zona_local():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(ZONA_HORARIA)
+    except Exception:
+        return timezone(timedelta(hours=-6))
 
 
 def hora_local(dt_utc: Optional[datetime], formato: str = "%d/%m/%Y %H:%M") -> str:
     """La BD guarda UTC (datetime.utcnow); a las personas se les muestra la hora de Guatemala."""
     if dt_utc is None:
         return "-"
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(ZONA_HORARIA)
-    except Exception:
-        tz = timezone(timedelta(hours=-6))
-    return dt_utc.replace(tzinfo=timezone.utc).astimezone(tz).strftime(formato)
+    return dt_utc.replace(tzinfo=timezone.utc).astimezone(zona_local()).strftime(formato)
+
+
+def local_a_utc(local: datetime) -> datetime:
+    """datetime ingenuo en hora local -> datetime ingenuo en UTC (como guarda la BD)."""
+    return local.replace(tzinfo=zona_local()).astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def rango_utc(desde: Optional[str], hasta: Optional[str]) -> tuple:
     """Fechas YYYY-MM-DD en hora local -> [inicio, fin) en UTC para filtrar
     created_at. hasta es inclusivo (se toma el dia completo)."""
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(ZONA_HORARIA)
-    except Exception:
-        tz = timezone(timedelta(hours=-6))
-
     def a_utc(fecha: str) -> datetime:
-        local = datetime.strptime(fecha, "%Y-%m-%d").replace(tzinfo=tz)
-        return local.astimezone(timezone.utc).replace(tzinfo=None)
+        return local_a_utc(datetime.strptime(fecha, "%Y-%m-%d"))
 
     inicio = a_utc(desde) if desde else None
     fin = a_utc(hasta) + timedelta(days=1) if hasta else None
@@ -209,7 +225,6 @@ def confirmar_remocion_patio(db, posicion_id: int) -> Optional[str]:
         cid = p.contenedor_nivel2
         p.contenedor_nivel2 = None
         p.nivel2_desde = None
-        p.remociones += 1
         p.estado = "OCUPADA_1"
     elif p.contenedor_nivel1 is not None:
         cid = p.contenedor_nivel1
@@ -410,6 +425,9 @@ def registrar_respuesta_comando(db, origen: str, tipo: str, datos: dict, payload
         if nombre == "AgujaLiberar":
             _liberar_plaza_por_ack(db, pendiente)
         return None
+    if nombre == "TrabajoGrua":
+        import grua
+        grua.trabajo_rechazado(db)
     db.flush()
     causa = datos.get("causa") or "sin causa"
     return generar_alarma(db, "AL14", origen=origen, referencia=f"comando:{pendiente.id}",
@@ -539,6 +557,12 @@ def resolver_retencion(db, retencion_id: int, resolucion: str, rol_usuario: str,
             if manifiesto is not None:
                 manifiesto.peso_declarado_anterior_g = manifiesto.peso_declarado_g
                 manifiesto.peso_declarado_g = retencion.peso_medido_g
+                # E08: el valor anterior queda en el historial del manifiesto
+                registrar_evento_manifiesto(
+                    db, manifiesto.id, "terminal",
+                    f"Peso declarado corregido de {manifiesto.peso_declarado_anterior_g} g a {manifiesto.peso_declarado_g} g "
+                    f"({retencion.causa}, turno {turno.id})",
+                    {"anterior_g": manifiesto.peso_declarado_anterior_g, "nuevo_g": manifiesto.peso_declarado_g})
             turno.peso_declarado_g = retencion.peso_medido_g
         turno.estado = retencion.estado_anterior  # continua el flujo, no pasa por transicionar_turno
         turno.estacion_actual = retencion.estacion or turno.estacion_actual
@@ -547,6 +571,8 @@ def resolver_retencion(db, retencion_id: int, resolucion: str, rol_usuario: str,
         registrar_evento(db, turno.id, "usuario",
                           f"Retencion {retencion.causa} resuelta con {resolucion}",
                           {"observacion": observacion})
+        if turno.estado == EN_RUTA:
+            _despachar_grua(db, publish_cmd)
 
     retencion.estado = "resuelta"
     retencion.resolucion = resolucion
@@ -660,6 +686,8 @@ def procesar_ingreso_garita(db, contenedor_id: str, vehiculo_uid: str,
     db.flush()
     registrar_evento(db, turno.id, "servidor", "Ingreso autorizado por servidor",
                       {"contenedor_id": contenedor_id, "canal": manifiesto.canal})
+    registrar_evento_manifiesto(db, manifiesto.id, "servidor", f"Turno {turno.id} creado: ingreso por la garita",
+                                {"turno": turno.id, "vehiculo": vehiculo_uid})
     # uid y op le dicen a la garita que esta es la respuesta a SU tarjeta
     # pendiente (sin uid, el firmware lo trata como apertura manual). Nada mas:
     # el UNO recibe con un bufer de 64 bytes y un frame largo se puede cortar.
@@ -706,6 +734,14 @@ def procesar_pesaje_entrada(db, turno: Turno, peso_medido_g: int,
 
     transicionar_turno(db, turno, EN_RUTA, origen="controlador", descripcion="Pesaje de entrada dentro de tolerancia")
     turno.estacion_actual = "ruta_transferencia"
+    _despachar_grua(db, publish_cmd)
+
+
+def _despachar_grua(db, publish_cmd: PublishFn) -> None:
+    """Un turno quedo esperando la grua: si esta libre, recibe su trabajo (fase 5)."""
+    import grua  # grua importa servicios
+    db.flush()
+    grua.despachar_trabajo(db, publish_cmd)
 
 
 def procesar_pesaje_salida(db, turno: Turno, peso_medido_g: int,
@@ -754,6 +790,213 @@ def anular_turno(db, turno: Turno, causa: Optional[str] = None,
                         valores={"causa": causa})
     publish_cmd("AbrirPuertaSalida", "UNO_SALIDA", {"turno": turno.id})
     notificar_transportista(db, turno, "turno_anulado", {"causa": causa})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Citas y franjas (sec. 9 y 4.7). Las usan el bot (pedir cita) y la terminal
+#  (agenda, cancelar, reprogramar, bloquear franja).
+# ══════════════════════════════════════════════════════════════════════════
+
+ESTADOS_QUE_OCUPAN_FRANJA = ("programada", "cumplida")
+
+
+def inicio_de_franja(dt: datetime) -> datetime:
+    dt = dt.replace(second=0, microsecond=0)
+    return dt.replace(minute=(dt.minute // MINUTOS_FRANJA) * MINUTOS_FRANJA)
+
+
+def texto_franja(inicio: datetime, fin: datetime) -> str:
+    return f"{hora_local(inicio, '%d/%m/%Y')} de {hora_local(inicio, '%H:%M')} a {hora_local(fin, '%H:%M')}"
+
+
+def estado_cita(cita: Cita, ahora: Optional[datetime] = None) -> str:
+    """No se escribe "vencida" en la BD por tiempo: si el camion llega tarde,
+    la garita necesita encontrar la cita "programada" para generar RT04."""
+    ahora = ahora or datetime.utcnow()
+    if cita.estado == "programada" and ahora > cita.fin + timedelta(minutes=TOLERANCIA_VENTANA_MIN):
+        return "vencida"
+    return cita.estado
+
+
+def citas_en_franja(db, inicio: datetime, excluir_cita_id: Optional[int] = None) -> int:
+    q = select(Cita.id).where(Cita.inicio == inicio, Cita.estado.in_(ESTADOS_QUE_OCUPAN_FRANJA))
+    if excluir_cita_id is not None:
+        q = q.where(Cita.id != excluir_cita_id)
+    return len(db.scalars(q).all())
+
+
+def franja_disponible(db, inicio: datetime, ahora: Optional[datetime] = None,
+                      excluir_cita_id: Optional[int] = None) -> bool:
+    """Futura, no bloqueada y con capacidad (sec. 9.2 y 9.5)."""
+    ahora = ahora or datetime.utcnow()
+    if inicio != inicio_de_franja(inicio) or inicio < ahora:
+        return False
+    if db.get(FranjaBloqueada, inicio) is not None:
+        return False
+    return citas_en_franja(db, inicio, excluir_cita_id) < CITAS_POR_FRANJA
+
+
+def proximas_franjas(db, desde: datetime, cantidad: int = 4, dias: int = 7,
+                     excluir_cita_id: Optional[int] = None) -> list:
+    """Las proximas franjas que se pueden ofrecer: las llenas o bloqueadas se saltan."""
+    actual = inicio_de_franja(desde)
+    if actual < desde:
+        actual += timedelta(minutes=MINUTOS_FRANJA)
+    limite = desde + timedelta(days=dias)
+    franjas = []
+    while actual < limite and len(franjas) < cantidad:
+        if franja_disponible(db, actual, desde, excluir_cita_id):
+            franjas.append((actual, actual + timedelta(minutes=MINUTOS_FRANJA)))
+        actual += timedelta(minutes=MINUTOS_FRANJA)
+    return franjas
+
+
+def asignar_cita(db, transportista_id: int, manifiesto: Manifiesto, inicio: datetime,
+                 ahora: Optional[datetime] = None) -> Cita:
+    """Crea la cita revalidando las reglas 3, 4 y 5 de la sec. 9 en el momento
+    de confirmar (otra persona pudo llenar la franja mientras tanto)."""
+    if manifiesto.estado_documental != "levante_otorgado" or manifiesto.anulado:
+        raise ReglaDeNegocioError("sin_levante")
+    vigente = db.scalars(select(Cita.id).where(Cita.contenedor_id == manifiesto.contenedor_id,
+                                               Cita.estado == "programada")).first()
+    if vigente is not None:
+        raise ReglaDeNegocioError("contenedor_con_cita_vigente")
+    if not franja_disponible(db, inicio, ahora):
+        raise ReglaDeNegocioError("franja_no_disponible")
+    cita = Cita(contenedor_id=manifiesto.contenedor_id, transportista_id=transportista_id, inicio=inicio,
+                fin=inicio + timedelta(minutes=MINUTOS_FRANJA), estado="programada")
+    db.add(cita)
+    db.flush()
+    return cita
+
+
+def _cita_programada(db, cita_id: int) -> Cita:
+    cita = db.get(Cita, cita_id)
+    if cita is None:
+        raise ReglaDeNegocioError("cita_no_existe")
+    if cita.estado != "programada":
+        raise ReglaDeNegocioError(f"cita_{cita.estado}")
+    return cita
+
+
+def cancelar_cita(db, cita_id: int, motivo: Optional[str] = None) -> Cita:
+    """Boton Cancelar cita (sec. 4.7) con su aviso al transportista (sec. 6.3)."""
+    cita = _cita_programada(db, cita_id)
+    cita.estado = "cancelada"
+    cita.motivo = motivo
+    texto = (f"PORTUS: tu cita fue CANCELADA por la terminal.\nContenedor: {cita.contenedor_id}\n"
+             f"Ventana cancelada: {texto_franja(cita.inicio, cita.fin)}")
+    if motivo:
+        texto += f"\nMotivo: {motivo}"
+    texto += "\nPuedes pedir una nueva con /cita."
+    encolar_notificacion(db, cita.transportista_id, "cita_cancelada", texto, referencia=f"cita:{cita.id}")
+    return cita
+
+
+def reprogramar_cita(db, cita_id: int, nuevo_inicio: datetime, motivo: Optional[str] = None,
+                     ahora: Optional[datetime] = None) -> Cita:
+    """Boton Reprogramar cita: solo a otra franja futura con capacidad y sin bloqueo."""
+    cita = _cita_programada(db, cita_id)
+    if nuevo_inicio == cita.inicio:
+        raise ReglaDeNegocioError("misma_franja")
+    if not franja_disponible(db, nuevo_inicio, ahora, excluir_cita_id=cita.id):
+        raise ReglaDeNegocioError("franja_no_disponible")
+    anterior = texto_franja(cita.inicio, cita.fin)
+    cita.inicio = nuevo_inicio
+    cita.fin = nuevo_inicio + timedelta(minutes=MINUTOS_FRANJA)
+    cita.motivo = motivo
+    texto = (f"PORTUS: tu cita fue REPROGRAMADA por la terminal.\nContenedor: {cita.contenedor_id}\n"
+             f"Ventana anterior: {anterior}\nVentana nueva: {texto_franja(cita.inicio, cita.fin)}")
+    if motivo:
+        texto += f"\nMotivo: {motivo}"
+    encolar_notificacion(db, cita.transportista_id, "cita_reprogramada", texto, referencia=f"cita:{cita.id}")
+    return cita
+
+
+def bloquear_franja(db, inicio: datetime, motivo: Optional[str] = None,
+                    ahora: Optional[datetime] = None) -> FranjaBloqueada:
+    if inicio != inicio_de_franja(inicio):
+        raise ReglaDeNegocioError("franja_no_alineada")
+    if inicio < (ahora or datetime.utcnow()):
+        raise ReglaDeNegocioError("franja_ya_comenzo")
+    if db.get(FranjaBloqueada, inicio) is not None:
+        raise ReglaDeNegocioError("franja_ya_bloqueada")
+    bloqueo = FranjaBloqueada(inicio=inicio, motivo=motivo)
+    db.add(bloqueo)
+    return bloqueo
+
+
+def desbloquear_franja(db, inicio: datetime) -> None:
+    bloqueo = db.get(FranjaBloqueada, inicio)
+    if bloqueo is None:
+        raise ReglaDeNegocioError("franja_no_bloqueada")
+    db.delete(bloqueo)
+
+
+def _vehiculos_de_cita(db, cita: Cita) -> list:
+    """La cita es por contenedor; el vehiculo sale del manifiesto o, si no lo
+    fija, de las tarjetas del transportista."""
+    m = db.scalars(select(Manifiesto).where(Manifiesto.contenedor_id == cita.contenedor_id)
+                   .order_by(Manifiesto.id.desc())).first()
+    if m is not None and m.vehiculo_uid:
+        return [m.vehiculo_uid]
+    if cita.transportista_id is None:
+        return []
+    return [v.uid for v in db.scalars(select(Vehiculo).where(Vehiculo.transportista_id == cita.transportista_id,
+                                                             Vehiculo.activo.is_(True))).all()]
+
+
+def agenda_del_dia(db, fecha: str, ahora: Optional[datetime] = None) -> dict:
+    """Pestania Citas (sec. 4.7): franjas del dia (hora local) con capacidad,
+    citas asignadas y bloqueo, y el % de citas cumplidas dentro de su ventana."""
+    ahora = ahora or datetime.utcnow()
+    dia_local = datetime.strptime(fecha, "%Y-%m-%d")
+    abre, cierra = (datetime.strptime(h, "%H:%M").time() for h in HORARIO_AGENDA.split("-"))
+    inicio_dia = local_a_utc(dia_local)
+    fin_dia = local_a_utc(dia_local + timedelta(days=1))
+
+    citas = db.scalars(select(Cita).where(Cita.inicio >= inicio_dia, Cita.inicio < fin_dia)
+                       .order_by(Cita.inicio, Cita.id)).all()
+    bloqueos = {b.inicio: b for b in db.scalars(select(FranjaBloqueada).where(
+        FranjaBloqueada.inicio >= inicio_dia, FranjaBloqueada.inicio < fin_dia)).all()}
+    nombres = {t.id: t.nombre for t in db.scalars(select(Transportista)).all()}
+
+    inicios = set(bloqueos) | {c.inicio for c in citas}
+    actual = local_a_utc(datetime.combine(dia_local, abre))
+    cierre = local_a_utc(datetime.combine(dia_local, cierra))
+    while actual < cierre:
+        inicios.add(actual)
+        actual += timedelta(minutes=MINUTOS_FRANJA)
+
+    franjas = []
+    for inicio in sorted(inicios):
+        de_franja = [c for c in citas if c.inicio == inicio]
+        bloqueo = bloqueos.get(inicio)
+        franjas.append({
+            "inicio": inicio.isoformat(), "fin": (inicio + timedelta(minutes=MINUTOS_FRANJA)).isoformat(),
+            "horaInicio": hora_local(inicio, "%H:%M"),
+            "horaFin": hora_local(inicio + timedelta(minutes=MINUTOS_FRANJA), "%H:%M"),
+            "capacidad": CITAS_POR_FRANJA,
+            "asignadas": len([c for c in de_franja if c.estado != "cancelada"]),
+            "ocupan": len([c for c in de_franja if c.estado in ESTADOS_QUE_OCUPAN_FRANJA]),
+            "bloqueada": bloqueo is not None, "motivoBloqueo": bloqueo.motivo if bloqueo else None,
+            "pasada": inicio + timedelta(minutes=MINUTOS_FRANJA) <= ahora,
+            "enCurso": inicio <= ahora < inicio + timedelta(minutes=MINUTOS_FRANJA),
+            "citas": [{
+                "id": c.id, "contenedorId": c.contenedor_id, "transportistaId": c.transportista_id,
+                "transportistaNombre": nombres.get(c.transportista_id), "vehiculos": _vehiculos_de_cita(db, c),
+                "estado": estado_cita(c, ahora), "motivo": c.motivo,
+            } for c in de_franja],
+        })
+
+    evaluadas = [estado_cita(c, ahora) for c in citas if estado_cita(c, ahora) in ("cumplida", "vencida")]
+    cumplidas = evaluadas.count("cumplida")
+    return {
+        "fecha": fecha, "franjas": franjas,
+        "totalCitas": len([c for c in citas if c.estado != "cancelada"]),
+        "cumplidas": cumplidas, "evaluadas": len(evaluadas),
+        "cumplimientoPct": round(cumplidas / len(evaluadas) * 100, 1) if evaluadas else None,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════

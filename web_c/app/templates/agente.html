@@ -1,60 +1,58 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Interfaz AGENTE</h1>
-<div id="agente-root">
+<div id="agente-root" class="rol-root">
   <section class="panel">
-    <h2>Presentar declaracion</h2>
-    <form id="agente-form-declaracion" class="grid-form">
-      <label>Manifiesto
-        <select id="agente-manifiesto" required></select>
-      </label>
-      <label>Numero de declaracion
-        <input id="agente-numero" required placeholder="DECL-2026-001" />
-      </label>
-      <label>Regimen
-        <select id="agente-regimen" required>
-          <option value="importacion_definitiva">importacion_definitiva</option>
-          <option value="deposito_temporal">deposito_temporal</option>
-        </select>
-      </label>
-      <label>Valor declarado
-        <input id="agente-valor" type="number" min="0" step="0.01" required value="1000.00" />
-      </label>
-      <label class="full-width">Descripcion
-        <input id="agente-descripcion" required placeholder="Descripcion de mercancia" />
-      </label>
-      <div class="form-actions">
-        <button type="submit">Presentar declaracion</button>
-        <button type="button" id="agente-refresh">Actualizar datos</button>
-      </div>
-    </form>
-    <pre id="agente-result" class="command-result"></pre>
-  </section>
-
-  <section class="panel">
-    <h2>Solicitar levante</h2>
-    <p class="muted">Solo aparecen manifiestos activos que aun no completan levante.</p>
-    <div class="table-wrap">
-      <table id="agente-table-pendientes" class="data-table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Contenedor</th>
-            <th>Operacion</th>
-            <th>Estado documental</th>
-            <th>Canal</th>
-            <th>Accion</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+    <div class="tabs">
+      <button type="button" class="tab tab-btn active" data-tab="declaraciones">Declaraciones</button>
+      <button type="button" class="tab tab-btn" data-tab="seguimiento">Seguimiento</button>
     </div>
   </section>
 
-  <section class="panel">
-    <h2>Seguimiento</h2>
-    <pre id="agente-seguimiento" class="command-result">Sin datos cargados.</pre>
+  <section class="panel tab-panel" data-tab-panel="declaraciones">
+    <div class="sin-header">
+      <h2>Manifiestos sin levante</h2>
+      <button type="button" id="agente-refresh">Actualizar</button>
+    </div>
+    <p id="agente-result" class="resultado"></p>
+    <div class="table-wrap"><table id="agente-table-pendientes" class="data-table"></table></div>
+  </section>
+
+  <section class="panel tab-panel hidden" data-tab-panel="seguimiento">
+    <h2>Seguimiento de mis solicitudes</h2>
+    <form id="agente-filtros" class="filtros">
+      <label>Numero de declaracion <input name="q" placeholder="DECL-..." /></label>
+      <label>Estado
+        <select name="estado">
+          <option value="">Todas</option>
+          <option value="pendiente">Pendientes</option>
+          <option value="autorizada">Autorizadas</option>
+          <option value="retenida">Retenidas</option>
+        </select>
+      </label>
+      <button type="submit">Buscar</button>
+    </form>
+    <div class="table-wrap"><table id="agente-table-seguimiento" class="data-table"></table></div>
   </section>
 </div>
-<script src="/static/roles.js"></script>
+
+<dialog id="dlg-declaracion" class="dialogo">
+  <form method="dialog"><button class="cerrar" aria-label="Cerrar">&times;</button></form>
+  <h2 id="dlg-declaracion-titulo">Presentar declaracion</h2>
+  <form id="agente-form-declaracion" class="grid-form">
+    <label>Numero de declaracion <input name="numero_declaracion" required placeholder="DECL-2026-001" /></label>
+    <label>Regimen
+      <select name="regimen" required>
+        <option value="importacion_definitiva">Importacion definitiva</option>
+        <option value="deposito_temporal">Deposito temporal</option>
+      </select>
+    </label>
+    <label>Valor declarado <input name="valor_declarado" type="number" min="0.01" step="0.01" required /></label>
+    <label class="full-width">Descripcion de la mercancia (minimo 10 caracteres)
+      <input name="descripcion" required minlength="10" />
+    </label>
+    <div class="form-actions"><button type="submit">Presentar declaracion</button></div>
+  </form>
+</dialog>
+<script src="/static/roles.js?v={{ v }}"></script>
 {% endblock %}

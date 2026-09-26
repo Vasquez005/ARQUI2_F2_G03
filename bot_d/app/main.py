@@ -19,16 +19,15 @@ from typing import Optional
 BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "backend"))
 sys.path.insert(0, BACKEND_DIR)
 
-from sqlalchemy import func, select  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 import servicios  # noqa: E402
-from catalogos import (  # noqa: E402
-    CITAS_POR_FRANJA, ESTADOS_FINALES, MINUTOS_FRANJA, TOLERANCIA_VENTANA_MIN,
-)
+from catalogos import ESTADOS_FINALES, TOLERANCIA_VENTANA_MIN  # noqa: E402
 from models import (  # noqa: E402
     Cita, Manifiesto, Notificacion, PosicionPatio, Transportista, Turno, make_db,
 )
+from servicios import estado_cita, proximas_franjas, texto_franja  # noqa: E402
 
 try:
     from telegram import Update
@@ -43,6 +42,26 @@ except Exception:
 
 DB_PATH = os.getenv("PORTUS_DB_PATH", os.path.join(BACKEND_DIR, "portus_core.db"))
 SessionLocal = make_db(DB_PATH)
+
+
+def conectar_anuncios() -> None:
+    """Las citas que se piden por el bot se anuncian por MQTT (portus/srv/cambio)
+    igual que lo que cambia el backend: asi la agenda de la terminal se
+    actualiza en vivo. Sin paho o sin broker, el bot funciona igual."""
+    try:
+        import paho.mqtt.client as mqtt
+        import orquestador
+    except Exception as exc:
+        print(f"[MQTT] sin anuncios en vivo: {exc}")
+        return
+    cliente = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    try:
+        cliente.connect(os.getenv("PORTUS_MQTT_HOST", "localhost"), int(os.getenv("PORTUS_MQTT_PORT", "1883")))
+    except Exception as exc:
+        print(f"[MQTT] sin anuncios en vivo: {exc}")
+        return
+    cliente.loop_start()
+    orquestador.anunciar_cambios(SessionLocal, lambda t, p: cliente.publish(t, p))
 
 NOMBRE_TERMINAL = "Terminal Portuaria PORTUS"
 FRANJAS_A_OFRECER = 4
@@ -115,46 +134,14 @@ def contenedores_elegibles(db: Session, trans: Transportista) -> list:
     return elegibles
 
 
-def citas_en_franja(db: Session, inicio: datetime) -> int:
-    return db.scalar(
-        select(func.count(Cita.id)).where(Cita.inicio == inicio, Cita.estado.in_(["programada", "cumplida"]))
-    ) or 0
-
-
-def proximas_franjas(db: Session, desde: datetime, cantidad: int = FRANJAS_A_OFRECER) -> list:
-    """Franjas de 15 min con capacidad (sec. 9.1, 9.2, 9.5). Las llenas no se ofrecen."""
-    actual = desde.replace(second=0, microsecond=0)
-    actual = actual.replace(minute=(actual.minute // MINUTOS_FRANJA) * MINUTOS_FRANJA)
-    if actual < desde:
-        actual += timedelta(minutes=MINUTOS_FRANJA)
-    limite = desde + timedelta(days=DIAS_BUSQUEDA_FRANJAS)
-    franjas = []
-    while actual < limite and len(franjas) < cantidad:
-        if citas_en_franja(db, actual) < CITAS_POR_FRANJA:
-            franjas.append((actual, actual + timedelta(minutes=MINUTOS_FRANJA)))
-        actual += timedelta(minutes=MINUTOS_FRANJA)
-    return franjas
-
-
-def texto_franja(inicio: datetime, fin: datetime) -> str:
-    return f"{servicios.hora_local(inicio, '%d/%m/%Y')} de {servicios.hora_local(inicio, '%H:%M')} a {servicios.hora_local(fin, '%H:%M')}"
-
-
-def estado_cita_texto(cita: Cita, ahora: datetime) -> str:
-    # No se escribe "vencida" en la BD: si el camion llega tarde, la garita
-    # necesita encontrar la cita "programada" para generar RT04.
-    if cita.estado == "programada" and ahora > cita.fin + timedelta(minutes=TOLERANCIA_VENTANA_MIN):
-        return "vencida"
-    return cita.estado
-
-
-def ubicacion_en_patio(db: Session, contenedor_id: str) -> Optional[str]:
+def ubicacion_en_patio(db: Session, contenedor_id: str) -> tuple:
+    """(texto de ubicacion, desde cuando esta ahi) o (None, None)."""
     for p in db.scalars(select(PosicionPatio).order_by(PosicionPatio.id)).all():
         if p.contenedor_nivel1 == contenedor_id:
-            return f"Patio posicion {p.id}, nivel 1"
+            return f"Patio posicion {p.id}, nivel 1", p.nivel1_desde
         if p.contenedor_nivel2 == contenedor_id:
-            return f"Patio posicion {p.id}, nivel 2"
-    return None
+            return f"Patio posicion {p.id}, nivel 2", p.nivel2_desde
+    return None, None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -210,7 +197,7 @@ def cmd_cita(db: Session, trans: Transportista, args: list) -> str:
             return f"El contenedor {contenedor} ya tiene una cita vigente. Revisa /miscitas."
         return f"El contenedor {contenedor} ya tiene un turno en la terminal."
 
-    franjas = proximas_franjas(db, datetime.utcnow())
+    franjas = proximas_franjas(db, datetime.utcnow(), FRANJAS_A_OFRECER, DIAS_BUSQUEDA_FRANJAS)
     if not franjas:
         return "No hay franjas con capacidad en los proximos dias."
 
@@ -227,8 +214,12 @@ def cmd_cita(db: Session, trans: Transportista, args: list) -> str:
     except (ValueError, IndexError):
         return f"Opcion invalida. Escribe /cita {contenedor} para ver las franjas disponibles."
 
-    cita = Cita(contenedor_id=contenedor, transportista_id=trans.id, inicio=inicio, fin=fin, estado="programada")
-    db.add(cita)
+    try:
+        servicios.asignar_cita(db, trans.id, m, inicio)
+    except servicios.ReglaDeNegocioError:
+        # Alguien tomo la ultima plaza de la franja (o la terminal la bloqueo) entre la oferta y la eleccion
+        db.rollback()
+        return f"Esa franja ya no esta disponible. Escribe /cita {contenedor} para ver los horarios actualizados."
     db.commit()
     return (f"Cita confirmada.\nContenedor: {contenedor}\n"
             f"Fecha: {servicios.hora_local(inicio, '%d/%m/%Y')}\n"
@@ -244,7 +235,7 @@ def cmd_miscitas(db: Session, trans: Transportista) -> str:
     if not rows:
         return "No tienes citas registradas."
     ahora = datetime.utcnow()
-    lineas = [f"- {c.contenedor_id} | {texto_franja(c.inicio, c.fin)} | {estado_cita_texto(c, ahora)}" for c in rows]
+    lineas = [f"- {c.contenedor_id} | {texto_franja(c.inicio, c.fin)} | {estado_cita(c, ahora)}" for c in rows]
     return "Tus citas:\n" + "\n".join(lineas)
 
 
@@ -257,7 +248,7 @@ def cmd_estado(db: Session, trans: Transportista, contenedor: Optional[str]) -> 
         return MSG_SIN_CARGA
 
     turno = db.scalars(select(Turno).where(Turno.manifiesto_id == m.id).order_by(Turno.id.desc())).first()
-    ubicacion = ubicacion_en_patio(db, contenedor)
+    ubicacion, en_patio_desde = ubicacion_en_patio(db, contenedor)
     if turno is not None and turno.estado not in ESTADOS_FINALES:
         estado = f"Turno {turno.estado} (estacion: {turno.estacion_actual or '-'})"
     elif m.anulado:
@@ -267,14 +258,8 @@ def cmd_estado(db: Session, trans: Transportista, contenedor: Optional[str]) -> 
     else:
         estado = ESTADO_DOCUMENTAL_TEXTO.get(m.estado_documental, m.estado_documental)
 
-    permanencia = "-"
-    if ubicacion:
-        deposito = db.scalars(
-            select(Turno).where(Turno.contenedor_id == contenedor, Turno.tipo_operacion == "DEPOSITO",
-                                Turno.closed_at.is_not(None)).order_by(Turno.id.desc())
-        ).first()
-        if deposito is not None:
-            permanencia = servicios.duracion_texto(deposito.closed_at)
+    # Reloj de permanencia desde que el contenedor quedo en el patio (fase 2)
+    permanencia = servicios.duracion_texto(en_patio_desde) if en_patio_desde else "-"
 
     return (f"Contenedor: {contenedor}\n"
             f"Estado: {estado}\n"
@@ -342,7 +327,8 @@ def encolar_recordatorios(db: Session) -> int:
     for c in citas:
         if c.created_at and c.created_at > c.inicio - timedelta(hours=1):
             continue
-        ref = f"recordatorio:cita:{c.id}"
+        # La ventana va en la referencia: si la terminal reprograma la cita, la nueva ventana tiene su recordatorio
+        ref = f"recordatorio:cita:{c.id}:{c.inicio:%Y%m%d%H%M}"
         if db.scalar(select(Notificacion.id).where(Notificacion.referencia == ref)):
             continue
         servicios.encolar_notificacion(
@@ -455,6 +441,7 @@ def cli_mode() -> None:
 
 
 def main() -> None:
+    conectar_anuncios()
     token = os.getenv("PORTUS_BOT_TOKEN")
     if token and Application is not None:
         asyncio.run(telegram_mode(token))

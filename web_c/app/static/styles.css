@@ -11,7 +11,7 @@ body { margin: 0; font-family: Arial, sans-serif; background: #f5f6f8; color: #1
 .tab { border: 1px solid #d0d7de; background: #f6f8fa; border-radius: 999px; padding: 6px 12px; font-size: 14px; }
 .tab-btn { cursor: pointer; }
 .tab-btn.active { background: #0b1f3a; color: #fff; border-color: #0b1f3a; }
-.hidden { display: none; }
+.hidden { display: none !important; } /* gana a .grid-form, .filtros, etc. */
 .status-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .muted { color: #57606a; font-size: 13px; }
 .event-log { height: 300px; overflow: auto; border: 1px solid #d8dee4; border-radius: 6px; padding: 8px; background: #0d1117; color: #c9d1d9; font-family: monospace; font-size: 12px; }
@@ -109,3 +109,24 @@ tr.sev-baja td:first-child { border-left: 4px solid #8c959f; }
 .toast-warn { background: #9a6700; }
 .toast-bad { background: #cf222e; }
 h3 { margin: 14px 0 6px; font-size: 16px; }
+.cita-linea { padding: 3px 0; border-bottom: 1px dashed #eaeef2; }
+.cita-linea:last-child { border-bottom: 0; }
+.cita-linea button { font-size: 12px; padding: 2px 8px; margin-left: 4px; }
+.fila-pasada td { color: #8c959f; }
+.grafica svg { width: 100%; height: auto; background: #fbfcfd; border: 1px solid #eaeef2; border-radius: 6px; }
+.grafica .eje { font-size: 11px; fill: #57606a; }
+.grafica .guia { stroke: #eaeef2; }
+.grafica .promedio { stroke: #cf222e; stroke-dasharray: 5 4; }
+.barra-deposito { fill: #0969da; }
+.barra-retiro { fill: #8250df; }
+.barra-abortada { fill: #cf222e; }
+.leyenda { font-size: 12px; color: #57606a; }
+.cuadro { display: inline-block; width: 10px; height: 10px; margin: 0 4px 0 10px; }
+.tabla-alta { max-height: 320px; overflow: auto; }
+.metricas { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; }
+.metrica { border: 1px solid #d0d7de; border-radius: 8px; padding: 10px; background: #fbfcfd; }
+.metrica-valor { font-size: 24px; font-weight: 700; margin: 4px 0; }
+a.boton { display: inline-block; border: 1px solid #d0d7de; background: #f6f8fa; border-radius: 6px; padding: 4px 10px;
+  font-size: 13px; color: inherit; text-decoration: none; margin-left: 6px; }
+.resultado.ok { color: #1a7f37; }
+.resultado.error { color: #cf222e; font-weight: 700; }

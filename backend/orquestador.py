@@ -11,11 +11,15 @@ fisico automatico (fase 1 del plan de trabajo):
     salida   evento=salida_autorizada;decision=local -> reconcilia una salida sin servidor
     salida   evento=salida_completada -> cierra el turno
     alarma   (cualquier placa)     -> se guarda en alarmas (fase 2)
+    grua     evt=trabajo_inicio / trabajo_fin / sin_posicion -> ciclo de grua y turno (fase 5)
+    patio    evento=deposito / retiro -> inventario, solo con confirmacion fisica (R09)
+    transferencia evento=alineado / aborto -> linea de tiempo del turno y ciclo abortado
 
 Fase 2: las alarmas nuevas se anuncian por MQTT (portus/srv/alarma) despues
 del commit, para que la web las muestre en vivo sin consultar.
 Fase 3: los cambios de turnos, retenciones, parqueo, patio e intentos se
 anuncian en portus/srv/cambio ({entidad, id}); la web recarga solo eso.
+Fase 4: tambien las citas y las franjas bloqueadas (el bot usa el mismo anuncio).
 
 Los comandos se publican DESPUES del commit: si la transaccion se deshace
 (rechazo), nunca sale un AbrirTalanquera que la base no respalda.
@@ -26,16 +30,21 @@ from typing import Callable, Optional
 
 from sqlalchemy import event, select
 
+import grua
 import servicios
 from catalogos import ANULADO, EN_GARITA, EN_PESAJE_ENTRADA, EN_SALIDA, RETENIDO
-from models import Alarma, CommandAudit, IntentoIngreso, ParqueoPlaza, PosicionPatio, Retencion, Turno
+from models import (
+    Alarma, Cita, CommandAudit, FranjaBloqueada, GruaCiclo, IntentoIngreso, ParqueoPlaza, PosicionPatio,
+    Retencion, Turno,
+)
 
 TOPICO_ALARMAS_SERVIDOR = "portus/srv/alarma"
 TOPICO_CAMBIOS_SERVIDOR = "portus/srv/cambio"
 
 ENTIDADES_ANUNCIADAS = {
     Turno: "turno", Retencion: "retencion", ParqueoPlaza: "parqueo",
-    PosicionPatio: "patio", IntentoIngreso: "intento",
+    PosicionPatio: "patio", IntentoIngreso: "intento", Cita: "cita", FranjaBloqueada: "franja",
+    GruaCiclo: "ciclo",
 }
 
 EnviarMqtt = Callable[[str, str], None]  # (topic, payload_json)
@@ -199,6 +208,58 @@ def _salida_completada(db, pub: PublicadorDiferido, datos: dict) -> None:
     _confirmar(db, pub)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Grua, patio y transferencia (fase 5)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _entero(valor) -> Optional[int]:
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _grua_trabajo_inicio(db, pub: PublicadorDiferido, datos: dict) -> None:
+    grua.iniciar_ciclo(db, datos.get("op", ""), _entero(datos.get("pos")))
+    _confirmar(db, pub)
+
+
+def _grua_trabajo_fin(db, pub: PublicadorDiferido, datos: dict) -> None:
+    grua.terminar_ciclo(db, _entero(datos.get("ms")), _entero(datos.get("tramos")), publish_cmd=pub)
+    _confirmar(db, pub)
+
+
+def _grua_sin_posicion(db, pub: PublicadorDiferido, datos: dict) -> None:
+    turno = grua.turno_en_transferencia(db)
+    if turno is not None:
+        texto = ("La grua no encontro posicion libre en el patio" if datos.get("op") == "DEPOSITO"
+                 else "La grua no encontro contenedor para retirar en el patio")
+        servicios.registrar_evento(db, turno.id, "controlador", texto, datos)
+        _confirmar(db, pub)
+
+
+def _patio_deposito(db, pub: PublicadorDiferido, datos: dict) -> None:
+    grua.confirmar_deposito(db, _entero(datos.get("pos")))
+    _confirmar(db, pub)
+
+
+def _patio_retiro(db, pub: PublicadorDiferido, datos: dict) -> None:
+    grua.confirmar_retiro(db, _entero(datos.get("pos")))
+    _confirmar(db, pub)
+
+
+def _transferencia_alineado(db, pub: PublicadorDiferido, datos: dict) -> None:
+    turno = grua.turno_en_transferencia(db)
+    if turno is not None:
+        servicios.registrar_evento(db, turno.id, "controlador", "Vehiculo alineado en la transferencia")
+        _confirmar(db, pub)
+
+
+def _transferencia_aborto(db, pub: PublicadorDiferido, datos: dict) -> None:
+    grua.abortar_ciclo(db, datos.get("causa", "desconocida"))
+    _confirmar(db, pub)
+
+
 def _alarma_controlador(db, pub: PublicadorDiferido, datos: dict, origen: str = "") -> None:
     servicios.registrar_alarma_controlador(db, origen or "controlador", datos)
     _confirmar(db, pub)
@@ -211,6 +272,13 @@ MANEJADORES = {
     ("portus/evt/salida", "rfid_salida"): _salida_rfid,
     ("portus/evt/salida", "salida_autorizada"): _salida_autorizada,
     ("portus/evt/salida", "salida_completada"): _salida_completada,
+    ("portus/evt/grua", "trabajo_inicio"): _grua_trabajo_inicio,
+    ("portus/evt/grua", "trabajo_fin"): _grua_trabajo_fin,
+    ("portus/evt/grua", "sin_posicion"): _grua_sin_posicion,
+    ("portus/evt/patio", "deposito"): _patio_deposito,
+    ("portus/evt/patio", "retiro"): _patio_retiro,
+    ("portus/evt/transferencia", "alineado"): _transferencia_alineado,
+    ("portus/evt/transferencia", "aborto"): _transferencia_aborto,
 }
 
 
@@ -222,7 +290,8 @@ def procesar_evento(session_factory, enviar_mqtt: EnviarMqtt, topic: str, datos:
         with session_factory() as db:
             _alarma_controlador(db, PublicadorDiferido(db, enviar_mqtt), datos, origen)
         return True
-    manejador = MANEJADORES.get((topic, datos.get("evento")))
+    # El Mega nombra el evento con "evt" (evt=estado, evt=trabajo_inicio...)
+    manejador = MANEJADORES.get((topic, datos.get("evento") or datos.get("evt")))
     if manejador is None:
         return False
     with session_factory() as db:
@@ -247,20 +316,21 @@ def anunciar_cambios(session_factory, enviar_mqtt: EnviarMqtt) -> None:
     def _anotar(session, _ctx):
         alarmas = session.info.setdefault("alarmas_nuevas", [])
         cambios = session.info.setdefault("cambios", set())
-        for obj in list(session.new) + list(session.dirty):
+        for obj in list(session.new) + list(session.dirty) + list(session.deleted):
             if isinstance(obj, Alarma):
                 if obj in session.new:
                     alarmas.append(alarma_dict(obj))
                 continue
             entidad = ENTIDADES_ANUNCIADAS.get(type(obj))
             if entidad is not None:
-                cambios.add((entidad, obj.id))
+                # FranjaBloqueada no tiene id: su clave es la hora de inicio
+                cambios.add((entidad, obj.id if hasattr(obj, "id") else obj.inicio.isoformat()))
 
     @event.listens_for(session_factory, "after_commit")
     def _enviar(session):
         mensajes = [(TOPICO_ALARMAS_SERVIDOR, d) for d in session.info.pop("alarmas_nuevas", [])]
         mensajes += [(TOPICO_CAMBIOS_SERVIDOR, {"entidad": e, "id": i})
-                     for e, i in sorted(session.info.pop("cambios", set()))]
+                     for e, i in sorted(session.info.pop("cambios", set()), key=str)]
         for topico, datos in mensajes:
             try:
                 enviar_mqtt(topico, json.dumps(datos, ensure_ascii=False))

@@ -7,6 +7,12 @@
  *   RESET      -> releer patio desde sensores
  *   RETIRO     -> modo retiro (toma primera celda ocupada)
  *   DEPOSITO   -> modo deposito (toma camion y busca primera celda libre)
+ *
+ * FASE 2 (protocolo PORTUS, ver docs/protocolo_serial.md):
+ *   - El servidor asigna el trabajo con CMD TrabajoGrua;op=DEPOSITO|RETIRO[;pos=N].
+ *     Sin pos (o si la celda no sirve) se usa la primera celda libre / ocupada.
+ *   - La grua informa trabajo_inicio, trabajo_fin (duracion y tramos
+ *     recorridos), deposito / retiro confirmados y abortos con su alarma.
  */
 
 #include <Stepper.h>
@@ -129,6 +135,13 @@ bool parpadeoReservaOn = false;
 unsigned long ultimoHeartbeatPortusMs = 0;
 long txSeqPortus = 1;
 
+// Trabajo en curso (fase 2): lo que el servidor necesita para la linea de
+// tiempo del turno, el historial de la grua y las metricas de la sec. 13.
+bool          trabajoActivo    = false;
+unsigned long trabajoInicioMs  = 0;
+int           trabajoTramos    = 0;   // marcas cruzadas = distancia en posiciones
+int           trabajoPosPedida = 0;   // posicion que asigno el servidor (0 = la decide la grua)
+
 int           optLectura  = HIGH;
 int           optEstable  = HIGH;
 unsigned long optCambioMs = 0;
@@ -173,6 +186,8 @@ void procesarComandosPortus();
 void emitirHeartbeatPortus();
 void emitirEventoGruaPortus(const char* evt);
 void responderCmdPortus(bool ok, const String& name, const String& extra);
+void emitirPortus(const char* topic, const String& payload);
+const char* opTrabajo();
 bool parseFramePortus(String line, String& src, long& seq, String& kind, String& topic, String& payload);
 String framePortus(const String& kind, const String& topic, const String& payload, long seq);
 String checksumPortus(const String& base);
@@ -439,6 +454,14 @@ void emitirEventoGruaPortus(const char* evt) {
   Serial.println(framePortus("EVT", "grua", payload, txSeqPortus++));
 }
 
+void emitirPortus(const char* topic, const String& payload) {
+  Serial.println(framePortus("EVT", topic, payload, txSeqPortus++));
+}
+
+const char* opTrabajo() {
+  return esDeposito ? "DEPOSITO" : "RETIRO";
+}
+
 void handleCmdPortus(const String& payload) {
   String target = fieldPortus(payload, "target");
   if (target.length() && target != "MEGA_GRUA") return;
@@ -467,6 +490,27 @@ void handleCmdPortus(const String& payload) {
     referenciada = false;
     refBuscandoP0 = true;
     cambiarEstado(ST_REFERENCIANDO);
+    responderCmdPortus(true, name, "");
+    return;
+  }
+  if (name == "TrabajoGrua") {
+    // Sec. 11 regla 4: en mantenimiento no se admiten trabajos originados por turnos.
+    if (modoMantenimientoRemoto) {
+      responderCmdPortus(false, name, "causa=modo_mantenimiento");
+      return;
+    }
+    if (trabajoActivo) {
+      responderCmdPortus(false, name, "causa=trabajo_en_curso");
+      return;
+    }
+    String op = fieldPortus(payload, "op");
+    if (op != "DEPOSITO" && op != "RETIRO") {
+      responderCmdPortus(false, name, "causa=op_invalida");
+      return;
+    }
+    esDeposito = (op == "DEPOSITO");
+    int p = fieldPortus(payload, "pos").toInt();
+    trabajoPosPedida = (p >= 1 && p <= 4) ? p : 0;
     responderCmdPortus(true, name, "");
     return;
   }
@@ -622,6 +666,7 @@ void ejecutarEstadoGrua() {
       if (!cicloCamionArmado && !patioRechazadoEsteCamion) {
         cicloCamionArmado = true;
         Serial.println(F("[OK] Camion detectado en transferencia."));
+        emitirPortus("transferencia", "evento=alineado");
         reiniciarPatioLogicoDesdeSensores();
         cambiarEstado(ST_REVISANDO_PATIO);
       }
@@ -629,8 +674,16 @@ void ejecutarEstadoGrua() {
 
     case ST_REVISANDO_PATIO:
       if (esDeposito) {
-        posicionDestino = buscarPrimeraCeldaLibre();
+        // La posicion la decide el servidor (politica seleccionable, sec. 13);
+        // si no mando una o esa celda no esta libre, se usa la politica de la fase 1.
+        if (trabajoPosPedida >= 1 && estadoPatio[trabajoPosPedida - 1] == LIBRE &&
+            !celdaFisicamenteOcupada(trabajoPosPedida)) {
+          posicionDestino = trabajoPosPedida;
+        } else {
+          posicionDestino = buscarPrimeraCeldaLibre();
+        }
         if (posicionDestino == 0) {
+          emitirPortus("grua", "evt=sin_posicion;op=DEPOSITO");
           Serial.println(F("[ERROR] PATIO SIN POSICIONES DISPONIBLES"));
           Serial.println(F("  Escribe RESET si las celdas estan vacias."));
           ultimoError              = ERR_PATIO_LLENO;
@@ -642,6 +695,10 @@ void ejecutarEstadoGrua() {
           Serial.print(F("[OK] Destino P"));
           Serial.print(posicionDestino);
           Serial.println(F(" RESERVADA"));
+          trabajoActivo   = true;
+          trabajoInicioMs = millis();
+          trabajoTramos   = 0;
+          emitirPortus("grua", "evt=trabajo_inicio;op=DEPOSITO;pos=" + String(posicionDestino));
           retiroTomandoDesdePatio = false;
           posicionOrigenRetiro = 0;
           alturaSegura = false;
@@ -649,8 +706,13 @@ void ejecutarEstadoGrua() {
           cambiarEstado(ST_BAJANDO_ORIGEN);
         }
       } else {
-        posicionOrigenRetiro = buscarPrimeraCeldaOcupada();
+        if (trabajoPosPedida >= 1 && celdaFisicamenteOcupada(trabajoPosPedida)) {
+          posicionOrigenRetiro = trabajoPosPedida;
+        } else {
+          posicionOrigenRetiro = buscarPrimeraCeldaOcupada();
+        }
         if (posicionOrigenRetiro == 0) {
+          emitirPortus("grua", "evt=sin_posicion;op=RETIRO");
           Serial.println(F("[ERROR] RETIRO SIN CELDAS OCUPADAS"));
           ultimoError              = ERR_PATIO_LLENO;
           patioRechazadoEsteCamion = true;
@@ -663,6 +725,10 @@ void ejecutarEstadoGrua() {
           Serial.print(F("[OK] Retiro origen P"));
           Serial.print(posicionOrigenRetiro);
           Serial.println(F(" RESERVADA"));
+          trabajoActivo   = true;
+          trabajoInicioMs = millis();
+          trabajoTramos   = 0;
+          emitirPortus("grua", "evt=trabajo_inicio;op=RETIRO;pos=" + String(posicionOrigenRetiro));
           cambiarEstado(ST_MOVIENDO_DESTINO);
         }
       }
@@ -702,6 +768,8 @@ void ejecutarEstadoGrua() {
           retiroTomandoDesdePatio = false;
           if (posicionOrigenRetiro >= 1 && posicionOrigenRetiro <= 4) {
             estadoPatio[posicionOrigenRetiro - 1] = LIBRE;
+            // Contenedor tomado de la celda: el servidor lo quita del inventario (R09)
+            emitirPortus("patio", "evento=retiro;pos=" + String(posicionOrigenRetiro));
           }
           posicionDestino = 0;
         }
@@ -761,6 +829,7 @@ void ejecutarEstadoGrua() {
         if (confirmarDepositoFisico(posicionDestino)) {
           Serial.print(F("[OK] Deposito confirmado en P"));
           Serial.println(posicionDestino);
+          emitirPortus("patio", "evento=deposito;pos=" + String(posicionDestino));
           posicionActual = posicionDestino;
           vertHechos     = 0;
           cambiarEstado(ST_SUBIENDO_CABEZAL);
@@ -808,6 +877,14 @@ void ejecutarEstadoGrua() {
       break;
 
     case ST_FINALIZADO:
+      if (trabajoActivo) {
+        int posTrabajo = esDeposito ? posicionDestino : posicionOrigenRetiro;
+        emitirPortus("grua", String("evt=trabajo_fin;op=") + opTrabajo() + ";pos=" + String(posTrabajo) +
+                     ";ms=" + String(millis() - trabajoInicioMs) + ";tramos=" + String(trabajoTramos));
+        emitirPortus("transferencia", "evento=fin");
+        trabajoActivo    = false;
+        trabajoPosPedida = 0;
+      }
       if (esDeposito) {
         Serial.print(F("DEPOSITO COMPLETADO | POSICION: P"));
         Serial.print(posicionDestino);
@@ -983,6 +1060,7 @@ void actualizarMarcaOptica() {
     int posAnterior = posicionActual;
     if (posicionActual >= 0) posicionActual = posicionTrasMarca(posicionActual, moviendoHaciaP0);
     else                     posicionActual = 4;
+    if (trabajoActivo) trabajoTramos++;
 
     if (refBuscandoP0 && posicionActual == 0) referenciada = true;
 
@@ -1157,6 +1235,22 @@ void desactivarElectroiman() {
 
 void abortarOperacion(CodigoError e) {
   ultimoError = e;
+  // Alarmas del catalogo (sec. 4.6). AL04 y AL05 no tienen sensor en la maqueta.
+  const char* causa = "otra";
+  const char* alarma = nullptr;
+  switch (e) {
+    case ERR_SIN_REFERENCIA: causa = "sin_referencia";         alarma = "AL03"; break;
+    case ERR_SIN_MARCA:      causa = "sin_marca";              alarma = "AL03"; break;
+    case ERR_DEPOSITO:       causa = "deposito_no_confirmado"; alarma = "AL07"; break;
+    case ERR_CAMION_MOVIDO:  causa = "camion_movido";          alarma = "AL08"; break;
+    default: break;
+  }
+  if (alarma) emitirPortus("alarma", String("codigo=") + alarma + ";causa=" + causa);
+  if (trabajoActivo) {
+    emitirPortus("transferencia", String("evento=aborto;causa=") + causa);
+    emitirPortus("alarma", String("codigo=AL06;causa=") + causa);
+    trabajoActivo = false;
+  }
   detenerTodo();
   desactivarElectroiman();
   alturaSegura = false;

@@ -91,7 +91,32 @@ DISPOSITIVOS = ("UNO_ENTRADA", "UNO_SALIDA", "MEGA_GRUA")
 # ── Citas (sec. 9) y vinculacion del bot (sec. 6.1) ──
 MINUTOS_FRANJA = 15
 CITAS_POR_FRANJA = 2
+# Horario que muestra la agenda de la terminal (hora local). Las franjas con
+# citas fuera de este horario tambien se muestran.
+HORARIO_AGENDA = os.getenv("PORTUS_HORARIO_AGENDA", "06:00-22:00")
 TOLERANCIA_VENTANA_MIN = 5
 MINUTOS_EXPIRA_CODIGO = 60
 ZONA_HORARIA = "America/Guatemala"  # la BD guarda UTC; a las personas se les muestra hora local
 UMBRAL_ENLACE_PERDIDO_S = 15  # ~3 latidos de 5s (sec. 10.2)
+
+# ── Contenedores de la maqueta (sec. 5.1): el manifiesto solo acepta estos.
+# Se siembran al arrancar; se cambian con PORTUS_CONTENEDORES (separados por coma).
+CONTENEDORES_MAQUETA = tuple(
+    c.strip().upper() for c in os.getenv(
+        "PORTUS_CONTENEDORES", ",".join(f"MSCU{n:07d}" for n in range(1, 9))
+    ).split(",") if c.strip()
+)
+
+# ── Politica de asignacion de posiciones del patio (sec. 13): la de la fase 1
+# se conserva como modo seleccionable para compararla en la Fase 3.
+POLITICAS_PATIO = {
+    "secuencial": "Fase 1: primera posicion libre en orden P1..P4; si no hay, apila en la primera con nivel 2 libre",
+}
+POLITICA_PATIO_DEFAULT = "secuencial"
+
+# ── Fila de espera (sec. 13 y zona de espera del sinoptico): vehiculos dentro
+# de la terminal esperando atencion, el pesaje (EnGarita) o la grua (EnRuta).
+ESTADOS_EN_ESPERA = (EN_GARITA, EN_RUTA)
+
+# Distancia de la grua: el Mega cuenta marcas (tramos entre posiciones).
+CM_POR_TRAMO = float(os.getenv("PORTUS_CM_POR_TRAMO", "0"))  # 0 = reportar solo tramos

@@ -6,7 +6,8 @@
 //   portus/evt/#          -> estado fisico de las placas (garita, pesaje, salida, grua, latidos)
 //   portus/cmd/respuesta  -> ACK/REJ de cada comando
 //   portus/srv/alarma     -> alarma nueva generada por el backend
-//   portus/srv/cambio     -> cambio de un turno, retencion, plaza, posicion o intento
+//   portus/srv/cambio     -> cambio de un turno, retencion, plaza, posicion, intento,
+//                            cita o franja (las citas del bot tambien se anuncian)
 // Ante un portus/srv/cambio se vuelve a pedir SOLO lo que cambio. El unico
 // temporizador redibuja relojes y la antiguedad del enlace; no consulta nada.
 (function () {
@@ -287,7 +288,8 @@
 
   function renderSinoptico() {
     const activos = st.turnosActivos;
-    const enEspera = activos.filter((t) => t.estado === "EnGarita");
+    // Igual que la metrica "fila de espera" del reporte (catalogos.ESTADOS_EN_ESPERA)
+    const enEspera = activos.filter((t) => t.estado === "EnGarita" || t.estado === "EnRuta");
     setEl("el-espera", String(enEspera.length), enEspera.length ? "warn" : "idle");
 
     setEl("el-garita", st.garita.estado, st.garita.clase);
@@ -414,6 +416,8 @@
         if (lista.includes("intentos") && cargadas.has("turnos")) cargarIntentos();
         if (lista.includes("retenciones") && cargadas.has("retenciones")) cargarRetenciones();
         if (lista.includes("patio") && cargadas.has("patio")) cargarPestanaPatio();
+        if (lista.includes("citas") && cargadas.has("citas")) cargarAgenda();
+        if (lista.includes("grua") && cargadas.has("grua")) cargarGrua();
       } catch (err) {
         toast(`No se pudo actualizar: ${err.message}`, "toast-bad");
       }
@@ -421,11 +425,14 @@
   }
 
   const RECARGA_POR_ENTIDAD = {
-    turno: ["sinoptico", "turnos"],
+    turno: ["sinoptico", "turnos", "grua"],
+    ciclo: ["sinoptico", "grua"],
     retencion: ["sinoptico", "retenciones"],
     parqueo: ["sinoptico", "retenciones"],
-    patio: ["sinoptico", "patio"],
+    patio: ["sinoptico", "patio", "grua"],
     intento: ["intentos"],
+    cita: ["citas"],
+    franja: ["citas"],
   };
 
   // ════════════════════════ comandos remotos ════════════════════════
@@ -823,6 +830,7 @@
     setBadge(st.alarmasActivas + 1);
     toast(`${a.codigo} (${a.severidad}): ${a.descripcion}`, ["critica", "alta"].includes(a.severidad) ? "toast-bad" : "toast-warn");
     if (cargadas.has("alarmas")) cargarAlarmas();
+    if (cargadas.has("grua") && ["AL02", "AL03", "AL04", "AL05", "AL06", "AL07", "AL08"].includes(a.codigo)) cargarGrua();
   }
 
   function filaAlarma(a) {
@@ -854,7 +862,212 @@
     }
   }
 
-  // ════════════════════════ pestaña Grua ════════════════════════
+  // ════════════════════════ pestaña Citas ════════════════════════
+
+  function hoyLocal() {
+    return new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD en la hora del navegador
+  }
+
+  const ESTADO_CITA_CLASE = { programada: "", cumplida: "chip-ok", vencida: "chip-bad", cancelada: "chip-warn" };
+
+  function filaFranja(f) {
+    const futura = !f.pasada && !f.enCurso;
+    let estado = futura ? `<span class="chip chip-ok">Disponible</span>` : "";
+    if (f.bloqueada) estado = `<span class="chip chip-bad">Bloqueada</span>${f.motivoBloqueo ? `<br><small>${escapeHtml(f.motivoBloqueo)}</small>` : ""}`;
+    else if (f.ocupan >= f.capacidad) estado = `<span class="chip chip-warn">Llena</span>`;
+    if (f.enCurso) estado += ` <span class="chip chip-ok">En curso</span>`;
+    if (f.pasada) estado += ` <span class="chip">Pasada</span>`;
+
+    const citas = f.citas.map((c) => {
+      const vehiculos = c.vehiculos.length ? c.vehiculos.map((v) => escapeHtml(v)).join(", ") : "-";
+      // "programada" ya descuenta la tolerancia: pasada la ventana + 5 min llega como "vencida"
+      const acciones = c.estado === "programada"
+        ? `<button type="button" data-cancelar-cita="${c.id}" data-contenedor="${escapeHtml(c.contenedorId)}" class="btn-warn">Cancelar</button>
+           <button type="button" data-reprogramar-cita="${c.id}" data-contenedor="${escapeHtml(c.contenedorId)}">Reprogramar</button>`
+        : "";
+      return `<div class="cita-linea"><strong>${escapeHtml(c.contenedorId)}</strong> | ${escapeHtml(c.transportistaNombre)}
+        | vehiculo ${vehiculos} <span class="chip ${ESTADO_CITA_CLASE[c.estado] || ""}">${escapeHtml(c.estado)}</span>
+        ${c.motivo ? `<small>(${escapeHtml(c.motivo)})</small>` : ""} ${acciones}</div>`;
+    }).join("") || `<span class="muted">Sin citas</span>`;
+
+    const accionFranja = !futura ? "" : (f.bloqueada
+      ? `<button type="button" data-franja-accion="desbloquear" data-inicio="${escapeHtml(f.inicio)}">Desbloquear</button>`
+      : `<button type="button" data-franja-accion="bloquear" data-inicio="${escapeHtml(f.inicio)}">Bloquear franja</button>`);
+
+    return `<tr class="${f.pasada ? "fila-pasada" : ""}">
+      <td><strong>${escapeHtml(f.horaInicio)} - ${escapeHtml(f.horaFin)}</strong></td>
+      <td>${f.asignadas} / ${f.capacidad}</td>
+      <td>${estado}</td>
+      <td>${citas}</td>
+      <td>${accionFranja}</td>
+    </tr>`;
+  }
+
+  async function cargarAgenda() {
+    const input = $("citas-fecha");
+    if (!input.value) input.value = hoyLocal();
+    try {
+      const agenda = await apiFetch(`/api/terminal/citas/agenda?fecha=${encodeURIComponent(input.value)}`);
+      let franjas = agenda.franjas;
+      if ($("citas-solo-ocupadas").checked) franjas = franjas.filter((f) => f.citas.length || f.bloqueada);
+      tabla($("tabla-agenda"), ["Franja", "Citas / capacidad", "Estado", "Citas asignadas", "Franja"],
+        franjas, filaFranja, "Sin franjas para mostrar.");
+      const pct = agenda.cumplimientoPct;
+      const chip = $("citas-cumplimiento");
+      chip.textContent = pct === null ? "sin citas evaluadas" : `${pct} % (${agenda.cumplidas} de ${agenda.evaluadas})`;
+      chip.className = `chip ${pct === null ? "" : pct >= 80 ? "chip-ok" : pct >= 50 ? "chip-warn" : "chip-bad"}`;
+      $("citas-total").textContent = String(agenda.totalCitas);
+    } catch (err) {
+      toast(`Error cargando la agenda: ${err.message}`, "toast-bad");
+    }
+  }
+
+  let citaAReprogramar = null;
+
+  async function abrirReprogramar(boton) {
+    citaAReprogramar = boton.dataset.reprogramarCita;
+    $("dlg-reprogramar-titulo").textContent = `Reprogramar la cita de ${boton.dataset.contenedor}`;
+    const select = $("reprogramar-franja");
+    select.innerHTML = "<option value=''>Cargando...</option>";
+    $("dlg-reprogramar").showModal();
+    try {
+      const franjas = await apiFetch(`/api/terminal/citas/${citaAReprogramar}/franjas`);
+      select.innerHTML = franjas.map((f) => `<option value="${escapeHtml(f.inicio)}">${escapeHtml(f.texto)}</option>`).join("")
+        || "<option value=''>No hay franjas disponibles</option>";
+    } catch (err) {
+      select.innerHTML = `<option value=''>Error: ${escapeHtml(err.message)}</option>`;
+    }
+  }
+
+  // ════════════════════════ pestaña Grua (sec. 4.5) ════════════════════════
+
+  function segundos(ms) {
+    return ms === null || ms === undefined ? "-" : `${(ms / 1000).toFixed(1)} s`;
+  }
+
+  // Grafica de barras en SVG (sin librerias: la Raspberry puede no tener internet)
+  function graficaCiclos(ciclos, promedioS) {
+    const datos = ciclos.filter((c) => c.tipo !== "REMOCION" && c.duracionMs !== null && c.resultado !== "en_curso");
+    if (!datos.length) return "<p class='muted'>Aun no hay ciclos de grua en este rango.</p>";
+    const ancho = 900;
+    const alto = 220;
+    const margen = { izq: 48, der: 10, arr: 10, aba: 28 };
+    const maxS = Math.max(...datos.map((c) => c.duracionMs / 1000), promedioS || 0) * 1.1 || 1;
+    const w = Math.min(40, (ancho - margen.izq - margen.der) / datos.length);  // pocas barras: no ocupan todo
+    const y = (s) => margen.arr + (alto - margen.arr - margen.aba) * (1 - s / maxS);
+    const barras = datos.map((c, i) => {
+      const s = c.duracionMs / 1000;
+      const x = margen.izq + i * w;
+      return `<rect x="${x + w * 0.1}" y="${y(s)}" width="${Math.max(1, w * 0.8)}" height="${alto - margen.aba - y(s)}"
+        class="${c.resultado === "abortado" ? "barra-abortada" : c.tipo === "RETIRO" ? "barra-retiro" : "barra-deposito"}">
+        <title>Ciclo ${c.id} ${c.tipo} ${c.resultado}: ${s.toFixed(1)} s</title></rect>`;
+    }).join("");
+    const marcas = [0, maxS / 2, maxS].map((s) => `<text x="${margen.izq - 6}" y="${y(s) + 4}" class="eje" text-anchor="end">${s.toFixed(0)} s</text>
+      <line x1="${margen.izq}" x2="${ancho - margen.der}" y1="${y(s)}" y2="${y(s)}" class="guia"/>`).join("");
+    const promedio = promedioS ? `<line x1="${margen.izq}" x2="${ancho - margen.der}" y1="${y(promedioS)}" y2="${y(promedioS)}" class="promedio"/>
+      <text x="${ancho - margen.der}" y="${y(promedioS) - 4}" class="eje" text-anchor="end">promedio ${promedioS} s</text>` : "";
+    return `<svg viewBox="0 0 ${ancho} ${alto}" role="img" aria-label="Tiempo de ciclo por operacion">${marcas}${barras}${promedio}
+      <text x="${margen.izq}" y="${alto - 8}" class="eje">mas antigua</text>
+      <text x="${ancho - margen.der}" y="${alto - 8}" class="eje" text-anchor="end">mas reciente</text></svg>
+      <p class="leyenda"><span class="cuadro barra-deposito"></span> deposito <span class="cuadro barra-retiro"></span> retiro
+        <span class="cuadro barra-abortada"></span> abortado</p>`;
+  }
+
+  async function cargarGrua() {
+    const limite = $("grua-rango").value;
+    try {
+      const [estado, historial] = await Promise.all([
+        apiFetch("/api/terminal/grua/estado"),
+        apiFetch(`/api/terminal/grua/ciclos?limit=${limite}`),
+      ]);
+      const t = estado.trabajoEnCurso;
+      $("grua-trabajo").textContent = t ? `${t.tipo} ${t.contenedorId || ""} en P${t.posicion} (turno ${t.turnoId || "-"})` : "ninguno";
+      tabla($("tabla-grua-cola"), ["Orden", "Tipo", "Contenedor", "Vehiculo", "Turno", "Estado"], estado.cola, (c) => `<tr>
+        <td>${c.orden}</td><td>${escapeHtml(c.tipo)}</td><td>${escapeHtml(c.contenedorId)}</td><td>${chipVehiculo(c.vehiculoUid)}</td>
+        <td>${c.turnoId}</td><td>${c.enviadoALaGrua ? "asignado a la grua" : "en espera"}</td></tr>`, "No hay trabajos pendientes.");
+      $("grua-completados").textContent = String(historial.completados);
+      $("grua-promedio").textContent = historial.promedioS === null ? "-" : `${historial.promedioS} s`;
+      $("grua-grafica").innerHTML = graficaCiclos(historial.ciclos, historial.promedioS);
+      tabla($("tabla-grua-ciclos"), ["Ciclo", "Inicio", "Tipo", "Contenedor", "Posicion", "Resultado", "Duracion", "Tramos"],
+        historial.ciclos.slice().reverse(), (c) => `<tr class="${c.resultado === "abortado" ? "fila-excedida" : ""}">
+          <td>${c.id}</td><td>${escapeHtml(fmtDate(c.inicio))}</td><td>${escapeHtml(c.tipo)}</td><td>${escapeHtml(c.contenedorId)}</td>
+          <td>${c.posicion ? `P${c.posicion}` : "-"}${c.posicionDestino ? ` &rarr; P${c.posicionDestino}` : ""}</td>
+          <td>${escapeHtml(c.resultado)}${c.causa ? `: ${escapeHtml(c.causa)}` : ""}</td>
+          <td>${segundos(c.duracionMs)}</td><td>${escapeHtml(c.tramos)}</td></tr>`, "Sin ciclos registrados.");
+      const fallas = [
+        ...estado.fallas.map((a) => ({ ts: a.createdAt, texto: `${a.codigo} (${a.severidad}): ${a.descripcion}`, estado: a.estado })),
+        ...estado.abortados.map((c) => ({ ts: c.fin || c.inicio, texto: `Ciclo ${c.id} ${c.tipo} abortado: ${c.causa || "-"}`, estado: "-" })),
+      ].sort((a, b) => (parseUtc(b.ts) || 0) - (parseUtc(a.ts) || 0));
+      tabla($("tabla-grua-fallas"), ["Fecha", "Falla", "Alarma"], fallas, (f) => `<tr>
+        <td>${escapeHtml(fmtDate(f.ts))}</td><td>${escapeHtml(f.texto)}</td><td>${escapeHtml(f.estado)}</td></tr>`,
+      "Sin fallas registradas.");
+      renderTablaGrua();
+    } catch (err) {
+      toast(`Error cargando la grua: ${err.message}`, "toast-bad");
+    }
+  }
+
+  // ════════════════════════ pestaña Reportes (sec. 4.8 y 13) ════════════════════════
+
+  const METRICAS = [
+    ["remocionesPorRetiro", "Remociones por contenedor retirado", (m) => m.valor ?? "-", (m) => `${m.remociones} remociones / ${m.retirosCompletados} retiros`],
+    ["ciclosPorOperacion", "Ciclos de grua por operacion completada", (m) => m.valor ?? "-", (m) => `${m.ciclos} ciclos / ${m.turnosCerrados} turnos cerrados`],
+    ["distanciaGrua", "Distancia total recorrida por la grua", (m) => `${m.tramos} tramos`, (m) => (m.cm !== null ? `${m.cm} cm` : "entre posiciones del riel")],
+    ["tiempoPromedioCamionS", "Tiempo promedio de camion en la terminal", (m) => (m.valor === null ? "-" : fmtDur(m.valor)), (m) => `${m.turnosCerrados} turnos cerrados`],
+    ["tiempoPromedioRetencionS", "Tiempo promedio de retencion", (m) => (m.valor === null ? "-" : fmtDur(m.valor)), (m) => `${m.retencionesResueltas} resueltas`],
+    ["filaMaxima", "Longitud maxima de la fila de espera", (m) => m.valor, () => "vehiculos esperando pesaje o grua"],
+    ["citasCumplidasPct", "Citas cumplidas en ventana", (m) => (m.valor === null ? "-" : `${m.valor} %`), (m) => `${m.cumplidas} de ${m.total} citas`],
+  ];
+
+  function htmlReporte(c) {
+    const m = c.metricas;
+    const tarjetas = METRICAS.map(([clave, nombre, valor, detalle]) => `<div class="metrica">
+      <div class="sin-tit">${nombre}</div><div class="metrica-valor">${escapeHtml(valor(m[clave]))}</div>
+      <small>${escapeHtml(detalle(m[clave]))}</small></div>`).join("");
+    const causas = Object.entries(m.retencionesPorCausa).sort();
+    const resoluciones = ["aclarar", "corregir", "rechazar", "abierta"];
+    const filas = causas.map(([causa, r]) => `<tr><td><strong>${escapeHtml(causa)}</strong></td>
+      ${resoluciones.map((k) => `<td>${r[k] || 0}</td>`).join("")}<td>${Object.values(r).reduce((a, b) => a + b, 0)}</td></tr>`).join("")
+      || `<tr><td colspan="6" class="muted">Sin retenciones en el periodo.</td></tr>`;
+    return `<h3>${escapeHtml(c.etiqueta)} <small class="muted">${escapeHtml(fmtDate(c.desde))} - ${escapeHtml(fmtDate(c.hasta))}
+        | politica ${escapeHtml(c.politicaPatio)}</small>
+      <a class="boton" href="/api/terminal/reportes/${c.id}.csv">Exportar CSV</a></h3>
+      <div class="metricas">${tarjetas}</div>
+      <h3>Retenciones por causa y resolucion</h3>
+      <table class="data-table"><thead><tr><th>Causa</th><th>Aclarar</th><th>Corregir</th><th>Rechazar</th><th>Abiertas</th><th>Total</th></tr></thead>
+      <tbody>${filas}</tbody></table>`;
+  }
+
+  function localInput(d) {
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  let corridas = [];
+
+  async function cargarReportes() {
+    const form = $("form-reporte");
+    if (!form.desde.value) {
+      const hoy = new Date();
+      form.desde.value = localInput(new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate(), 0, 0));
+      form.hasta.value = localInput(new Date(hoy.getTime() + 60 * 60 * 1000));
+    }
+    try {
+      const [lista, politica] = await Promise.all([apiFetch("/api/terminal/reportes"), apiFetch("/api/terminal/politica-patio")]);
+      corridas = lista;
+      $("politica-patio").innerHTML = Object.entries(politica.disponibles).map(([k, texto]) =>
+        `<option value="${escapeHtml(k)}" ${k === politica.politica ? "selected" : ""}>${escapeHtml(k)}: ${escapeHtml(texto)}</option>`).join("");
+      tabla($("tabla-corridas"), ["Etiqueta", "Desde", "Hasta", "Politica", "Generado", ""], lista, (c) => `<tr>
+        <td>${escapeHtml(c.etiqueta)}</td><td>${escapeHtml(fmtDate(c.desde))}</td><td>${escapeHtml(fmtDate(c.hasta))}</td>
+        <td>${escapeHtml(c.politicaPatio)}</td><td>${escapeHtml(fmtDate(c.createdAt))}</td>
+        <td class="acciones"><button type="button" data-ver-corrida="${c.id}">Ver</button>
+          <a class="boton" href="/api/terminal/reportes/${c.id}.csv">CSV</a></td></tr>`, "Aun no hay corridas guardadas.");
+    } catch (err) {
+      toast(`Error cargando reportes: ${err.message}`, "toast-bad");
+    }
+  }
+
+  // ════════════════════════ pestaña Grua: eventos de la sesion ════════════════════════
 
   function renderTablaGrua() {
     tabla($("tabla-grua"), ["Hora", "Evento", "Estado", "Posicion"], st.eventosGrua, (e) => {
@@ -871,7 +1084,9 @@
     retenciones: cargarRetenciones,
     patio: cargarPestanaPatio,
     alarmas: cargarAlarmas,
-    grua: async () => renderTablaGrua(),
+    citas: cargarAgenda,
+    grua: cargarGrua,
+    reportes: cargarReportes,
   };
 
   function activarPestana(tab) {
@@ -912,6 +1127,30 @@
       const plaza = b.dataset.liberarPlaza;
       if (!window.confirm(`Enviar AgujaLiberar para la plaza ${plaza}?`)) return;
       await accion(post(`/api/terminal/parqueo/${plaza}/liberar`), `AgujaLiberar enviado (plaza ${plaza})`);
+      return;
+    }
+    if (b.dataset.verCorrida) {
+      const c = corridas.find((x) => String(x.id) === b.dataset.verCorrida);
+      if (c) $("reporte-resultado").innerHTML = htmlReporte(c);
+      return;
+    }
+    if (b.dataset.cancelarCita) {
+      const motivo = window.prompt(`Cancelar la cita de ${b.dataset.contenedor}. Se avisa al transportista. Motivo (opcional):`, "");
+      if (motivo === null) return;
+      await accion(post(`/api/terminal/citas/${b.dataset.cancelarCita}/cancelar`, { motivo: motivo || null }),
+        `Cita de ${b.dataset.contenedor} cancelada`);
+      return;
+    }
+    if (b.dataset.reprogramarCita) return abrirReprogramar(b);
+    if (b.dataset.franjaAccion) {
+      const bloquear = b.dataset.franjaAccion === "bloquear";
+      let motivo = null;
+      if (bloquear) {
+        motivo = window.prompt("Bloquear la franja: no se asignaran citas nuevas (las que tiene se conservan). Motivo (opcional):", "");
+        if (motivo === null) return;
+      }
+      await accion(post(`/api/terminal/franjas/${b.dataset.franjaAccion}`, { inicio: b.dataset.inicio, motivo: motivo || null }),
+        bloquear ? "Franja bloqueada" : "Franja desbloqueada");
       return;
     }
     if (b.dataset.reconocer) {
@@ -955,6 +1194,38 @@
     if (r) {
       toast(`${r.reconocidas} alarma(s) reconocida(s). Las criticas y altas se reconocen una por una.`, "toast-ok");
       cargarAlarmas();
+    }
+  });
+
+  $("grua-rango").addEventListener("change", cargarGrua);
+  $("grua-exportar").addEventListener("click", () => {
+    window.location.href = `/api/terminal/grua/ciclos.csv?limit=${$("grua-rango").value}`;
+  });
+  $("form-reporte").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const c = await accion(post("/api/terminal/reportes",
+      { etiqueta: f.get("etiqueta"), desde: f.get("desde"), hasta: f.get("hasta") }), "Reporte generado y guardado");
+    if (c) {
+      $("reporte-resultado").innerHTML = htmlReporte(c);
+      cargarReportes();
+    }
+  });
+  $("politica-patio").addEventListener("change", async (e) => {
+    if (!window.confirm(`Cambiar la politica de asignacion de posiciones a "${e.target.value}"?`)) return cargarReportes();
+    await accion(post("/api/terminal/politica-patio", { politica: e.target.value }), "Politica de patio cambiada");
+  });
+  $("citas-fecha").addEventListener("change", cargarAgenda);
+  $("citas-solo-ocupadas").addEventListener("change", cargarAgenda);
+  $("form-reprogramar").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    if (!f.get("inicio")) return;
+    const r = await accion(post(`/api/terminal/citas/${citaAReprogramar}/reprogramar`,
+      { inicio: f.get("inicio"), motivo: f.get("motivo") || null }), "Cita reprogramada; se aviso al transportista");
+    if (r) {
+      e.target.reset();
+      $("dlg-reprogramar").close();
     }
   });
 

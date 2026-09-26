@@ -44,436 +44,434 @@ async function apiFetch(url, options = {}) {
   return data;
 }
 
-function setResult(el, payload) {
+
+// ════════════════════════ comunes a naviera, agente y autoridad ════════════════════════
+
+function postJson(url, body) {
+  return apiFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+function mensaje(el, texto, ok = true) {
   if (!el) return;
-  if (typeof payload === "string") {
-    el.textContent = payload;
-  } else {
-    el.textContent = JSON.stringify(payload, null, 2);
+  el.textContent = texto;
+  el.className = `resultado ${ok ? "ok" : "error"}`;
+}
+
+function llenarTabla(tabla, columnas, filas, filaHtml, vacio = "Sin datos.") {
+  if (!tabla) return;
+  const cuerpo = filas.length
+    ? filas.map(filaHtml).join("")
+    : `<tr><td colspan="${columnas.length}" class="muted">${vacio}</td></tr>`;
+  tabla.innerHTML = `<thead><tr>${columnas.map((c) => `<th>${c}</th>`).join("")}</tr></thead><tbody>${cuerpo}</tbody>`;
+  actualizarRelojesRol();
+}
+
+function duracion(segundos) {
+  const s = Math.max(0, Math.floor(segundos));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return `${h} h ${m} min`;
+}
+
+// <span class="reloj-rol" data-desde="..."> muestra el reloj de permanencia en horas y minutos
+function relojRol(desdeIso) {
+  return desdeIso ? `<span class="reloj-rol" data-desde="${escapeHtml(desdeIso)}"></span>` : "-";
+}
+
+function actualizarRelojesRol() {
+  document.querySelectorAll(".reloj-rol").forEach((el) => {
+    const d = parseUtc(el.dataset.desde);
+    if (d) el.textContent = duracion((Date.now() - d.getTime()) / 1000);
+  });
+}
+
+const ESTADO_DOC = {
+  declarado: "Declarado (sin levante)",
+  declaracion_presentada: "Declaracion presentada",
+  levante_solicitado: "Levante solicitado",
+  levante_otorgado: "Levante otorgado",
+  levante_retenido: "Levante retenido",
+};
+
+function autorizacion(m) {
+  const canal = m.canal ? ` <span class="chip ${m.canal === "rojo" ? "chip-bad" : "chip-ok"}">canal ${escapeHtml(m.canal)}</span>` : "";
+  return `${escapeHtml(ESTADO_DOC[m.estadoDocumental] || m.estadoDocumental)}${canal}`;
+}
+
+function initTabs(root) {
+  const botones = Array.from(root.querySelectorAll(".tab-btn"));
+  const paneles = Array.from(root.querySelectorAll(".tab-panel"));
+  const activar = (tab) => {
+    botones.forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+    paneles.forEach((p) => p.classList.toggle("hidden", p.dataset.tabPanel !== tab));
+    if (window.location.hash !== `#${tab}`) window.history.replaceState(null, "", `#${tab}`);
+    root.dispatchEvent(new CustomEvent("pestana", { detail: tab }));
+  };
+  botones.forEach((b) => b.addEventListener("click", () => activar(b.dataset.tab)));
+  const inicial = (window.location.hash || "").replace("#", "");
+  activar(botones.some((b) => b.dataset.tab === inicial) ? inicial : botones[0].dataset.tab);
+  setInterval(actualizarRelojesRol, 30000);
+}
+
+function htmlDetalleManifiesto(d, { conDeclaracion = true } = {}) {
+  const historial = (d.historial || []).map((h) => {
+    const valores = Object.entries(h.valores || {}).filter(([, v]) => v !== null && v !== "")
+      .map(([k, v]) => `${k}: ${v}`).join(", ");
+    return `<tr><td>${escapeHtml(fmtDate(h.ts))}</td><td><span class="chip">${escapeHtml(h.origen)}</span></td>
+      <td>${h.tipo === "observacion" ? "<strong>Observacion:</strong> " : ""}${escapeHtml(h.descripcion)}</td>
+      <td><small>${escapeHtml(valores)}</small></td></tr>`;
+  }).join("") || "<tr><td colspan='4'>Sin eventos.</td></tr>";
+  const decl = d.declaracion;
+  const declaracion = !conDeclaracion ? "" : decl
+    ? `<h3>Declaracion de mercancias</h3>
+       <table class="data-table"><tr><th>Numero</th><td>${escapeHtml(decl.numero)}</td><th>Regimen</th><td>${escapeHtml(decl.regimen)}</td></tr>
+       <tr><th>Valor declarado</th><td>${escapeHtml(decl.valorDeclarado)}</td><th>Agente</th><td>${escapeHtml(decl.agente)}</td></tr>
+       <tr><th>Descripcion</th><td colspan="3">${escapeHtml(decl.descripcion)}</td></tr></table>`
+    : "<p class='muted'>Aun no hay declaracion presentada.</p>";
+  const turnos = (d.turnos || []).map((t) => `${t.id} (${escapeHtml(t.estado)})`).join(", ") || "-";
+  return `<h2>Manifiesto ${d.id} - ${escapeHtml(d.contenedorId)}</h2>
+    <table class="data-table">
+      <tr><th>Operacion</th><td>${escapeHtml(d.tipoOperacion)}</td><th>Naviera</th><td>${escapeHtml(d.navieraNombre)}</td></tr>
+      <tr><th>Peso declarado</th><td>${escapeHtml(d.pesoDeclaradoG)} g${d.pesoDeclaradoAnteriorG ? ` <small>(anterior: ${escapeHtml(d.pesoDeclaradoAnteriorG)} g)</small>` : ""}</td>
+          <th>Tolerancia</th><td>${escapeHtml(d.toleranciaPct)} %</td></tr>
+      <tr><th>Transportista</th><td>${escapeHtml(d.transportistaNombre)}</td><th>Tarjeta RFID</th><td>${escapeHtml(d.vehiculoUid)}</td></tr>
+      <tr><th>Autorizacion</th><td>${autorizacion(d)}${d.motivoLevante ? `<br><small>Motivo: ${escapeHtml(d.motivoLevante)}</small>` : ""}</td>
+          <th>Estado operativo</th><td>${escapeHtml(d.estadoOperativo)} | ${escapeHtml(d.ubicacion)}</td></tr>
+      <tr><th>Observaciones</th><td colspan="3">${escapeHtml(d.observaciones)}</td></tr>
+      <tr><th>Turnos</th><td colspan="3">${turnos}</td></tr>
+    </table>
+    ${declaracion}
+    <h3>Historial</h3>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>Fecha</th><th>Origen</th><th>Evento</th><th>Valores</th></tr></thead>
+    <tbody>${historial}</tbody></table></div>`;
+}
+
+async function abrirDetalle(url, opciones) {
+  const dlg = document.getElementById("dlg-rol");
+  const body = document.getElementById("dlg-rol-body");
+  body.textContent = "Cargando...";
+  dlg.showModal();
+  try {
+    body.innerHTML = htmlDetalleManifiesto(await apiFetch(url), opciones);
+  } catch (err) {
+    body.textContent = `Error: ${err.message}`;
   }
 }
+
+// ════════════════════════ NAVIERA (sec. 5.1 y 5.2) ════════════════════════
 
 function initNaviera() {
   const root = document.getElementById("naviera-root");
   if (!root) return;
+  const $ = (id) => document.getElementById(id);
+  const form = $("naviera-form-manifiesto");
+  const result = $("naviera-result");
 
-  const form = document.getElementById("naviera-form-manifiesto");
-  const contenedor = document.getElementById("naviera-contenedor");
-  const operacion = document.getElementById("naviera-operacion");
-  const peso = document.getElementById("naviera-peso");
-  const tolerancia = document.getElementById("naviera-tolerancia");
-  const transportista = document.getElementById("naviera-transportista");
-  const observaciones = document.getElementById("naviera-observaciones");
-  const refreshBtn = document.getElementById("naviera-refresh");
-  const result = document.getElementById("naviera-result");
-  const tbodyManifiestos = document.querySelector("#naviera-table-manifiestos tbody");
-  const tbodyContenedores = document.querySelector("#naviera-table-contenedores tbody");
-
-  async function loadTransportistas() {
-    const items = await apiFetch("/api/naviera/transportistas");
-    transportista.innerHTML = "";
-    (items || []).forEach((t) => {
-      const opt = document.createElement("option");
-      opt.value = t.id;
-      opt.textContent = `${t.id} - ${t.nombre}`;
-      transportista.appendChild(opt);
-    });
+  async function cargarFormulario() {
+    const [transportistas, catalogo] = await Promise.all([
+      apiFetch("/api/naviera/transportistas"), apiFetch("/api/naviera/catalogo")]);
+    $("naviera-transportista").innerHTML = transportistas
+      .map((t) => `<option value="${t.id}">${escapeHtml(t.nombre)}</option>`).join("");
+    $("naviera-catalogo").innerHTML = catalogo.map((c) => `<option value="${escapeHtml(c.contenedorId)}"></option>`).join("");
   }
 
-  function renderManifiestos(items) {
-    tbodyManifiestos.innerHTML = "";
-    if (!items.length) {
-      tbodyManifiestos.innerHTML = "<tr><td colspan='8'>Sin manifiestos.</td></tr>";
-      return;
-    }
-    items.forEach((m) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${escapeHtml(m.id)}</td>
-        <td>${escapeHtml(m.contenedorId)}</td>
-        <td>${escapeHtml(m.tipoOperacion)}</td>
-        <td>${escapeHtml(m.estadoDocumental)}</td>
-        <td>${escapeHtml(m.canal)}</td>
-        <td>${m.anulado ? "SI" : "NO"}</td>
-        <td>${escapeHtml(fmtDate(m.createdAt))}</td>
-        <td><button type="button" data-anular="${m.id}" ${m.anulado ? "disabled" : ""}>Anular</button></td>
-      `;
-      tbodyManifiestos.appendChild(tr);
-    });
-  }
-
-  function renderContenedores(items) {
-    tbodyContenedores.innerHTML = "";
-    const map = new Map();
-    items.forEach((m) => map.set(m.contenedorId, m));
-    const values = Array.from(map.values());
-    if (!values.length) {
-      tbodyContenedores.innerHTML = "<tr><td colspan='5'>Sin contenedores.</td></tr>";
-      return;
-    }
-    values.forEach((m) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${escapeHtml(m.contenedorId)}</td>
-        <td>${escapeHtml(m.tipoOperacion)}</td>
-        <td>${escapeHtml(m.estadoDocumental)}</td>
-        <td>${escapeHtml(m.canal)}</td>
-        <td>#${escapeHtml(m.id)}</td>
-      `;
-      tbodyContenedores.appendChild(tr);
-    });
-  }
-
-  async function loadManifiestos() {
-    const items = await apiFetch("/api/naviera/manifiestos");
-    renderManifiestos(items);
-    renderContenedores(items);
-  }
-
-  tbodyManifiestos.addEventListener("click", async (ev) => {
-    const btn = ev.target.closest("button[data-anular]");
-    if (!btn) return;
-    const id = Number(btn.dataset.anular);
-    if (!window.confirm(`Anular manifiesto #${id}?`)) return;
+  async function cargarManifiestos() {
     try {
-      const data = await apiFetch(`/api/naviera/manifiestos/${id}/anular`, { method: "POST" });
-      setResult(result, data);
-      await loadManifiestos();
+      const items = await apiFetch("/api/naviera/manifiestos");
+      llenarTabla($("naviera-table-manifiestos"),
+        ["Id", "Contenedor", "Operacion", "Peso declarado", "Tolerancia", "Estado documental", "Estado operativo", "Acciones"],
+        items, (m) => {
+          const anulable = !m.anulado && !(m.estadoOperativo || "").startsWith("Turno") && m.estadoOperativo !== "En patio";
+          return `<tr>
+            <td>${m.id}</td><td>${escapeHtml(m.contenedorId)}</td><td>${escapeHtml(m.tipoOperacion)}</td>
+            <td>${escapeHtml(m.pesoDeclaradoG)} g</td><td>${escapeHtml(m.toleranciaPct)} %</td>
+            <td>${autorizacion(m)}</td><td>${escapeHtml(m.anulado ? "Anulado" : m.estadoOperativo)}</td>
+            <td class="acciones"><button type="button" data-detalle="${m.id}">Ver detalle</button>
+              <button type="button" data-anular="${m.id}" class="btn-warn" ${anulable ? "" : "disabled"}
+                title="${anulable ? "" : "Solo sin turno asociado"}">Anular</button></td></tr>`;
+        }, "Aun no declaraste manifiestos.");
     } catch (err) {
-      setResult(result, `Error: ${err.message}`);
+      mensaje(result, `Error: ${err.message}`, false);
     }
-  });
+  }
 
+  async function cargarContenedores() {
+    const f = new FormData($("naviera-filtros"));
+    const qs = new URLSearchParams(Array.from(f.entries()).filter(([, v]) => v)).toString();
+    try {
+      const items = await apiFetch(`/api/naviera/contenedores?${qs}`);
+      llenarTabla($("naviera-table-contenedores"),
+        ["Contenedor", "Operacion", "Estado", "Ubicacion actual", "Autorizacion vigente", "Permanencia"],
+        items, (c) => `<tr><td>${escapeHtml(c.contenedorId)}</td><td>${escapeHtml(c.tipoOperacion)}</td>
+          <td>${escapeHtml(c.estadoOperativo)}</td><td>${escapeHtml(c.ubicacion)}</td><td>${autorizacion(c)}</td>
+          <td>${relojRol(c.enPatioDesde)}</td></tr>`, "Sin contenedores.");
+    } catch (err) {
+      mensaje(result, `Error: ${err.message}`, false);
+    }
+  }
+
+  $("naviera-nuevo").addEventListener("click", () => form.classList.toggle("hidden"));
+  $("naviera-cancelar").addEventListener("click", () => form.classList.add("hidden"));
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
+    const tolerancia = $("naviera-tolerancia").value;
     const payload = {
-      contenedor_id: contenedor.value.trim(),
-      tipo_operacion: operacion.value,
-      peso_declarado_g: Number(peso.value),
-      tolerancia_pct: Number(tolerancia.value),
-      transportista_id: Number(transportista.value),
-      observaciones: observaciones.value.trim() || null,
+      contenedor_id: $("naviera-contenedor").value.trim().toUpperCase(),
+      tipo_operacion: $("naviera-operacion").value,
+      peso_declarado_g: Number($("naviera-peso").value),
+      tolerancia_pct: tolerancia === "" ? null : Number(tolerancia),
+      transportista_id: Number($("naviera-transportista").value),
+      vehiculo_uid: $("naviera-rfid").value.trim() || null,
+      observaciones: $("naviera-observaciones").value.trim() || null,
     };
     try {
-      const data = await apiFetch("/api/naviera/manifiestos", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      setResult(result, data);
+      const r = await postJson("/api/naviera/manifiestos", payload);
+      mensaje(result, `Manifiesto ${r.id} declarado para ${payload.contenedor_id}.`);
       form.reset();
-      operacion.value = "DEPOSITO";
-      peso.value = "1000";
-      tolerancia.value = "5.0";
-      await loadManifiestos();
+      form.classList.add("hidden");
+      cargarManifiestos();
     } catch (err) {
-      setResult(result, `Error: ${err.message}`);
+      mensaje(result, `Rechazado: ${err.message}`, false);
     }
   });
 
-  refreshBtn.addEventListener("click", async () => {
-    try {
-      await loadManifiestos();
-    } catch (err) {
-      setResult(result, `Error: ${err.message}`);
+  root.addEventListener("click", async (ev) => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    if (b.dataset.detalle) abrirDetalle(`/api/naviera/manifiestos/${b.dataset.detalle}`);
+    if (b.dataset.anular) {
+      if (!window.confirm(`Anular el manifiesto ${b.dataset.anular}?`)) return;
+      try {
+        await postJson(`/api/naviera/manifiestos/${b.dataset.anular}/anular`);
+        mensaje(result, `Manifiesto ${b.dataset.anular} anulado.`);
+        cargarManifiestos();
+      } catch (err) {
+        mensaje(result, `Rechazado: ${err.message}`, false);
+      }
     }
   });
+  $("naviera-filtros").addEventListener("submit", (ev) => { ev.preventDefault(); cargarContenedores(); });
+  root.addEventListener("pestana", (ev) => (ev.detail === "contenedores" ? cargarContenedores() : cargarManifiestos()));
 
-  (async () => {
-    try {
-      await loadTransportistas();
-      await loadManifiestos();
-    } catch (err) {
-      setResult(result, `Error inicial: ${err.message}`);
-    }
-  })();
+  cargarFormulario().catch((err) => mensaje(result, `Error: ${err.message}`, false));
+  initTabs(root);
 }
+
+// ════════════════════════ AGENTE (sec. 5.3 y 5.4) ════════════════════════
 
 function initAgente() {
   const root = document.getElementById("agente-root");
   if (!root) return;
+  const $ = (id) => document.getElementById(id);
+  const result = $("agente-result");
+  let manifiestoDeclarando = null;
 
-  const form = document.getElementById("agente-form-declaracion");
-  const manifiestoSel = document.getElementById("agente-manifiesto");
-  const numero = document.getElementById("agente-numero");
-  const regimen = document.getElementById("agente-regimen");
-  const valor = document.getElementById("agente-valor");
-  const descripcion = document.getElementById("agente-descripcion");
-  const refreshBtn = document.getElementById("agente-refresh");
-  const result = document.getElementById("agente-result");
-  const seguimiento = document.getElementById("agente-seguimiento");
-  const tbody = document.querySelector("#agente-table-pendientes tbody");
-  let pendientes = [];
-
-  function renderPendientes(items) {
-    tbody.innerHTML = "";
-    manifiestoSel.innerHTML = "";
-    if (!items.length) {
-      tbody.innerHTML = "<tr><td colspan='6'>Sin pendientes para agente.</td></tr>";
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "Sin pendientes";
-      manifiestoSel.appendChild(opt);
-      return;
-    }
-    items.forEach((m) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${escapeHtml(m.id)}</td>
-        <td>${escapeHtml(m.contenedorId)}</td>
-        <td>${escapeHtml(m.tipoOperacion)}</td>
-        <td>${escapeHtml(m.estadoDocumental)}</td>
-        <td>${escapeHtml(m.canal)}</td>
-        <td><button type="button" data-levante="${m.id}">Solicitar levante</button></td>
-      `;
-      tbody.appendChild(tr);
-
-      const opt = document.createElement("option");
-      opt.value = m.id;
-      opt.textContent = `#${m.id} - ${m.contenedorId} (${m.estadoDocumental})`;
-      manifiestoSel.appendChild(opt);
-    });
-  }
-
-  async function loadPendientes() {
-    pendientes = await apiFetch("/api/agente/declaraciones");
-    renderPendientes(pendientes);
-    setResult(seguimiento, pendientes);
-  }
-
-  tbody.addEventListener("click", async (ev) => {
-    const btn = ev.target.closest("button[data-levante]");
-    if (!btn) return;
-    const id = Number(btn.dataset.levante);
+  async function cargarPendientes() {
     try {
-      const data = await apiFetch(`/api/agente/manifiestos/${id}/solicitar-levante`, { method: "POST" });
-      setResult(result, data);
-      await loadPendientes();
+      const items = await apiFetch("/api/agente/declaraciones");
+      llenarTabla($("agente-table-pendientes"),
+        ["Manifiesto", "Contenedor", "Naviera", "Operacion", "Peso declarado", "Estado", "Acciones"],
+        items, (m) => `<tr>
+          <td>${m.id}</td><td>${escapeHtml(m.contenedorId)}</td><td>${escapeHtml(m.navieraNombre)}</td>
+          <td>${escapeHtml(m.tipoOperacion)}</td><td>${escapeHtml(m.pesoDeclaradoG)} g</td><td>${autorizacion(m)}</td>
+          <td class="acciones">
+            <button type="button" data-declarar="${m.id}" data-contenedor="${escapeHtml(m.contenedorId)}"
+              ${m.estadoDocumental === "declarado" ? "" : "disabled"}>Presentar declaracion</button>
+            <button type="button" data-levante="${m.id}" ${m.estadoDocumental === "declaracion_presentada" ? "" : "disabled"}
+              title="Solo con la declaracion presentada">Solicitar levante</button>
+            <button type="button" data-observar="${m.id}">Adjuntar observacion</button>
+          </td></tr>`, "No hay manifiestos pendientes de levante.");
     } catch (err) {
-      setResult(result, `Error: ${err.message}`);
+      mensaje(result, `Error: ${err.message}`, false);
     }
-  });
+  }
 
-  form.addEventListener("submit", async (ev) => {
+  const SITUACION = { pendiente: "", autorizada: "chip-ok", retenida: "chip-bad" };
+
+  async function cargarSeguimiento() {
+    const f = new FormData($("agente-filtros"));
+    const qs = new URLSearchParams(Array.from(f.entries()).filter(([, v]) => v)).toString();
+    try {
+      const items = await apiFetch(`/api/agente/seguimiento?${qs}`);
+      llenarTabla($("agente-table-seguimiento"),
+        ["Declaracion", "Contenedor", "Naviera", "Estado", "Canal", "Motivo de retencion", "Presentada"],
+        items, (d) => `<tr><td>${escapeHtml(d.numeroDeclaracion)}</td><td>${escapeHtml(d.contenedorId)}</td>
+          <td>${escapeHtml(d.naviera)}</td><td><span class="chip ${SITUACION[d.situacion]}">${escapeHtml(d.situacion)}</span></td>
+          <td>${escapeHtml(d.canal)}</td><td>${escapeHtml(d.motivoRetencion)}</td><td>${escapeHtml(fmtDate(d.createdAt))}</td></tr>`,
+        "Sin solicitudes.");
+    } catch (err) {
+      mensaje(result, `Error: ${err.message}`, false);
+    }
+  }
+
+  $("agente-form-declaracion").addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    const payload = {
-      manifiesto_id: Number(manifiestoSel.value),
-      numero_declaracion: numero.value.trim(),
-      regimen: regimen.value,
-      descripcion: descripcion.value.trim(),
-      valor_declarado: Number(valor.value),
-    };
+    const f = new FormData(ev.target);
     try {
-      const data = await apiFetch("/api/agente/declaraciones", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+      await postJson("/api/agente/declaraciones", {
+        manifiesto_id: manifiestoDeclarando,
+        numero_declaracion: f.get("numero_declaracion").trim(),
+        regimen: f.get("regimen"),
+        descripcion: f.get("descripcion").trim(),
+        valor_declarado: Number(f.get("valor_declarado")),
       });
-      setResult(result, data);
-      form.reset();
-      regimen.value = "importacion_definitiva";
-      valor.value = "1000.00";
-      await loadPendientes();
+      ev.target.reset();
+      $("dlg-declaracion").close();
+      mensaje(result, `Declaracion presentada para el manifiesto ${manifiestoDeclarando}.`);
+      cargarPendientes();
     } catch (err) {
-      setResult(result, `Error: ${err.message}`);
+      mensaje(result, `Rechazado: ${err.message}`, false);
+      $("dlg-declaracion").close();
     }
   });
 
-  refreshBtn.addEventListener("click", async () => {
+  root.addEventListener("click", async (ev) => {
+    const b = ev.target.closest("button");
+    if (!b) return;
     try {
-      await loadPendientes();
+      if (b.dataset.declarar) {
+        manifiestoDeclarando = Number(b.dataset.declarar);
+        $("dlg-declaracion-titulo").textContent = `Presentar declaracion - ${b.dataset.contenedor}`;
+        $("dlg-declaracion").showModal();
+      }
+      if (b.dataset.levante) {
+        await postJson(`/api/agente/manifiestos/${b.dataset.levante}/solicitar-levante`);
+        mensaje(result, `Levante solicitado para el manifiesto ${b.dataset.levante}.`);
+        cargarPendientes();
+      }
+      if (b.dataset.observar) {
+        const texto = window.prompt("Observacion para la autoridad:", "");
+        if (!texto || !texto.trim()) return;
+        await postJson(`/api/agente/manifiestos/${b.dataset.observar}/observaciones`, { texto });
+        mensaje(result, `Observacion adjuntada al manifiesto ${b.dataset.observar}.`);
+      }
     } catch (err) {
-      setResult(result, `Error: ${err.message}`);
+      mensaje(result, `Rechazado: ${err.message}`, false);
     }
   });
-
-  (async () => {
-    try {
-      await loadPendientes();
-    } catch (err) {
-      setResult(result, `Error inicial: ${err.message}`);
-    }
-  })();
+  $("agente-refresh").addEventListener("click", cargarPendientes);
+  $("agente-filtros").addEventListener("submit", (ev) => { ev.preventDefault(); cargarSeguimiento(); });
+  root.addEventListener("pestana", (ev) => (ev.detail === "seguimiento" ? cargarSeguimiento() : cargarPendientes()));
+  initTabs(root);
 }
+
+// ════════════════════════ AUTORIDAD (sec. 5.5, 5.6 y 5.7) ════════════════════════
 
 function initAutoridad() {
   const root = document.getElementById("autoridad-root");
   if (!root) return;
+  const $ = (id) => document.getElementById(id);
+  const result = $("autoridad-result");
 
-  const refreshSolicitudes = document.getElementById("autoridad-refresh-solicitudes");
-  const refreshRetenciones = document.getElementById("autoridad-refresh-retenciones");
-  const refreshCarga = document.getElementById("autoridad-refresh-carga");
-  const solicitudesResult = document.getElementById("autoridad-solicitudes-result");
-  const retencionesResult = document.getElementById("autoridad-retenciones-result");
-  const tbodySolicitudes = document.querySelector("#autoridad-table-solicitudes tbody");
-  const tbodyRetenciones = document.querySelector("#autoridad-table-retenciones tbody");
-  const tbodyCarga = document.querySelector("#autoridad-table-carga tbody");
-
-  function renderSolicitudes(items) {
-    tbodySolicitudes.innerHTML = "";
-    if (!items.length) {
-      tbodySolicitudes.innerHTML = "<tr><td colspan='6'>Sin solicitudes de levante.</td></tr>";
-      return;
-    }
-    items.forEach((m) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${escapeHtml(m.id)}</td>
-        <td>${escapeHtml(m.contenedorId)}</td>
-        <td>${escapeHtml(m.tipoOperacion)}</td>
-        <td>${escapeHtml(m.estadoDocumental)}</td>
-        <td>
-          <select data-canal="${m.id}">
-            <option value="verde">verde</option>
-            <option value="rojo">rojo</option>
-          </select>
-        </td>
-        <td>
-          <button type="button" data-otorgar="${m.id}">Otorgar</button>
-          <button type="button" data-retener="${m.id}">Retener</button>
-        </td>
-      `;
-      tbodySolicitudes.appendChild(tr);
-    });
-  }
-
-  function renderRetenciones(items) {
-    tbodyRetenciones.innerHTML = "";
-    if (!items.length) {
-      tbodyRetenciones.innerHTML = "<tr><td colspan='6'>Sin retenciones RT03/RT05.</td></tr>";
-      return;
-    }
-    items.forEach((r) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${escapeHtml(r.id)}</td>
-        <td>${escapeHtml(r.turnoId)}</td>
-        <td>${escapeHtml(r.causa)}</td>
-        <td>${escapeHtml(r.estado)}</td>
-        <td>${escapeHtml(fmtDate(r.createdAt))}</td>
-        <td>
-          <button type="button" data-aclarar="${r.id}" ${r.estado !== "abierta" ? "disabled" : ""}>Aclarar</button>
-          <button type="button" data-rechazar="${r.id}" ${r.estado !== "abierta" ? "disabled" : ""}>Rechazar</button>
-        </td>
-      `;
-      tbodyRetenciones.appendChild(tr);
-    });
-  }
-
-  function renderCarga(items) {
-    tbodyCarga.innerHTML = "";
-    if (!items.length) {
-      tbodyCarga.innerHTML = "<tr><td colspan='6'>Sin carga registrada.</td></tr>";
-      return;
-    }
-    items.forEach((m) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${escapeHtml(m.id)}</td>
-        <td>${escapeHtml(m.contenedorId)}</td>
-        <td>${escapeHtml(m.tipoOperacion)}</td>
-        <td>${escapeHtml(m.estadoDocumental)}</td>
-        <td>${escapeHtml(m.canal)}</td>
-        <td>${m.anulado ? "SI" : "NO"}</td>
-      `;
-      tbodyCarga.appendChild(tr);
-    });
-  }
-
-  async function loadSolicitudes() {
-    const data = await apiFetch("/api/autoridad/solicitudes");
-    renderSolicitudes(data);
-  }
-
-  async function loadRetenciones() {
-    const data = await apiFetch("/api/autoridad/retenciones");
-    renderRetenciones(data);
-  }
-
-  async function loadCarga() {
-    const data = await apiFetch("/api/autoridad/carga");
-    renderCarga(data);
-  }
-
-  tbodySolicitudes.addEventListener("click", async (ev) => {
-    const otorgarBtn = ev.target.closest("button[data-otorgar]");
-    const retenerBtn = ev.target.closest("button[data-retener]");
-    if (!otorgarBtn && !retenerBtn) return;
-
+  async function cargarSolicitudes() {
     try {
-      if (otorgarBtn) {
-        const id = Number(otorgarBtn.dataset.otorgar);
-        const canalSel = tbodySolicitudes.querySelector(`select[data-canal="${id}"]`);
-        const payload = { otorgar: true, canal: canalSel ? canalSel.value : "verde", motivo_retencion: null };
-        const data = await apiFetch(`/api/autoridad/manifiestos/${id}/levante`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        setResult(solicitudesResult, data);
-      } else if (retenerBtn) {
-        const id = Number(retenerBtn.dataset.retener);
-        const motivo = window.prompt("Motivo de retencion (obligatorio):", "");
-        if (!motivo) {
-          setResult(solicitudesResult, "Debes ingresar un motivo para retener.");
-          return;
-        }
-        const payload = { otorgar: false, canal: null, motivo_retencion: motivo };
-        const data = await apiFetch(`/api/autoridad/manifiestos/${id}/levante`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        setResult(solicitudesResult, data);
-      }
-      await Promise.all([loadSolicitudes(), loadRetenciones(), loadCarga()]);
+      const items = await apiFetch("/api/autoridad/solicitudes");
+      llenarTabla($("autoridad-table-solicitudes"),
+        ["Manifiesto", "Contenedor", "Naviera", "Agente", "Declaracion", "Peso declarado", "Canal", "Acciones"],
+        items, (m) => `<tr>
+          <td>${m.id}</td><td>${escapeHtml(m.contenedorId)}</td><td>${escapeHtml(m.navieraNombre)}</td>
+          <td>${escapeHtml(m.agenteNombre)}</td><td>${escapeHtml(m.numeroDeclaracion)}</td><td>${escapeHtml(m.pesoDeclaradoG)} g</td>
+          <td><select data-canal="${m.id}"><option value="">Elegir canal</option>
+            <option value="verde">Verde</option><option value="rojo">Rojo</option></select></td>
+          <td class="acciones"><button type="button" data-otorgar="${m.id}">Otorgar levante</button>
+            <button type="button" data-retener="${m.id}" class="btn-warn">Retener</button>
+            <button type="button" data-declaracion="${m.id}">Ver declaracion</button></td></tr>`,
+        "No hay solicitudes pendientes.");
     } catch (err) {
-      setResult(solicitudesResult, `Error: ${err.message}`);
+      mensaje(result, `Error: ${err.message}`, false);
+    }
+  }
+
+  async function cargarRetenciones() {
+    const estado = $("autoridad-ret-estado").value;
+    try {
+      const items = (await apiFetch("/api/autoridad/retenciones")).filter((r) => !estado || r.estado === estado);
+      llenarTabla($("autoridad-table-retenciones"),
+        ["Id", "Turno / vehiculo", "Contenedor", "Causa", "Momento", "Plaza", "Tiempo", "Rol facultado", "Resolucion"],
+        items, (r) => {
+          const fin = r.resolvedAt ? parseUtc(r.resolvedAt) : new Date();
+          const tiempo = duracion((fin.getTime() - parseUtc(r.createdAt).getTime()) / 1000);
+          const acciones = r.estado === "abierta"
+            ? `<button type="button" data-aclarar="${r.id}">Aclarar</button>
+               <button type="button" data-rechazar="${r.id}" class="btn-warn">Rechazar</button>`
+            : `${escapeHtml(r.resolucion)}${r.motivo ? `: ${escapeHtml(r.motivo)}` : ""}`;
+          return `<tr><td>${r.id}</td><td>Turno ${r.turnoId}<br>${escapeHtml(r.vehiculoUid)}</td><td>${escapeHtml(r.contenedorId)}</td>
+            <td><strong>${escapeHtml(r.causa)}</strong></td><td>${escapeHtml(r.estacion)}<br><small>${escapeHtml(fmtDate(r.createdAt))}</small></td>
+            <td>${escapeHtml(r.plaza)}</td><td>${tiempo}</td><td>${escapeHtml(r.rolFacultado)}</td><td class="acciones">${acciones}</td></tr>`;
+        }, "Sin retenciones aduaneras.");
+    } catch (err) {
+      mensaje(result, `Error: ${err.message}`, false);
+    }
+  }
+
+  async function cargarCarga() {
+    const f = new FormData($("autoridad-filtros"));
+    const qs = new URLSearchParams(Array.from(f.entries()).filter(([, v]) => v)).toString();
+    try {
+      const items = await apiFetch(`/api/autoridad/carga?${qs}`);
+      llenarTabla($("autoridad-table-carga"),
+        ["Contenedor", "Naviera", "Estado", "Ubicacion", "Autorizacion", "Permanencia", ""],
+        items, (c) => `<tr><td>${escapeHtml(c.contenedorId)}</td><td>${escapeHtml(c.naviera)}</td>
+          <td>${escapeHtml(c.estadoOperativo)}</td><td>${escapeHtml(c.ubicacion)}</td><td>${autorizacion(c)}</td>
+          <td>${relojRol(c.enPatioDesde)}</td>
+          <td><button type="button" data-declaracion="${c.manifiestoId}">Ver detalle</button></td></tr>`,
+        "Sin carga que coincida.");
+    } catch (err) {
+      mensaje(result, `Error: ${err.message}`, false);
+    }
+  }
+
+  root.addEventListener("click", async (ev) => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    try {
+      if (b.dataset.declaracion) return abrirDetalle(`/api/autoridad/manifiestos/${b.dataset.declaracion}`);
+      if (b.dataset.otorgar) {
+        const canal = root.querySelector(`select[data-canal="${b.dataset.otorgar}"]`).value;
+        if (!canal) return mensaje(result, "Elige el canal de selectivo antes de otorgar el levante.", false);
+        if (!window.confirm(`Otorgar el levante del manifiesto ${b.dataset.otorgar} con canal ${canal}?`)) return;
+        await postJson(`/api/autoridad/manifiestos/${b.dataset.otorgar}/levante`, { otorgar: true, canal });
+        mensaje(result, `Levante otorgado (canal ${canal}).`);
+        cargarSolicitudes();
+      }
+      if (b.dataset.retener) {
+        const motivo = window.prompt("Causa de la retencion del levante (obligatoria):", "");
+        if (!motivo || !motivo.trim()) return;
+        await postJson(`/api/autoridad/manifiestos/${b.dataset.retener}/levante`, { otorgar: false, motivo_retencion: motivo });
+        mensaje(result, "Levante retenido; se aviso al transportista.");
+        cargarSolicitudes();
+      }
+      if (b.dataset.aclarar) {
+        const observacion = window.prompt("Aclarar: el turno continua. Observacion opcional:", "");
+        if (observacion === null) return;
+        await postJson(`/api/autoridad/retenciones/${b.dataset.aclarar}/resolver`,
+          { resolucion: "aclarar", observacion: observacion || null });
+        cargarRetenciones();
+      }
+      if (b.dataset.rechazar) {
+        const motivo = window.prompt("Rechazar: se anula el turno. Motivo (obligatorio):", "");
+        if (!motivo || !motivo.trim()) return;
+        await postJson(`/api/autoridad/retenciones/${b.dataset.rechazar}/resolver`, { resolucion: "rechazar", motivo });
+        cargarRetenciones();
+      }
+    } catch (err) {
+      mensaje(result, `Rechazado: ${err.message}`, false);
     }
   });
-
-  tbodyRetenciones.addEventListener("click", async (ev) => {
-    const aclararBtn = ev.target.closest("button[data-aclarar]");
-    const rechazarBtn = ev.target.closest("button[data-rechazar]");
-    if (!aclararBtn && !rechazarBtn) return;
-    try {
-      let id = 0;
-      let payload = {};
-      if (aclararBtn) {
-        id = Number(aclararBtn.dataset.aclarar);
-        payload = { resolucion: "aclarar", motivo: null, observacion: "Aclarada por autoridad" };
-      } else {
-        id = Number(rechazarBtn.dataset.rechazar);
-        const motivo = window.prompt("Motivo obligatorio para rechazar:", "");
-        if (!motivo) {
-          setResult(retencionesResult, "Rechazar requiere motivo.");
-          return;
-        }
-        payload = { resolucion: "rechazar", motivo, observacion: "Rechazo por autoridad" };
-      }
-      const data = await apiFetch(`/api/autoridad/retenciones/${id}/resolver`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      setResult(retencionesResult, data);
-      await Promise.all([loadRetenciones(), loadSolicitudes(), loadCarga()]);
-    } catch (err) {
-      setResult(retencionesResult, `Error: ${err.message}`);
-    }
+  $("autoridad-refresh-solicitudes").addEventListener("click", cargarSolicitudes);
+  $("autoridad-refresh-retenciones").addEventListener("click", cargarRetenciones);
+  $("autoridad-ret-estado").addEventListener("change", cargarRetenciones);
+  $("autoridad-filtros").addEventListener("submit", (ev) => { ev.preventDefault(); cargarCarga(); });
+  root.addEventListener("pestana", (ev) => {
+    if (ev.detail === "retenciones") cargarRetenciones();
+    else if (ev.detail === "carga") cargarCarga();
+    else cargarSolicitudes();
   });
-
-  refreshSolicitudes.addEventListener("click", () => loadSolicitudes().catch((err) => setResult(solicitudesResult, `Error: ${err.message}`)));
-  refreshRetenciones.addEventListener("click", () => loadRetenciones().catch((err) => setResult(retencionesResult, `Error: ${err.message}`)));
-  refreshCarga.addEventListener("click", () => loadCarga().catch((err) => setResult(retencionesResult, `Error: ${err.message}`)));
-
-  (async () => {
-    try {
-      await Promise.all([loadSolicitudes(), loadRetenciones(), loadCarga()]);
-    } catch (err) {
-      setResult(solicitudesResult, `Error inicial: ${err.message}`);
-    }
-  })();
+  initTabs(root);
 }
 
 initNaviera();

@@ -26,7 +26,7 @@ from typing import Optional
 
 import paho.mqtt.client as mqtt
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, URLSafeSerializer
@@ -94,6 +94,22 @@ def backend(method: str, path: str, body: Optional[dict] = None, params: Optiona
         raise HTTPException(status_code=503, detail="backend_no_disponible")
 
 
+def backend_csv(path: str, params: Optional[dict] = None) -> PlainTextResponse:
+    """Reenvia un CSV de B como descarga (Exportar historial / Exportar reporte)."""
+    url = BACKEND_URL + path
+    if params:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            texto = resp.read().decode("utf-8")
+            disposicion = resp.headers.get("Content-Disposition", 'attachment; filename="portus.csv"')
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=exc.code, detail="no_se_pudo_generar_el_csv")
+    except urllib.error.URLError:
+        raise HTTPException(status_code=503, detail="backend_no_disponible")
+    return PlainTextResponse(texto, media_type="text/csv", headers={"Content-Disposition": disposicion})
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Tiempo real: MQTT -> WebSocket (sin polling, sec. 4.1)
 # ══════════════════════════════════════════════════════════════════════════
@@ -155,6 +171,16 @@ event_bus = EventBus()
 app = FastAPI(title="PORTUS Fase 2 - Web (Persona C)")
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+
+
+def version_estaticos() -> str:
+    """?v= en los <script> y <link>: al cambiar un archivo cambia la URL y el
+    navegador no sigue usando la copia vieja de su cache (paso al probar la fase 4)."""
+    carpeta = os.path.join(os.path.dirname(__file__), "static")
+    return str(int(max(os.path.getmtime(os.path.join(carpeta, f)) for f in os.listdir(carpeta))))
+
+
+templates.env.globals["v"] = version_estaticos()
 main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
@@ -406,6 +432,49 @@ def terminal_patio(user: dict = Depends(require_role(Role.TERMINAL))):
     return {"patio": backend("GET", "/patio"), "parqueo": backend("GET", "/parqueo")}
 
 
+# ── Citas (sec. 4.7): "Ver agenda completa de citas" es solo de TERMINAL (sec. 2.3) ──
+
+@app.get("/api/terminal/citas/agenda")
+def terminal_agenda(fecha: Optional[str] = None, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/citas/agenda", params={"fecha": fecha})
+
+
+@app.get("/api/terminal/citas/{cita_id}/franjas")
+def terminal_franjas_reprogramar(cita_id: int, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", f"/citas/{cita_id}/franjas-disponibles")
+
+
+class CitaMotivoIn(BaseModel):
+    motivo: Optional[str] = None
+
+
+class ReprogramarIn(BaseModel):
+    inicio: str
+    motivo: Optional[str] = None
+
+
+@app.post("/api/terminal/citas/{cita_id}/cancelar")
+def terminal_cancelar_cita(cita_id: int, body: CitaMotivoIn, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", f"/citas/{cita_id}/cancelar", body.model_dump())
+
+
+@app.post("/api/terminal/citas/{cita_id}/reprogramar")
+def terminal_reprogramar_cita(cita_id: int, body: ReprogramarIn, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", f"/citas/{cita_id}/reprogramar", body.model_dump())
+
+
+class FranjaIn(BaseModel):
+    inicio: str
+    motivo: Optional[str] = None
+
+
+@app.post("/api/terminal/franjas/{accion}")
+def terminal_franja(accion: str, body: FranjaIn, user: dict = Depends(require_role(Role.TERMINAL))):
+    if accion not in ("bloquear", "desbloquear"):
+        raise HTTPException(status_code=400, detail="accion_invalida")
+    return backend("POST", f"/franjas/{accion}", body.model_dump())
+
+
 @app.get("/api/terminal/patio/inventario")
 def terminal_inventario(user: dict = Depends(require_role(Role.TERMINAL))):
     return backend("GET", "/patio/inventario")
@@ -444,6 +513,60 @@ def terminal_reconocer_todas(user: dict = Depends(require_role(Role.TERMINAL))):
     return backend("POST", "/alarmas/reconocer-todas")
 
 
+# ── Grua (sec. 4.5) ──
+
+@app.get("/api/terminal/grua/estado")
+def terminal_grua_estado(user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/grua/estado")
+
+
+@app.get("/api/terminal/grua/ciclos")
+def terminal_grua_ciclos(limit: int = 50, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/grua/ciclos", params={"limit": limit})
+
+
+@app.get("/api/terminal/grua/ciclos.csv")
+def terminal_grua_csv(limit: int = 50, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend_csv("/grua/ciclos.csv", {"limit": limit})
+
+
+# ── Reportes (sec. 4.8): "Generar reporte de corrida" es solo de TERMINAL ──
+
+class ReporteIn(BaseModel):
+    desde: str
+    hasta: str
+    etiqueta: str
+
+
+@app.get("/api/terminal/reportes")
+def terminal_reportes(user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/reportes")
+
+
+@app.post("/api/terminal/reportes")
+def terminal_generar_reporte(body: ReporteIn, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", "/reportes", body.model_dump())
+
+
+@app.get("/api/terminal/reportes/{corrida_id}.csv")
+def terminal_reporte_csv(corrida_id: int, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend_csv(f"/reportes/{corrida_id}.csv")
+
+
+class PoliticaIn(BaseModel):
+    politica: str
+
+
+@app.get("/api/terminal/politica-patio")
+def terminal_politica(user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/config/politica-patio")
+
+
+@app.post("/api/terminal/politica-patio")
+def terminal_cambiar_politica(body: PoliticaIn, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", "/config/politica-patio", body.model_dump())
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  API NAVIERA (solo lo propio — sec. 5.1, 5.2)
 # ══════════════════════════════════════════════════════════════════════════
@@ -480,6 +603,31 @@ def naviera_anular_manifiesto(manifiesto_id: int, user: dict = Depends(require_r
     return backend("POST", f"/manifiestos/{manifiesto_id}/anular")
 
 
+def _manifiesto_propio(manifiesto_id: int, user: dict) -> dict:
+    detalle = backend("GET", f"/manifiestos/{manifiesto_id}")
+    if detalle.get("navieraUsuarioId") != user["uid"]:
+        raise HTTPException(status_code=403, detail="El manifiesto no pertenece a esta naviera")
+    return detalle
+
+
+@app.get("/api/naviera/manifiestos/{manifiesto_id}")
+def naviera_detalle(manifiesto_id: int, user: dict = Depends(require_role(Role.NAVIERA))):
+    return _manifiesto_propio(manifiesto_id, user)
+
+
+@app.get("/api/naviera/contenedores")
+def naviera_contenedores(q: Optional[str] = None, estado_documental: Optional[str] = None,
+                         user: dict = Depends(require_role(Role.NAVIERA))):
+    # Sec. 5.2: el filtro por naviera lo pone el servidor, no el navegador
+    return backend("GET", "/carga", params={"naviera_usuario_id": user["uid"], "q": q,
+                                            "estado_documental": estado_documental})
+
+
+@app.get("/api/naviera/catalogo")
+def naviera_catalogo(user: dict = Depends(require_role(Role.NAVIERA))):
+    return [c for c in backend("GET", "/contenedores") if c["activo"]]
+
+
 @app.get("/api/naviera/transportistas")
 def naviera_transportistas(user: dict = Depends(require_role(Role.NAVIERA))):
     # Para el selector "Transportista asignado" del formulario (sec. 5.1)
@@ -507,6 +655,22 @@ def agente_declaraciones(user: dict = Depends(require_role(Role.AGENTE))):
 @app.post("/api/agente/declaraciones")
 def agente_presentar(body: DeclaracionIn, user: dict = Depends(require_role(Role.AGENTE))):
     return backend("POST", "/declaraciones", {**body.model_dump(), "agente_usuario_id": user["uid"]})
+
+
+@app.get("/api/agente/seguimiento")
+def agente_seguimiento(q: Optional[str] = None, estado: Optional[str] = None,
+                       user: dict = Depends(require_role(Role.AGENTE))):
+    return backend("GET", "/declaraciones", params={"agente_usuario_id": user["uid"], "q": q, "estado": estado})
+
+
+class ObservacionAgenteIn(BaseModel):
+    texto: str
+
+
+@app.post("/api/agente/manifiestos/{manifiesto_id}/observaciones")
+def agente_observacion(manifiesto_id: int, body: ObservacionAgenteIn, user: dict = Depends(require_role(Role.AGENTE))):
+    return backend("POST", f"/manifiestos/{manifiesto_id}/observaciones",
+                   {"texto": body.texto, "agente_usuario_id": user["uid"]})
 
 
 @app.post("/api/agente/manifiestos/{manifiesto_id}/solicitar-levante")
@@ -547,8 +711,15 @@ def autoridad_resolver(retencion_id: int, body: ResolverIn, user: dict = Depends
 
 
 @app.get("/api/autoridad/carga")
-def autoridad_carga(user: dict = Depends(require_role(Role.AUTORIDAD))):
-    return backend("GET", "/manifiestos")
+def autoridad_carga(q: Optional[str] = None, naviera: Optional[str] = None, estado_documental: Optional[str] = None,
+                    user: dict = Depends(require_role(Role.AUTORIDAD))):
+    # Sec. 5.7: cualquier contenedor, sin restriccion de propietario
+    return backend("GET", "/carga", params={"q": q, "naviera": naviera, "estado_documental": estado_documental})
+
+
+@app.get("/api/autoridad/manifiestos/{manifiesto_id}")
+def autoridad_ver_declaracion(manifiesto_id: int, user: dict = Depends(require_role(Role.AUTORIDAD))):
+    return backend("GET", f"/manifiestos/{manifiesto_id}")
 
 
 # ══════════════════════════════════════════════════════════════════════════

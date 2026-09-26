@@ -31,7 +31,7 @@
     <div class="sin-el" data-el="espera" data-dev="UNO_ENTRADA">
       <div class="sin-tit">Zona de espera</div>
       <div class="sin-val" id="el-espera">-</div>
-      <div class="sin-sub">vehiculos autorizados esperando el pesaje</div>
+      <div class="sin-sub">vehiculos dentro esperando el pesaje o la grua</div>
     </div>
     <div class="sin-flecha">&rarr;</div>
     <div class="sin-el" data-el="garita" data-dev="UNO_ENTRADA">
@@ -87,7 +87,7 @@
     </div>
   </div>
   <p class="muted">Se actualiza por suscripcion (MQTT &rarr; WebSocket), sin consultas periodicas.
-    Transferencia, zona de espera y cola de grua se deducen de los turnos hasta que la grua informe sus eventos (fase 5).</p>
+    Zona de espera y cola de grua salen de los turnos; la transferencia, de los eventos de la grua.</p>
 </section>
 
 <section class="panel tab-panel" data-tab-panel="operacion">
@@ -125,16 +125,6 @@
 <section class="panel tab-panel" data-tab-panel="operacion">
   <h2>Eventos recientes</h2>
   <div id="event-log" class="event-log"></div>
-</section>
-
-<section class="panel tab-panel" data-tab-panel="operacion">
-  <h2>Vinculacion Bot Transportista</h2>
-  <div class="inline-form">
-    <select id="transportista-select"></select>
-    <button id="refresh-transportistas" type="button">Actualizar lista</button>
-    <button id="generate-link-code" type="button">Generar codigo</button>
-  </div>
-  <p id="link-code-result" class="resultado"></p>
 </section>
 
 <!-- ═══════════════════════ 2. Turnos ═══════════════════════ -->
@@ -224,10 +214,42 @@
     <div><strong>Posicion:</strong> <span id="grua-pos">-</span></div>
     <div><strong>Suspendida:</strong> <span id="grua-susp">-</span></div>
     <div><strong>Mantenimiento:</strong> <span id="grua-mant">-</span></div>
+    <div><strong>Trabajo en ejecucion:</strong> <span id="grua-trabajo">-</span></div>
   </div>
-  <h3>Eventos recibidos</h3>
-  <div class="table-wrap"><table class="data-table" id="tabla-grua"></table></div>
-  <p class="muted">Historial, grafica de tiempos de ciclo y exportar CSV: fase 5 (el Mega todavia solo informa su estado).</p>
+  <h3>Cola de trabajos (orden de atencion)</h3>
+  <div class="table-wrap"><table class="data-table" id="tabla-grua-cola"></table></div>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="grua">
+  <div class="sin-header">
+    <h2>Tiempo de ciclo</h2>
+    <div class="filtros">
+      <label>Rango
+        <select id="grua-rango">
+          <option value="50">Ultimas 50</option>
+          <option value="100">Ultimas 100</option>
+          <option value="200">Ultimas 200</option>
+        </select>
+      </label>
+      <button type="button" id="grua-exportar">Exportar historial (CSV)</button>
+    </div>
+  </div>
+  <div class="status-grid">
+    <div><strong>Ciclos completados:</strong> <span id="grua-completados">-</span></div>
+    <div><strong>Tiempo promedio de ciclo:</strong> <span id="grua-promedio">-</span></div>
+  </div>
+  <div id="grua-grafica" class="grafica"></div>
+  <h3>Historial de operaciones</h3>
+  <div class="table-wrap tabla-alta"><table class="data-table" id="tabla-grua-ciclos"></table></div>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="grua">
+  <h2>Fallas</h2>
+  <p class="muted">Perdida de referencia (AL03), agarre no confirmado (AL05), trabajo abortado (AL06), perdida de carga (AL04),
+    inconsistencia de altura (AL07) y movimiento del vehiculo (AL08).</p>
+  <div class="table-wrap"><table class="data-table" id="tabla-grua-fallas"></table></div>
+  <h3>Eventos recibidos en esta sesion</h3>
+  <div class="table-wrap tabla-alta"><table class="data-table" id="tabla-grua"></table></div>
 </section>
 
 <!-- ═══════════════════════ 6. Alarmas ═══════════════════════ -->
@@ -251,21 +273,69 @@
   <div class="table-wrap"><table class="data-table" id="tabla-alarmas-historicas"></table></div>
 </section>
 
-<!-- ═══════════════════════ 7. Citas / 8. Reportes ═══════════════════════ -->
+<!-- ═══════════════════════ 7. Citas ═══════════════════════ -->
 <section class="panel tab-panel hidden" data-tab-panel="citas">
-  <h2>Citas</h2>
-  <p class="muted">Agenda del dia, franjas bloqueadas y cancelar / reprogramar: fase 4.</p>
+  <div class="sin-header">
+    <h2>Agenda de citas</h2>
+    <div class="sin-status">
+      <span>Cumplimiento del dia: <strong id="citas-cumplimiento" class="chip">-</strong></span>
+      <span>Citas: <strong id="citas-total">-</strong></span>
+    </div>
+  </div>
+  <div class="filtros">
+    <label>Fecha <input type="date" id="citas-fecha" /></label>
+    <label class="check"><input type="checkbox" id="citas-solo-ocupadas" /> Solo franjas con citas o bloqueadas</label>
+  </div>
+  <p class="muted">Franjas de 15 minutos, 2 citas por franja. El transportista pide la cita por el bot;
+    el cumplimiento cuenta las citas cuya ventana ya se evaluo (cumplidas / cumplidas + vencidas).</p>
+  <div class="table-wrap"><table class="data-table" id="tabla-agenda"></table></div>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="citas">
+  <h2>Vinculacion Bot Transportista</h2>
+  <div class="inline-form">
+    <select id="transportista-select"></select>
+    <button id="refresh-transportistas" type="button">Actualizar lista</button>
+    <button id="generate-link-code" type="button">Generar codigo</button>
+  </div>
+  <p id="link-code-result" class="resultado"></p>
+</section>
+
+<!-- ═══════════════════════ 8. Reportes ═══════════════════════ -->
+
+<section class="panel tab-panel hidden" data-tab-panel="reportes">
+  <h2>Reporte de corrida</h2>
+  <form id="form-reporte" class="filtros">
+    <label>Etiqueta de corrida <input name="etiqueta" required placeholder="corrida de evaluacion" /></label>
+    <label>Desde <input type="datetime-local" name="desde" required /></label>
+    <label>Hasta <input type="datetime-local" name="hasta" required /></label>
+    <button type="submit">Generar</button>
+  </form>
+  <div class="filtros">
+    <label>Politica de asignacion de posiciones (sec. 13) <select id="politica-patio"></select></label>
+  </div>
+  <div id="reporte-resultado"></div>
 </section>
 
 <section class="panel tab-panel hidden" data-tab-panel="reportes">
-  <h2>Reportes</h2>
-  <p class="muted">Metricas de la corrida y exportar CSV: fase 5.</p>
+  <h2>Corridas guardadas</h2>
+  <div class="table-wrap"><table class="data-table" id="tabla-corridas"></table></div>
 </section>
 
 <!-- ═══════════════════════ Dialogos ═══════════════════════ -->
 <dialog id="dlg-turno" class="dialogo">
   <form method="dialog"><button class="cerrar" aria-label="Cerrar">&times;</button></form>
   <div id="dlg-turno-body"></div>
+</dialog>
+
+<dialog id="dlg-reprogramar" class="dialogo">
+  <form method="dialog"><button class="cerrar" aria-label="Cerrar">&times;</button></form>
+  <h2 id="dlg-reprogramar-titulo">Reprogramar cita</h2>
+  <form id="form-reprogramar" class="filtros">
+    <label>Nueva franja (solo con capacidad y sin bloqueo) <select name="inicio" id="reprogramar-franja" required></select></label>
+    <label>Motivo (opcional) <input name="motivo" /></label>
+    <button type="submit">Reprogramar y avisar al transportista</button>
+  </form>
 </dialog>
 
 <dialog id="dlg-posicion" class="dialogo">
@@ -276,6 +346,6 @@
 <script>
   window.PORTUS_WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + window.location.host + "/ws/terminal";
 </script>
-<script src="/static/roles.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/roles.js?v={{ v }}"></script>
+<script src="/static/app.js?v={{ v }}"></script>
 {% endblock %}

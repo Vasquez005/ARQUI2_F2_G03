@@ -114,6 +114,32 @@ de 64. Si el comando llega mientras el loop esta bloqueado (por ejemplo en el
 garita termina en "Sin respuesta". Si pasa en las pruebas: quitar el
 `Serial.flush()` de `sendFrame` en la entrada o acortar los parametros.
 
+## Grua (fase 5)
+
+El servidor asigna el trabajo y la grua informa cada paso. Sin `TrabajoGrua`,
+la grua sigue funcionando en modo local (consola `DEPOSITO` / `RETIRO`).
+
+| Momento | Frame |
+| --- | --- |
+| Servidor asigna el trabajo | `CMD cmd name=TrabajoGrua;target=MEGA_GRUA;op=DEPOSITO;pos=2` (`pos` opcional) |
+| Grua lo rechaza | `REJ cmd name=TrabajoGrua;causa=modo_mantenimiento` (o `trabajo_en_curso`, `op_invalida`) |
+| Camion estable en la transferencia | `EVT transferencia evento=alineado` |
+| Empieza el trabajo | `EVT grua evt=trabajo_inicio;op=DEPOSITO;pos=2` |
+| Sin posicion util | `EVT grua evt=sin_posicion;op=DEPOSITO` |
+| Deposito confirmado por el sensor | `EVT patio evento=deposito;pos=2` |
+| Contenedor tomado de la celda | `EVT patio evento=retiro;pos=3` |
+| Fin del trabajo | `EVT grua evt=trabajo_fin;op=DEPOSITO;pos=2;ms=15300;tramos=4` |
+| Aborto | `EVT transferencia evento=aborto;causa=camion_movido` + `EVT alarma codigo=AL08;...` + `EVT alarma codigo=AL06;...` |
+
+- `pos`: si el servidor la manda y la celda sirve (libre para depositar,
+  ocupada para retirar), la grua la usa; si no, aplica la politica de la fase 1.
+- `tramos`: marcas del riel cruzadas durante el trabajo (distancia de la sec. 13).
+- Causas de aborto y su alarma: `sin_referencia` / `sin_marca` -> AL03,
+  `deposito_no_confirmado` -> AL07, `camion_movido` -> AL08; todo aborto de un
+  trabajo en curso ademas genera AL06.
+- El inventario del servidor solo cambia con `patio evento=deposito|retiro`
+  (regla R09). El nivel 2 es logico: las remociones las registra el servidor.
+
 ## Alarmas desde las placas (fase 2)
 
 Una placa reporta una alarma con un `EVT` de topico `alarma`; el bridge lo

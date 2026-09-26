@@ -2,22 +2,25 @@ import json
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 
+import grua
 import orquestador
+import reportes
 import servicios
 from catalogos import (
-    CAUSAS_RETENCION, ESTADOS_FINALES, ROL_FACULTADO_POR_CAUSA, DISPOSITIVOS, MINUTOS_EXPIRA_CODIGO, ROLES, SEGUNDOS_REVISION_ALARMAS,
+    CAUSAS_RETENCION, CONTENEDORES_MAQUETA, ESTADOS_FINALES, POLITICAS_PATIO, ROL_FACULTADO_POR_CAUSA, DISPOSITIVOS, MINUTOS_EXPIRA_CODIGO, ROLES, SEGUNDOS_REVISION_ALARMAS,
     UMBRAL_ENLACE_PERDIDO_S,
 )
 from models import (
-    Alarma, CommandAudit, Declaracion, EventLog, EventoTurno, IntentoIngreso, LinkDevice,
+    Alarma, Cita, CommandAudit, ContenedorCatalogo, Corrida, Declaracion, GruaCiclo, ManifiestoEvento, EventLog, EventoTurno, IntentoIngreso, LinkDevice,
     LinkStatus, Manifiesto, ParqueoPlaza, PosicionPatio, Retencion, Turno,
     Transportista, Usuario, Vehiculo, make_db,
 )
@@ -51,6 +54,9 @@ def seed_minimo(db) -> None:
     for d in DISPOSITIVOS:
         if not db.get(LinkDevice, d):
             db.add(LinkDevice(device=d, connected=False, last_heartbeat_ts=0))
+    for c in CONTENEDORES_MAQUETA:
+        if not db.get(ContenedorCatalogo, c):
+            db.add(ContenedorCatalogo(contenedor_id=c, descripcion="Contenedor de la maqueta"))
     db.commit()
 
 
@@ -162,8 +168,12 @@ def on_message(client, userdata, msg):
     if topic == "portus/cmd/respuesta":
         # Auditoria del comando y, si fue REJ, AL14 con la causa (sec. 11.2)
         with SessionLocal() as db:
-            servicios.registrar_respuesta_comando(db, origin, evt_type, payload.get("data", {}),
+            datos = payload.get("data", {})
+            servicios.registrar_respuesta_comando(db, origin, evt_type, datos,
                                                   json.dumps(payload, ensure_ascii=False))
+            if evt_type == "ACK" and datos.get("name") in ("GruaReanudar", "ModoMantenimiento"):
+                # La grua vuelve a admitir trabajos: sigue la cola (E13)
+                grua.despachar_trabajo(db, make_publish_and_audit(db))
             db.commit()
 
 
@@ -344,6 +354,90 @@ def listar_transportistas():
         return [{"id": t.id, "nombre": t.nombre, "vinculado": t.chat_id is not None} for t in rows]
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Citas (sec. 4.7 y 9). El transportista las pide por el bot; la terminal
+#  ve la agenda, cancela, reprograma y bloquea franjas.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _fecha_hora(valor: str) -> datetime:
+    """Inicio de franja en UTC tal como lo devuelve la agenda (ISO sin zona)."""
+    try:
+        dt = datetime.fromisoformat(valor.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(400, "inicio_invalido")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+@app.get("/citas/agenda")
+def agenda_citas(fecha: Optional[str] = None):
+    fecha = fecha or servicios.hora_local(datetime.utcnow(), "%Y-%m-%d")
+    with SessionLocal() as db:
+        try:
+            return servicios.agenda_del_dia(db, fecha)
+        except ValueError:
+            raise HTTPException(400, "fecha_invalida_usar_YYYY-MM-DD")
+
+
+@app.get("/citas/{cita_id}/franjas-disponibles")
+def franjas_para_reprogramar(cita_id: int, cantidad: int = 12):
+    with SessionLocal() as db:
+        if not db.get(Cita, cita_id):
+            raise HTTPException(404, "cita_no_existe")
+        franjas = servicios.proximas_franjas(db, datetime.utcnow(), cantidad, excluir_cita_id=cita_id)
+        return [{"inicio": i.isoformat(), "texto": servicios.texto_franja(i, f)} for i, f in franjas]
+
+
+class CitaMotivoIn(BaseModel):
+    motivo: Optional[str] = None
+
+
+class ReprogramarIn(BaseModel):
+    inicio: str
+    motivo: Optional[str] = None
+
+
+class FranjaIn(BaseModel):
+    inicio: str
+    motivo: Optional[str] = None
+
+
+def _ejecutar(accion):
+    with SessionLocal() as db:
+        try:
+            resultado = accion(db)
+        except servicios.ReglaDeNegocioError as exc:
+            db.rollback()
+            raise HTTPException(409, str(exc))
+        db.commit()
+        return resultado
+
+
+@app.post("/citas/{cita_id}/cancelar")
+def cancelar_cita(cita_id: int, body: CitaMotivoIn):
+    return _ejecutar(lambda db: {"ok": True, "estado": servicios.cancelar_cita(db, cita_id, body.motivo).estado})
+
+
+@app.post("/citas/{cita_id}/reprogramar")
+def reprogramar_cita(cita_id: int, body: ReprogramarIn):
+    inicio = _fecha_hora(body.inicio)
+    return _ejecutar(lambda db: {"ok": True,
+                                 "inicio": servicios.reprogramar_cita(db, cita_id, inicio, body.motivo).inicio.isoformat()})
+
+
+@app.post("/franjas/bloquear")
+def bloquear_franja(body: FranjaIn):
+    inicio = _fecha_hora(body.inicio)
+    return _ejecutar(lambda db: {"ok": True, "inicio": servicios.bloquear_franja(db, inicio, body.motivo).inicio.isoformat()})
+
+
+@app.post("/franjas/desbloquear")
+def desbloquear_franja(body: FranjaIn):
+    inicio = _fecha_hora(body.inicio)
+    return _ejecutar(lambda db: servicios.desbloquear_franja(db, inicio) or {"ok": True})
+
+
 @app.post("/transportistas/{transportista_id}/codigo-vinculacion")
 def generar_codigo_vinculacion(transportista_id: int):
     with SessionLocal() as db:
@@ -395,37 +489,160 @@ def crear_manifiesto(body: ManifiestoIn):
         raise HTTPException(400, "tipo_operacion_invalida")
     if body.peso_declarado_g <= 0:
         raise HTTPException(400, "peso_declarado_debe_ser_mayor_a_cero")
+    contenedor = body.contenedor_id.strip().upper()
     with SessionLocal() as db:
-        if _tiene_manifiesto_pendiente(db, body.contenedor_id):
+        catalogo = db.get(ContenedorCatalogo, contenedor)
+        if catalogo is None or not catalogo.activo:
+            # Sec. 5.1: debe existir en el catalogo de contenedores de la maqueta
+            raise HTTPException(400, "contenedor_no_existe_en_el_catalogo_de_la_maqueta")
+        if _tiene_manifiesto_pendiente(db, contenedor):
             raise HTTPException(409, "el_contenedor_ya_tiene_un_manifiesto_pendiente")
+        if body.transportista_id is not None and not db.get(Transportista, body.transportista_id):
+            raise HTTPException(404, "transportista_no_existe")
         datos = body.model_dump()
+        datos["contenedor_id"] = contenedor
         datos["vehiculo_uid"] = servicios.normalizar_uid(datos["vehiculo_uid"]) or None
         m = Manifiesto(**datos)
         db.add(m)
+        db.flush()
+        servicios.registrar_evento_manifiesto(db, m.id, "naviera", "Manifiesto declarado",
+                                              {"peso_g": m.peso_declarado_g, "tolerancia_pct": m.tolerancia_pct,
+                                               "operacion": m.tipo_operacion})
         db.commit()
         db.refresh(m)
         return {"id": m.id}
 
 
+def _manifiesto_dict(db, m: Manifiesto, usuarios: dict, transportistas: dict) -> dict:
+    decl = db.scalars(select(Declaracion).where(Declaracion.manifiesto_id == m.id)
+                      .order_by(Declaracion.id.desc())).first()
+    return {
+        "id": m.id, "contenedorId": m.contenedor_id, "tipoOperacion": m.tipo_operacion,
+        "pesoDeclaradoG": m.peso_declarado_g, "toleranciaPct": m.tolerancia_pct,
+        "estadoDocumental": m.estado_documental, "canal": m.canal, "anulado": m.anulado,
+        "navieraUsuarioId": m.naviera_usuario_id, "navieraNombre": usuarios.get(m.naviera_usuario_id),
+        "transportistaId": m.transportista_id, "transportistaNombre": transportistas.get(m.transportista_id),
+        "vehiculoUid": m.vehiculo_uid, "motivoLevante": m.motivo_levante,
+        "pesoDeclaradoAnteriorG": m.peso_declarado_anterior_g, "observaciones": m.observaciones,
+        "declaracionId": decl.id if decl else None, "numeroDeclaracion": decl.numero_declaracion if decl else None,
+        "agenteNombre": usuarios.get(decl.agente_usuario_id) if decl else None,
+        "estadoOperativo": reportes.estado_operativo(db, m)["estadoOperativo"],
+        "createdAt": m.created_at.isoformat(),
+    }
+
+
+def _nombres(db) -> tuple:
+    usuarios = {u.id: (u.nombre or u.username) for u in db.scalars(select(Usuario)).all()}
+    return usuarios, _nombres_transportistas(db)
+
+
 @app.get("/manifiestos")
-def listar_manifiestos(naviera_usuario_id: Optional[int] = None, contenedor_id: Optional[str] = None):
+def listar_manifiestos(naviera_usuario_id: Optional[int] = None, contenedor_id: Optional[str] = None,
+                       estado_documental: Optional[str] = None):
     with SessionLocal() as db:
         q = select(Manifiesto)
         if naviera_usuario_id is not None:
             q = q.where(Manifiesto.naviera_usuario_id == naviera_usuario_id)
         if contenedor_id is not None:
             q = q.where(Manifiesto.contenedor_id == contenedor_id)
+        if estado_documental:
+            q = q.where(Manifiesto.estado_documental == estado_documental)
         rows = db.scalars(q.order_by(Manifiesto.id.desc())).all()
-        return [
-            {"id": m.id, "contenedorId": m.contenedor_id, "tipoOperacion": m.tipo_operacion,
-             "pesoDeclaradoG": m.peso_declarado_g, "toleranciaPct": m.tolerancia_pct,
-             "estadoDocumental": m.estado_documental, "canal": m.canal, "anulado": m.anulado,
-             "navieraUsuarioId": m.naviera_usuario_id, "transportistaId": m.transportista_id,
-             "vehiculoUid": m.vehiculo_uid,
-             "pesoDeclaradoAnteriorG": m.peso_declarado_anterior_g, "observaciones": m.observaciones,
-             "createdAt": m.created_at.isoformat()}
-            for m in rows
-        ]
+        usuarios, transportistas = _nombres(db)
+        return [_manifiesto_dict(db, m, usuarios, transportistas) for m in rows]
+
+
+@app.get("/manifiestos/{manifiesto_id}")
+def detalle_manifiesto(manifiesto_id: int):
+    """Sec. 5.1 Ver detalle y 5.5 Ver declaracion: el manifiesto completo, su
+    declaracion, su historial, sus turnos y las observaciones del agente."""
+    with SessionLocal() as db:
+        m = db.get(Manifiesto, manifiesto_id)
+        if not m:
+            raise HTTPException(404, "manifiesto_no_existe")
+        usuarios, transportistas = _nombres(db)
+        datos = _manifiesto_dict(db, m, usuarios, transportistas)
+        datos.update(reportes.estado_operativo(db, m))
+        decl = db.get(Declaracion, datos["declaracionId"]) if datos["declaracionId"] else None
+        datos["declaracion"] = None if decl is None else {
+            "id": decl.id, "numero": decl.numero_declaracion, "regimen": decl.regimen,
+            "descripcion": decl.descripcion, "valorDeclarado": decl.valor_declarado,
+            "agente": usuarios.get(decl.agente_usuario_id), "createdAt": decl.created_at.isoformat(),
+        }
+        eventos = db.scalars(select(ManifiestoEvento).where(ManifiestoEvento.manifiesto_id == m.id)
+                             .order_by(ManifiestoEvento.ts, ManifiestoEvento.id)).all()
+        datos["historial"] = [{"ts": e.ts.isoformat(), "origen": e.origen, "tipo": e.tipo,
+                               "descripcion": e.descripcion, "valores": json.loads(e.valores_json)} for e in eventos]
+        datos["observacionesAgente"] = [h for h in datos["historial"] if h["tipo"] == "observacion"]
+        datos["turnos"] = [_turno_dict(t, transportistas) for t in db.scalars(
+            select(Turno).where(Turno.manifiesto_id == m.id).order_by(Turno.id)).all()]
+        return datos
+
+
+class ObservacionManifiestoIn(BaseModel):
+    texto: str
+    agente_usuario_id: Optional[int] = None
+
+
+@app.post("/manifiestos/{manifiesto_id}/observaciones")
+def adjuntar_observacion(manifiesto_id: int, body: ObservacionManifiestoIn):
+    """Sec. 5.3 Adjuntar observacion: nota documental visible para la autoridad."""
+    texto = body.texto.strip()
+    if not texto:
+        raise HTTPException(400, "observacion_vacia")
+    with SessionLocal() as db:
+        m = db.get(Manifiesto, manifiesto_id)
+        if not m:
+            raise HTTPException(404, "manifiesto_no_existe")
+        autor = db.get(Usuario, body.agente_usuario_id) if body.agente_usuario_id else None
+        servicios.registrar_evento_manifiesto(db, m.id, "agente", texto,
+                                              {"agente": autor.nombre or autor.username if autor else None},
+                                              tipo="observacion")
+        db.commit()
+        return {"ok": True}
+
+
+@app.get("/contenedores")
+def catalogo_contenedores():
+    with SessionLocal() as db:
+        return [{"contenedorId": c.contenedor_id, "descripcion": c.descripcion, "activo": c.activo}
+                for c in db.scalars(select(ContenedorCatalogo).order_by(ContenedorCatalogo.contenedor_id)).all()]
+
+
+@app.get("/carga")
+def consulta_carga(naviera_usuario_id: Optional[int] = None, q: Optional[str] = None,
+                   naviera: Optional[str] = None, estado_documental: Optional[str] = None):
+    """Sec. 5.2 (naviera, solo lo propio) y 5.7 (autoridad, todo): ubicacion,
+    estado, autorizacion y reloj de permanencia de cada contenedor."""
+    with SessionLocal() as db:
+        return reportes.estado_de_carga(db, naviera_usuario_id, q, naviera, estado_documental)
+
+
+@app.get("/declaraciones")
+def seguimiento_declaraciones(agente_usuario_id: Optional[int] = None, q: Optional[str] = None,
+                              estado: Optional[str] = None):
+    """Sec. 5.4 Seguimiento: pendiente, autorizada o retenida, con canal y motivo."""
+    with SessionLocal() as db:
+        query = select(Declaracion).order_by(Declaracion.id.desc())
+        if agente_usuario_id is not None:
+            query = query.where(Declaracion.agente_usuario_id == agente_usuario_id)
+        usuarios, _ = _nombres(db)
+        filas = []
+        for d in db.scalars(query).all():
+            m = db.get(Manifiesto, d.manifiesto_id)
+            situacion = {"levante_otorgado": "autorizada", "levante_retenido": "retenida"}.get(
+                m.estado_documental if m else "", "pendiente")
+            if q and q.strip().upper() not in d.numero_declaracion.upper():
+                continue
+            if estado and situacion != estado:
+                continue
+            filas.append({"id": d.id, "numeroDeclaracion": d.numero_declaracion, "manifiestoId": d.manifiesto_id,
+                          "contenedorId": m.contenedor_id if m else None, "regimen": d.regimen,
+                          "estadoDocumental": m.estado_documental if m else None, "situacion": situacion,
+                          "canal": m.canal if m else None, "motivoRetencion": m.motivo_levante if m else None,
+                          "naviera": usuarios.get(m.naviera_usuario_id) if m else None,
+                          "createdAt": d.created_at.isoformat()})
+        return filas
 
 
 @app.post("/manifiestos/{manifiesto_id}/anular")
@@ -438,6 +655,7 @@ def anular_manifiesto(manifiesto_id: int):
         if turno is not None:
             raise HTTPException(409, "el_manifiesto_ya_tiene_turno_asociado")
         m.anulado = True
+        servicios.registrar_evento_manifiesto(db, m.id, "naviera", "Manifiesto anulado")
         db.commit()
         return {"ok": True}
 
@@ -465,9 +683,15 @@ def presentar_declaracion(body: DeclaracionIn):
             raise HTTPException(404, "manifiesto_no_existe")
         if m.estado_documental != "declarado":
             raise HTTPException(409, "el_manifiesto_no_esta_en_estado_declarado")
-        d = Declaracion(**body.model_dump())
+        numero = body.numero_declaracion.strip()
+        if db.scalars(select(Declaracion.id).where(Declaracion.numero_declaracion == numero)).first():
+            # Sec. 5.3: unico en el sistema (antes explotaba con un error 500 de la base)
+            raise HTTPException(409, "numero_de_declaracion_ya_existe")
+        d = Declaracion(**{**body.model_dump(), "numero_declaracion": numero})
         db.add(d)
         m.estado_documental = "declaracion_presentada"
+        servicios.registrar_evento_manifiesto(db, m.id, "agente", f"Declaracion {numero} presentada",
+                                              {"regimen": body.regimen, "valor": body.valor_declarado})
         db.commit()
         db.refresh(d)
         return {"id": d.id}
@@ -482,6 +706,7 @@ def solicitar_levante(manifiesto_id: int):
         if m.estado_documental != "declaracion_presentada":
             raise HTTPException(409, "falta_presentar_la_declaracion")
         m.estado_documental = "levante_solicitado"
+        servicios.registrar_evento_manifiesto(db, m.id, "agente", "Levante solicitado a la autoridad")
         db.commit()
         return {"ok": True}
 
@@ -505,6 +730,9 @@ def resolver_levante(manifiesto_id: int, body: LevanteIn):
                 raise HTTPException(400, "canal_obligatorio_al_otorgar")
             m.estado_documental = "levante_otorgado"
             m.canal = body.canal
+            m.motivo_levante = None
+            servicios.registrar_evento_manifiesto(db, m.id, "autoridad",
+                                                  f"Levante otorgado, canal {body.canal}", {"canal": body.canal})
             texto = (f"PORTUS: levante OTORGADO para el contenedor {m.contenedor_id}.\n"
                      f"Canal asignado: {body.canal.upper()}")
             if body.canal == "rojo":
@@ -516,7 +744,9 @@ def resolver_levante(manifiesto_id: int, body: LevanteIn):
             if not body.motivo_retencion:
                 raise HTTPException(400, "motivo_obligatorio_al_retener")
             m.estado_documental = "levante_retenido"
-            m.observaciones = (m.observaciones or "") + f"\n[levante retenido] {body.motivo_retencion}"
+            m.motivo_levante = body.motivo_retencion
+            servicios.registrar_evento_manifiesto(db, m.id, "autoridad", "Levante retenido",
+                                                  {"motivo": body.motivo_retencion})
             servicios.encolar_notificacion(
                 db, m.transportista_id, "levante_retenido",
                 f"PORTUS: levante RETENIDO para el contenedor {m.contenedor_id}.\n"
@@ -977,3 +1207,135 @@ def reconocer_todas_endpoint():
         n = servicios.reconocer_todas_media_baja(db)
         db.commit()
         return {"ok": True, "reconocidas": n}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Grua (sec. 4.5): historial de ciclos, tiempos, fallas y CSV
+# ══════════════════════════════════════════════════════════════════════════
+
+def _ultimos_ciclos(db, limit: int) -> list:
+    if limit not in (50, 100, 200):
+        raise HTTPException(400, "rango_valido_50_100_200")
+    return db.scalars(select(GruaCiclo).order_by(GruaCiclo.id.desc()).limit(limit)).all()
+
+
+@app.get("/grua/ciclos")
+def ciclos_grua(limit: int = 50):
+    """Ultimas N operaciones (50, 100 o 200) con su tiempo de ciclo."""
+    with SessionLocal() as db:
+        ciclos = _ultimos_ciclos(db, limit)
+        completados = [c for c in ciclos if c.resultado == "completado" and c.tipo != "REMOCION"]
+        tiempos = [c.duracion_ms for c in completados if c.duracion_ms is not None]
+        return {
+            "ciclos": [grua.ciclo_dict(c) for c in reversed(ciclos)],
+            "completados": len(completados),
+            "promedioS": round(sum(tiempos) / len(tiempos) / 1000, 1) if tiempos else None,
+        }
+
+
+@app.get("/grua/ciclos.csv", response_class=PlainTextResponse)
+def ciclos_grua_csv(limit: int = 50):
+    with SessionLocal() as db:
+        texto = reportes.csv_ciclos(list(reversed(_ultimos_ciclos(db, limit))))
+    return PlainTextResponse(texto, media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="grua_ultimos_{limit}.csv"'})
+
+
+CODIGOS_FALLA_GRUA = ("AL02", "AL03", "AL04", "AL05", "AL06", "AL07", "AL08")
+
+
+@app.get("/grua/estado")
+def estado_grua():
+    """Trabajo en curso, cola de trabajos (orden de atencion) y fallas recientes."""
+    with SessionLocal() as db:
+        en_curso = grua.ciclo_en_curso(db)
+        cola = db.scalars(select(Turno).where(Turno.estado == "EnRuta").order_by(Turno.id)).all()
+        fallas = db.scalars(select(Alarma).where(Alarma.codigo.in_(CODIGOS_FALLA_GRUA))
+                            .order_by(Alarma.id.desc()).limit(50)).all()
+        abortados = db.scalars(select(GruaCiclo).where(GruaCiclo.resultado == "abortado")
+                               .order_by(GruaCiclo.id.desc()).limit(50)).all()
+        return {
+            "trabajoEnCurso": grua.ciclo_dict(en_curso) if en_curso else None,
+            "cola": [{"orden": i + 1, "turnoId": t.id, "tipo": t.tipo_operacion, "contenedorId": t.contenedor_id,
+                      "vehiculoUid": t.vehiculo_uid, "enviadoALaGrua": t.trabajo_grua_at is not None}
+                     for i, t in enumerate(cola)],
+            "fallas": [orquestador.alarma_dict(a) for a in fallas],
+            "abortados": [grua.ciclo_dict(c) for c in abortados],
+            "politicaPatio": grua.politica_patio(db),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Politica de asignacion de posiciones (sec. 13, modo seleccionable)
+# ══════════════════════════════════════════════════════════════════════════
+
+class PoliticaIn(BaseModel):
+    politica: str
+
+
+@app.get("/config/politica-patio")
+def ver_politica_patio():
+    with SessionLocal() as db:
+        return {"politica": grua.politica_patio(db), "disponibles": POLITICAS_PATIO}
+
+
+@app.post("/config/politica-patio")
+def cambiar_politica_patio(body: PoliticaIn):
+    return _ejecutar(lambda db: grua.cambiar_politica_patio(db, body.politica) or {"ok": True, "politica": body.politica})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Reportes de corrida (sec. 4.8 y 13)
+# ══════════════════════════════════════════════════════════════════════════
+
+class ReporteIn(BaseModel):
+    desde: str  # hora local, "YYYY-MM-DDTHH:MM" (input datetime-local)
+    hasta: str
+    etiqueta: str
+
+
+def _local(valor: str) -> datetime:
+    try:
+        return servicios.local_a_utc(datetime.fromisoformat(valor))
+    except ValueError:
+        raise HTTPException(400, "fecha_invalida_usar_YYYY-MM-DDTHH:MM")
+
+
+def _corrida_dict(c: Corrida) -> dict:
+    return {"id": c.id, "etiqueta": c.etiqueta, "desde": c.desde.isoformat(), "hasta": c.hasta.isoformat(),
+            "politicaPatio": c.politica_patio, "createdAt": c.created_at.isoformat(),
+            "metricas": json.loads(c.metricas_json)}
+
+
+@app.post("/reportes")
+def generar_reporte(body: ReporteIn):
+    """Calcula las 8 metricas del rango y guarda la corrida con su etiqueta."""
+    desde, hasta = _local(body.desde), _local(body.hasta)
+    if hasta <= desde:
+        raise HTTPException(400, "el_rango_debe_terminar_despues_de_empezar")
+    etiqueta = body.etiqueta.strip() or "corrida sin nombre"
+    with SessionLocal() as db:
+        corrida = Corrida(etiqueta=etiqueta, desde=desde, hasta=hasta, politica_patio=grua.politica_patio(db),
+                          metricas_json=json.dumps(reportes.calcular_metricas(db, desde, hasta)))
+        db.add(corrida)
+        db.commit()
+        return _corrida_dict(corrida)
+
+
+@app.get("/reportes")
+def listar_reportes():
+    with SessionLocal() as db:
+        return [_corrida_dict(c) for c in db.scalars(select(Corrida).order_by(Corrida.id.desc())).all()]
+
+
+@app.get("/reportes/{corrida_id}.csv", response_class=PlainTextResponse)
+def reporte_csv(corrida_id: int):
+    with SessionLocal() as db:
+        c = db.get(Corrida, corrida_id)
+        if not c:
+            raise HTTPException(404, "reporte_no_existe")
+        texto = reportes.csv_reporte(c.etiqueta, c.desde, c.hasta, c.politica_patio, json.loads(c.metricas_json),
+                                     reportes.detalle_turnos(db, c.desde, c.hasta))
+    nombre = "".join(ch if ch.isalnum() else "_" for ch in c.etiqueta)[:40]
+    return PlainTextResponse(texto, media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="reporte_{c.id}_{nombre}.csv"'})

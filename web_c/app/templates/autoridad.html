@@ -1,68 +1,65 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Interfaz AUTORIDAD</h1>
-<div id="autoridad-root">
+<div id="autoridad-root" class="rol-root">
   <section class="panel">
-    <h2>Solicitudes de levante</h2>
-    <button type="button" id="autoridad-refresh-solicitudes">Actualizar solicitudes</button>
-    <div class="table-wrap">
-      <table id="autoridad-table-solicitudes" class="data-table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Contenedor</th>
-            <th>Operacion</th>
-            <th>Estado</th>
-            <th>Canal</th>
-            <th>Acciones</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+    <div class="tabs">
+      <button type="button" class="tab tab-btn active" data-tab="solicitudes">Solicitudes de levante</button>
+      <button type="button" class="tab tab-btn" data-tab="retenciones">Retenciones aduaneras</button>
+      <button type="button" class="tab tab-btn" data-tab="carga">Consulta de carga</button>
     </div>
-    <pre id="autoridad-solicitudes-result" class="command-result"></pre>
   </section>
 
-  <section class="panel">
-    <h2>Retenciones aduaneras</h2>
-    <button type="button" id="autoridad-refresh-retenciones">Actualizar retenciones</button>
-    <div class="table-wrap">
-      <table id="autoridad-table-retenciones" class="data-table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Turno</th>
-            <th>Causa</th>
-            <th>Estado</th>
-            <th>Creada</th>
-            <th>Acciones</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+  <section class="panel tab-panel" data-tab-panel="solicitudes">
+    <div class="sin-header">
+      <h2>Solicitudes de levante pendientes</h2>
+      <button type="button" id="autoridad-refresh-solicitudes">Actualizar</button>
     </div>
-    <pre id="autoridad-retenciones-result" class="command-result"></pre>
+    <p id="autoridad-result" class="resultado"></p>
+    <div class="table-wrap"><table id="autoridad-table-solicitudes" class="data-table"></table></div>
   </section>
 
-  <section class="panel">
+  <section class="panel tab-panel hidden" data-tab-panel="retenciones">
+    <div class="sin-header">
+      <h2>Retenciones aduaneras (RT03 canal rojo, RT05 documental)</h2>
+      <div class="filtros">
+        <label>Estado
+          <select id="autoridad-ret-estado">
+            <option value="abierta">Abiertas</option>
+            <option value="resuelta">Resueltas</option>
+            <option value="">Todas</option>
+          </select>
+        </label>
+        <button type="button" id="autoridad-refresh-retenciones">Actualizar</button>
+      </div>
+    </div>
+    <div class="table-wrap"><table id="autoridad-table-retenciones" class="data-table"></table></div>
+  </section>
+
+  <section class="panel tab-panel hidden" data-tab-panel="carga">
     <h2>Consulta de carga</h2>
-    <button type="button" id="autoridad-refresh-carga">Actualizar carga</button>
-    <div class="table-wrap">
-      <table id="autoridad-table-carga" class="data-table">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Contenedor</th>
-            <th>Operacion</th>
-            <th>Estado documental</th>
-            <th>Canal</th>
-            <th>Anulado</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-    </div>
+    <form id="autoridad-filtros" class="filtros">
+      <label>Contenedor <input name="q" placeholder="MSCU..." /></label>
+      <label>Naviera <input name="naviera" placeholder="Naviera Uno" /></label>
+      <label>Autorizacion
+        <select name="estado_documental">
+          <option value="">Todas</option>
+          <option value="declarado">Declarado</option>
+          <option value="declaracion_presentada">Declaracion presentada</option>
+          <option value="levante_solicitado">Levante solicitado</option>
+          <option value="levante_otorgado">Levante otorgado</option>
+          <option value="levante_retenido">Levante retenido</option>
+        </select>
+      </label>
+      <button type="submit">Buscar</button>
+    </form>
+    <div class="table-wrap"><table id="autoridad-table-carga" class="data-table"></table></div>
   </section>
 </div>
-<script src="/static/roles.js"></script>
+
+<dialog id="dlg-rol" class="dialogo">
+  <form method="dialog"><button class="cerrar" aria-label="Cerrar">&times;</button></form>
+  <div id="dlg-rol-body"></div>
+</dialog>
+<script src="/static/roles.js?v={{ v }}"></script>
 {% endblock %}
