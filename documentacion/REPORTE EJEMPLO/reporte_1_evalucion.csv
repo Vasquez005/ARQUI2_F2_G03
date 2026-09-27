@@ -1,0 +1,19 @@
+Reporte de corrida,evalucion
+Desde,2026-09-26 00:00
+Hasta,2026-09-26 12:51
+Politica de patio,secuencial
+
+Metrica,Valor,Detalle
+Remociones por contenedor retirado,,remociones=0; retirosCompletados=0
+Ciclos de grua por operacion completada,,ciclos=0; turnosCerrados=0
+Distancia total recorrida por la grua (tramos),0,
+Tiempo promedio de camion en la terminal (s),,turnosCerrados=0
+Tiempo promedio de retencion (s),108.1,retencionesResueltas=2
+Longitud maxima de la fila de espera,1,
+Porcentaje de citas cumplidas en ventana,0.0,cumplidas=0; total=1
+Retenciones RT04,2,aclarar=2
+
+Detalle de turnos
+turno,vehiculo,transportista,contenedor,operacion,estado,creado,cerrado,tiempo_s,peso_declarado_g,peso_entrada_g,peso_salida_g,posicion_patio
+4,E1 69 73 15,Transportista Uno,MSCU0000008,DEPOSITO,EnSalida,2026-09-26 11:32:46,,1571,1000,1000,1000,
+5,E1 67 7F 15,Transportista Dos,MSCU0000004,DEPOSITO,EnRuta,2026-09-26 11:55:35,,202,1000,1000,,

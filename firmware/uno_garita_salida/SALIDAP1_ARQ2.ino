@@ -304,7 +304,7 @@ void procesarComandosRemotos() {
   if (kind == "CMD" && topic == "cmd") handleCommand(payload);
 }
 
-void actualizarModoDegradado() {
+void actualizarModoDegradado() {  
   modoDegradado = (millis() - ultimaActividadPiMs) > UMBRAL_DEGRADADO_MS;
 }
 
