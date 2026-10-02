@@ -82,7 +82,7 @@ start_proc "backend_b" \
   "cd '$ROOT_DIR/backend' && \
    python3 -m venv .venv >/dev/null 2>&1 || true && \
    .venv/bin/python3 -m pip install -q -r requirements.txt && \
-   .venv/bin/python3 seed.py && \
+   .venv/bin/python3 seed.py --presentacion && \
    PORTUS_MQTT_HOST='$MQTT_HOST' PORTUS_MQTT_PORT='$MQTT_PORT' \
    .venv/bin/python3 -m uvicorn app:app --host '$BACKEND_BIND' --port 8100"
 

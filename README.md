@@ -209,6 +209,7 @@ PORTUS_BOT_TOKEN=... .venv/bin/python3 app/main.py
 cd backend
 .venv/bin/python3 seed.py          # usuarios, transportistas y tarjetas RFID
 .venv/bin/python3 seed.py --demo   # ademas, manifiestos con levante para probar la maqueta
+.venv/bin/python3 seed.py --presentacion  # 2 tarjetas listas para el ciclo limpio (run_all.sh ya lo corre)
 ```
 
 Crea (sin duplicar) los usuarios `terminal1`, `naviera1`, `naviera2`, `agente1`,
@@ -221,13 +222,19 @@ Tarjetas RFID de la maqueta:
 
 | UID | Transportista | Vehiculo | Uso en la demo |
 | --- | --- | --- | --- |
-| `E1 69 73 15` | Transportista Uno | C-001 | ciclo normal |
-| `E1 67 7F 15` | Transportista Dos | C-002 | ciclo normal |
+| `E1 69 73 15` | Transportista Uno | C-001 | ciclo normal (presentacion) |
+| `E1 67 7F 15` | Transportista Dos | C-002 | ciclo normal (presentacion) |
 | `E1 8E 3C 53` | Transportista Uno | C-003 | peso fuera de tolerancia (RT01) |
 | `90 C7 3D 5F` | - | - | no registrada: rechazo en garita (E03) |
 
 Con `--demo` cada tarjeta registrada recibe un manifiesto con levante otorgado
 (canal verde), de modo que la garita puede abrir la talanquera.
+
+Con `--presentacion` las dos tarjetas de ciclo normal quedan "quemadas" con
+3 depositos listos cada una (manifiesto `PRES...` con levante verde, sin cita):
+ingreso -> 10 s -> pesaje OK -> grua DEPOSITO -> salida, sin papeleria previa.
+Volver a correrlo repone los que se hayan usado. El patio tiene 4 posiciones
+(8 contenedores con el nivel 2): para repetir mucho, liberar posiciones desde la web.
 
 ### Pruebas
 
