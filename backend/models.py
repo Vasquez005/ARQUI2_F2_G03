@@ -399,3 +399,38 @@ def _agregar_columnas_nuevas(engine) -> None:
             for nombre, tipo in columnas.items():
                 if nombre not in existentes:
                     conn.exec_driver_sql(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {tipo}")
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Fase 3: verificacion de placa y placas restringidas (sec. 6.5 y 7)
+# ══════════════════════════════════════════════════════════════════════════
+
+class LecturaPlaca(Base):
+    """Cada intento de ingreso con su foto, la placa leida y el resultado (sec. 6.5).
+    No se puede borrar desde la plataforma."""
+    __tablename__ = "lecturas_placa"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vehiculo_uid: Mapped[str] = mapped_column(String(32), index=True)
+    placa_leida: Mapped[str] = mapped_column(String(16), default="")
+    confianza: Mapped[float] = mapped_column(Float, default=0.0)  # 0 a 100
+    resultado: Mapped[str] = mapped_column(String(32), index=True)
+    causa: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # RT07 / RT08
+    foto: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    turno_id: Mapped[Optional[int]] = mapped_column(ForeignKey("turnos.id"), nullable=True)
+    pendiente: Mapped[bool] = mapped_column(Boolean, default=False, index=True)  # espera al operador
+    decidido_por: Mapped[str] = mapped_column(String(32), default="servidor")
+    motivo_decision: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class PlacaRestringida(Base):
+    """Lista de la autoridad aduanera (sec. 7). Las bajas quedan en el mismo registro."""
+    __tablename__ = "placas_restringidas"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    placa: Mapped[str] = mapped_column(String(16), index=True)
+    motivo: Mapped[str] = mapped_column(String(200))
+    usuario: Mapped[str] = mapped_column(String(40), default="")
+    restringida_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    activa: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    liberada_por: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    liberada_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    motivo_liberacion: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)

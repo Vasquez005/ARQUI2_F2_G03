@@ -21,6 +21,16 @@ CONFIG_LECTURA_MIN_S = 2
 CONFIG_LECTURA_MAX_S = 60
 CONFIG_LATIDO_MIN_S = 5
 CONFIG_LATIDO_MAX_S = 60
+CONFIG_MINUTOS_SIN_LLUVIA_DEFECTO = 2
+CONFIG_MINUTOS_SIN_LLUVIA_MIN = 1
+CONFIG_MINUTOS_SIN_LLUVIA_MAX = 30
+
+
+def validar_minutos_sin_lluvia(minutos: int) -> None:
+    if not CONFIG_MINUTOS_SIN_LLUVIA_MIN <= minutos <= CONFIG_MINUTOS_SIN_LLUVIA_MAX:
+        raise ValueError(
+            f"MinutosSinLluviaReanudar fuera de rango ({CONFIG_MINUTOS_SIN_LLUVIA_MIN} a {CONFIG_MINUTOS_SIN_LLUVIA_MAX})"
+        )
 
 
 EnviarComando = Callable[[str, str, dict], None]
@@ -90,21 +100,41 @@ class RegistroEstacion:
 
 
 class ControlClimaLluvia:
-    """Suspende / reanuda la grua segun el sensor de lluvia de la estacion."""
+    """Suspende la grua al llover y la reanuda tras MinutosSinLluviaReanudar sin lluvia (sec. 3.3)."""
 
-    def __init__(self, enviar: EnviarComando) -> None:
+    def __init__(
+        self,
+        enviar: EnviarComando,
+        minutos_sin_lluvia: int = CONFIG_MINUTOS_SIN_LLUVIA_DEFECTO,
+        reloj: Callable[[], float] = time.monotonic,
+    ) -> None:
+        validar_minutos_sin_lluvia(minutos_sin_lluvia)
         self._enviar = enviar
+        self._minutos = minutos_sin_lluvia
+        self._reloj = reloj
         self._lock = threading.Lock()
+        self._sin_lluvia_desde: Optional[float] = None
         self.suspendido_por_lluvia = False
 
     def procesar_lluvia(self, lloviendo: bool) -> None:
         with self._lock:
-            if lloviendo and not self.suspendido_por_lluvia:
-                self._enviar("GruaSuspender", TARGET_GRUA, {"motivo": "Clima"})
-                self.suspendido_por_lluvia = True
-            elif not lloviendo and self.suspendido_por_lluvia:
+            if lloviendo:
+                # Si vuelve a llover, el conteo de tiempo sin lluvia se reinicia desde cero.
+                self._sin_lluvia_desde = None
+                if not self.suspendido_por_lluvia:
+                    self._enviar("GruaSuspender", TARGET_GRUA, {"motivo": "Clima"})
+                    self.suspendido_por_lluvia = True
+                return
+
+            if not self.suspendido_por_lluvia:
+                return
+            ahora = self._reloj()
+            if self._sin_lluvia_desde is None:
+                self._sin_lluvia_desde = ahora
+            if ahora - self._sin_lluvia_desde >= self._minutos * 60:
                 self._enviar("GruaReanudar", TARGET_GRUA, {"origen": "auto"})
                 self.suspendido_por_lluvia = False
+                self._sin_lluvia_desde = None
 
 
 def validar_config_estacion(seg_lectura: int, seg_latido: int) -> None:
@@ -140,3 +170,38 @@ def procesar_lectura_estacion(
         control_clima.procesar_lluvia(lectura.lluvia)
 
     return lectura
+
+
+class VigilanciaEstacion:
+    """Declara la estacion fuera de servicio tras 3 periodos de latido sin llegar (sec. 3.4).
+
+    Cualquier latido o lectura cuenta como senal de vida. Al volver, avisa una vez.
+    """
+
+    PERIODOS_SIN_LATIDO = 3
+
+    def __init__(self, alerta: Callable[[], None], recuperacion: Callable[[], None],
+                 segundos_periodo: Callable[[], float], reloj: Callable[[], float] = time.monotonic) -> None:
+        self._alerta = alerta
+        self._recuperacion = recuperacion
+        self._segundos_periodo = segundos_periodo
+        self._reloj = reloj
+        self._lock = threading.Lock()
+        self._ultima_senal: Optional[float] = None
+        self.fuera_de_servicio = False
+
+    def senal_de_vida(self) -> None:
+        with self._lock:
+            self._ultima_senal = self._reloj()
+            if self.fuera_de_servicio:
+                self.fuera_de_servicio = False
+                self._recuperacion()
+
+    def revisar(self) -> None:
+        with self._lock:
+            if self._ultima_senal is None or self.fuera_de_servicio:
+                return
+            limite = self.PERIODOS_SIN_LATIDO * self._segundos_periodo()
+            if self._reloj() - self._ultima_senal > limite:
+                self.fuera_de_servicio = True
+                self._alerta()

@@ -7,7 +7,7 @@ from typing import Optional
 
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -26,6 +26,8 @@ from models import (
     LinkStatus, Manifiesto, ParqueoPlaza, PosicionPatio, Retencion, Turno,
     Transportista, Usuario, Vehiculo, make_db,
 )
+import garita_verificacion
+from models import LecturaPlaca, PlacaRestringida
 from security import verify_password
 
 DB_PATH = os.getenv("PORTUS_DB_PATH", os.path.abspath(os.path.join(os.path.dirname(__file__), "portus_core.db")))
@@ -76,12 +78,46 @@ def _publicar_config_estacion_mqtt() -> None:
 
 
 def _procesar_lectura_estacion(payload: dict) -> None:
+    vigilancia_estacion.senal_de_vida()
     try:
         estacion.procesar_lectura_estacion(
             payload, registro_estacion, control_iluminacion, control_clima_lluvia,
         )
     except Exception as exc:
         print(f"[ESTACION] error procesando lectura: {exc!r}")
+
+
+# Sec. 3.4: sin latido de la estacion durante 3 periodos, AL16 y la planta encendida.
+segundos_latido_vigente = [estacion.CONFIG_LATIDO_DEFECTO_S]
+
+
+def _alerta_estacion_fuera() -> None:
+    print("[ESTACION] fuera de servicio: AL16 y iluminacion encendida")
+    with SessionLocal() as db:
+        servicios.generar_alarma(db, "AL16", origen="estacion",
+                                 descripcion="Estacion meteorologica sin comunicacion")
+        db.commit()
+    control_iluminacion.encender_sin_estacion()
+
+
+def _recuperacion_estacion() -> None:
+    print("[ESTACION] vuelve a comunicarse; se reaplican las reglas con la lectura nueva")
+
+
+vigilancia_estacion = estacion.VigilanciaEstacion(
+    alerta=_alerta_estacion_fuera,
+    recuperacion=_recuperacion_estacion,
+    segundos_periodo=lambda: segundos_latido_vigente[0],
+)
+
+
+def vigilancia_estacion_loop() -> None:
+    while True:
+        time.sleep(1)
+        try:
+            vigilancia_estacion.revisar()
+        except Exception as exc:
+            print(f"[ESTACION] error revisando latido: {exc!r}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -203,6 +239,8 @@ def on_message(client, userdata, msg):
 
     if topic == "portus/estacion/lectura":
         _procesar_lectura_estacion(payload)
+    if topic == "portus/estacion/estado":
+        vigilancia_estacion.senal_de_vida()
 
     if topic == "portus/evt/iluminacion" and payload.get("data", {}).get("evento") == "enlace_restablecido":
         control_iluminacion.resincronizar()
@@ -255,6 +293,7 @@ def ensure_started():
     threading.Thread(target=mqtt_loop, daemon=True).start()
     threading.Thread(target=link_watchdog_loop, daemon=True).start()
     threading.Thread(target=alarmas_por_tiempo_loop, daemon=True).start()
+    threading.Thread(target=vigilancia_estacion_loop, daemon=True).start()
 
 
 def make_publish_and_audit(db):
@@ -396,7 +435,153 @@ def publicar_config_estacion(body: ConfigEstacionIn):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     mqttc.publish(estacion.TOPIC_CONFIG, msg)
+    segundos_latido_vigente[0] = body.segundos_latido
     return {"ok": True, "mensaje": msg}
+
+
+class MotivoVerificacionIn(BaseModel):
+    motivo: str
+    usuario: str = "terminal"
+
+
+class RestringirPlacaIn(BaseModel):
+    placa: str
+    motivo: str
+    usuario: str = "autoridad"
+
+
+class LiberarPlacaIn(BaseModel):
+    motivo: str
+    usuario: str = "autoridad"
+
+
+def _auditar_db(db, nombre: str, datos: dict) -> None:
+    """Auditoria de acciones de la fase 3 que no son comandos al controlador (sec. 8.8)."""
+    db.add(CommandAudit(
+        cmd_name=nombre, target="SERVIDOR",
+        request_json=json.dumps(datos, ensure_ascii=False), result="OK", response_json="{}",
+    ))
+
+
+def _lectura_dict(f: LecturaPlaca) -> dict:
+    return {
+        "id": f.id, "uid": f.vehiculo_uid, "placaLeida": f.placa_leida, "confianza": f.confianza,
+        "resultado": f.resultado, "causa": f.causa, "foto": f.foto, "turnoId": f.turno_id,
+        "pendiente": f.pendiente, "decididoPor": f.decidido_por, "motivo": f.motivo_decision,
+        "ts": f.ts.isoformat(),
+    }
+
+
+@app.get("/garita/verificaciones-pendientes")
+def listar_verificaciones_pendientes():
+    with SessionLocal() as db:
+        return [_lectura_dict(f) for f in garita_verificacion.verificaciones_pendientes(db)]
+
+
+@app.get("/garita/lecturas")
+def listar_lecturas_placa(resultado: Optional[str] = None, limit: int = 100):
+    with SessionLocal() as db:
+        q = db.query(LecturaPlaca).order_by(LecturaPlaca.ts.desc())
+        if resultado:
+            q = q.filter(LecturaPlaca.resultado == resultado)
+        return [_lectura_dict(f) for f in q.limit(limit).all()]
+
+
+@app.get("/garita/lecturas/{lectura_id}/foto")
+def foto_lectura(lectura_id: int):
+    with SessionLocal() as db:
+        f = db.get(LecturaPlaca, lectura_id)
+        if f is None or not f.foto or not os.path.exists(f.foto):
+            raise HTTPException(404, "foto_no_disponible")
+        return FileResponse(f.foto, media_type="image/jpeg")
+
+
+@app.post("/garita/verificaciones/{lectura_id}/confirmar")
+def confirmar_verificacion(lectura_id: int, body: MotivoVerificacionIn):
+    """Sec. 6.2 y 8.2: el operador confirma el ingreso con motivo de al menos 10 caracteres."""
+    try:
+        motivo = garita_verificacion.validar_motivo(body.motivo)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    with SessionLocal() as db:
+        f = db.get(LecturaPlaca, lectura_id)
+        if f is None or not f.pendiente:
+            raise HTTPException(404, "verificacion_no_pendiente")
+        try:
+            turno = servicios.ingreso_por_rfid(db, f.vehiculo_uid, publish_cmd=make_publish_and_audit(db))
+        except servicios.ReglaDeNegocioError as exc:
+            db.rollback()
+            raise HTTPException(409, str(exc))
+        f.pendiente = False
+        f.resultado = "confirmada_manual"
+        f.decidido_por = body.usuario
+        f.motivo_decision = motivo
+        f.turno_id = turno.id
+        _auditar_db(db, "ConfirmarVerificacionIngreso", {"lectura": lectura_id, "motivo": motivo, "usuario": body.usuario})
+        db.commit()
+        return {"ok": True, "turno": turno.id}
+
+
+@app.post("/garita/verificaciones/{lectura_id}/rechazar")
+def rechazar_verificacion(lectura_id: int, body: MotivoVerificacionIn):
+    """Sec. 6.2 y 8.2: el operador rechaza; la talanquera no abre y no se crea turno."""
+    try:
+        motivo = garita_verificacion.validar_motivo(body.motivo)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    with SessionLocal() as db:
+        f = db.get(LecturaPlaca, lectura_id)
+        if f is None or not f.pendiente:
+            raise HTTPException(404, "verificacion_no_pendiente")
+        f.pendiente = False
+        f.resultado = "rechazada_manual"
+        f.decidido_por = body.usuario
+        f.motivo_decision = motivo
+        servicios.registrar_intento_rechazado(db, f.vehiculo_uid, "garita_entrada",
+                                              "verificacion_manual_rechazada", decidido_por=body.usuario)
+        make_publish_and_audit(db)("RechazarIngreso", "UNO_ENTRADA",
+                                   {"uid": f.vehiculo_uid, "motivo": "Rechazado"})
+        _auditar_db(db, "RechazarVerificacionIngreso", {"lectura": lectura_id, "motivo": motivo, "usuario": body.usuario})
+        db.commit()
+        return {"ok": True}
+
+
+@app.get("/autoridad/placas-restringidas")
+def listar_placas_restringidas():
+    """Tabla y historial: las activas y las ya liberadas con quien las libero (sec. 8.3)."""
+    with SessionLocal() as db:
+        filas = db.query(PlacaRestringida).order_by(PlacaRestringida.restringida_at.desc()).all()
+        return [{
+            "id": p.id, "placa": p.placa, "motivo": p.motivo, "usuario": p.usuario,
+            "restringidaAt": p.restringida_at.isoformat(), "activa": p.activa,
+            "liberadaPor": p.liberada_por,
+            "liberadaAt": p.liberada_at.isoformat() if p.liberada_at else None,
+            "motivoLiberacion": p.motivo_liberacion,
+        } for p in filas]
+
+
+@app.post("/autoridad/placas-restringidas")
+def restringir_placa(body: RestringirPlacaIn):
+    with SessionLocal() as db:
+        try:
+            fila = garita_verificacion.restringir(db, body.placa, body.motivo, body.usuario)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        _auditar_db(db, "RestringirPlaca", {"placa": fila.placa, "motivo": fila.motivo, "usuario": body.usuario})
+        db.commit()
+        return {"ok": True, "id": fila.id, "placa": fila.placa}
+
+
+@app.post("/autoridad/placas-restringidas/{restriccion_id}/liberar")
+def liberar_placa(restriccion_id: int, body: LiberarPlacaIn):
+    with SessionLocal() as db:
+        try:
+            fila = garita_verificacion.liberar(db, restriccion_id, body.motivo, body.usuario)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        _auditar_db(db, "LiberarPlaca", {"placa": fila.placa, "motivo": body.motivo, "usuario": body.usuario})
+        db.commit()
+        return {"ok": True}
 
 
 @app.post("/commands/send")

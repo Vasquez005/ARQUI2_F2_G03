@@ -118,6 +118,11 @@ class ControlIluminacion:
             self.umbral_encendido = encendido
             self.umbral_apagado = apagado
 
+    def encender_sin_estacion(self) -> None:
+        """Sec. 3.4 punto 3: con la estacion fuera de servicio, la planta queda encendida."""
+        with self._lock:
+            self._mandar(True)
+
     def resincronizar(self) -> None:
         """El controlador volvio a tener enlace: encendio la tira sola al perderlo
         (sec. 4.2 regla 3). Se reenvia el estado que corresponde ahora."""

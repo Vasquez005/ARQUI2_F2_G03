@@ -293,6 +293,31 @@
 </section>
 
 <!-- ═══════════════════════ 6. Alarmas ═══════════════════════ -->
+<section class="panel tab-panel hidden" data-tab-panel="accesos">
+  <h2>Verificaciones pendientes</h2>
+  <p class="muted">Ingresos que esperan decision del operador (camara fuera de servicio o sin lectura valida). Confirmar o rechazar exige un motivo de al menos diez caracteres.</p>
+  <div id="verificaciones-pendientes"></div>
+  <h2>Historial de lecturas</h2>
+  <div class="filtros">
+    <label>Resultado
+      <select id="lecturas-resultado">
+        <option value="">Todos</option>
+        <option value="autorizado">Autorizado</option>
+        <option value="retencion_pendiente">Retencion</option>
+        <option value="retencion_aplicada">Retencion aplicada</option>
+        <option value="rechazo">Rechazo</option>
+        <option value="rechazo_documental">Rechazo documental</option>
+        <option value="verificacion_manual">Verificacion manual</option>
+        <option value="modo_degradado">Modo degradado</option>
+        <option value="confirmada_manual">Confirmada por operador</option>
+        <option value="rechazada_manual">Rechazada por operador</option>
+      </select>
+    </label>
+    <button type="button" id="btn-lecturas-filtrar">Filtrar</button>
+  </div>
+  <div class="table-wrap"><table class="data-table" id="tabla-lecturas"></table></div>
+</section>
+
 <section class="panel tab-panel hidden" data-tab-panel="alarmas">
   <h2>Alarmas</h2>
   <div class="filtros">

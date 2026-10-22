@@ -588,6 +588,52 @@ function initAutoridad() {
       mensaje(result, `Rechazado: ${err.message}`, false);
     }
   });
+  async function cargarPlacas() {
+    try {
+      const filas = await apiFetch("/api/autoridad/placas-restringidas");
+      llenarTabla($("autoridad-table-placas"),
+        ["Placa", "Motivo", "Restringida por", "Fecha", "Estado", "Liberada por", "Motivo de liberacion", "Accion"],
+        filas, (p) => `<tr>
+          <td>${escapeHtml(p.placa)}</td><td>${escapeHtml(p.motivo)}</td><td>${escapeHtml(p.usuario)}</td>
+          <td>${escapeHtml(p.restringidaAt)}</td><td>${p.activa ? "Activa" : "Liberada"}</td>
+          <td>${escapeHtml(p.liberadaPor || "")}</td><td>${escapeHtml(p.motivoLiberacion || "")}</td>
+          <td>${p.activa ? `<button type="button" data-liberar="${p.id}">Quitar restriccion</button>` : ""}</td></tr>`,
+        "Sin placas restringidas.");
+    } catch (err) {
+      mensaje(result, `Error: ${err.message}`, false);
+    }
+  }
+
+  $("autoridad-form-placas").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const placa = $("autoridad-placa").value.trim();
+    const motivo = $("autoridad-placa-motivo").value.trim();
+    try {
+      await postJson("/api/autoridad/placas-restringidas", { placa, motivo });
+      mensaje(result, `Placa ${placa} restringida.`);
+      $("autoridad-form-placas").reset();
+      cargarPlacas();
+    } catch (err) {
+      mensaje(result, `Rechazado: ${err.message}`, false);
+    }
+  });
+
+  root.addEventListener("click", async (ev) => {
+    const b = ev.target.closest("button[data-liberar]");
+    if (!b) return;
+    const motivo = await preguntar({ titulo: "Quitar restriccion",
+      texto: "La placa deja de retenerse en la garita. Queda en el historial con este motivo.",
+      campo: "Motivo de liberacion", obligatorio: true, aceptar: "Quitar restriccion" });
+    if (!motivo) return;
+    try {
+      await postJson(`/api/autoridad/placas-restringidas/${b.dataset.liberar}/liberar`, { motivo });
+      mensaje(result, "Restriccion quitada y registrada en auditoria.");
+      cargarPlacas();
+    } catch (err) {
+      mensaje(result, `Rechazado: ${err.message}`, false);
+    }
+  });
+
   $("autoridad-refresh-solicitudes").addEventListener("click", cargarSolicitudes);
   $("autoridad-refresh-retenciones").addEventListener("click", cargarRetenciones);
   $("autoridad-ret-estado").addEventListener("change", cargarRetenciones);
@@ -595,6 +641,7 @@ function initAutoridad() {
   root.addEventListener("pestana", (ev) => {
     if (ev.detail === "retenciones") cargarRetenciones();
     else if (ev.detail === "carga") cargarCarga();
+    else if (ev.detail === "placas") cargarPlacas();
     else cargarSolicitudes();
   });
   initTabs(root);

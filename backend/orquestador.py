@@ -32,8 +32,11 @@ from typing import Callable, Optional
 
 from sqlalchemy import event, select
 
+import camara_garita
+import garita_verificacion
 import grua
 import servicios
+import verificacion
 from catalogos import ANULADO, EN_GARITA, EN_PESAJE_ENTRADA, EN_SALIDA, RETENIDO
 from models import (
     Alarma, Cita, CommandAudit, Declaracion, FranjaBloqueada, GruaCiclo, IntentoIngreso, Manifiesto,
@@ -90,20 +93,95 @@ def _garita_rfid(db, pub: PublicadorDiferido, datos: dict) -> None:
     uid = servicios.normalizar_uid(datos.get("uid", ""))
     if not uid:
         return
+    if garita_verificacion.activa():
+        _garita_rfid_verificada(db, pub, uid)
+        return
     try:
         servicios.ingreso_por_rfid(db, uid, publish_cmd=pub)
         _confirmar(db, pub)
     except servicios.ReglaDeNegocioError as exc:
-        db.rollback()
-        pub.descartar()
-        causa = str(exc)
-        if causa == "parqueo_lleno":
-            servicios.generar_alarma(db, "AL11", origen="garita",
-                                     descripcion=f"Parqueo lleno, ingreso rechazado ({uid})")
-        servicios.registrar_intento_rechazado(db, uid, "garita_entrada", causa,
-                                              contenedor_id=getattr(exc, "contenedor_id", None))
-        pub("RechazarIngreso", "UNO_ENTRADA", {"uid": uid, "motivo": servicios.motivo_lcd(causa)})
+        _rechazar_entrada(db, pub, uid, exc)
+
+
+def _rechazar_entrada(db, pub: PublicadorDiferido, uid: str, exc: Exception) -> None:
+    db.rollback()
+    pub.descartar()
+    causa = str(exc)
+    if causa == "parqueo_lleno":
+        servicios.generar_alarma(db, "AL11", origen="garita",
+                                 descripcion=f"Parqueo lleno, ingreso rechazado ({uid})")
+    servicios.registrar_intento_rechazado(db, uid, "garita_entrada", causa,
+                                          contenedor_id=getattr(exc, "contenedor_id", None))
+    pub("RechazarIngreso", "UNO_ENTRADA", {"uid": uid, "motivo": servicios.motivo_lcd(causa)})
+    _confirmar(db, pub)
+
+
+def _alarma_verificacion(db, decision: verificacion.Decision, uid: str) -> None:
+    if decision.alarma:
+        servicios.generar_alarma(db, decision.alarma, origen="garita",
+                                 descripcion=f"{decision.linea1} ({uid})", referencia=f"uid:{uid}")
+
+
+def _pantalla_garita(pub: PublicadorDiferido, uid: str, decision: verificacion.Decision) -> None:
+    """Textos literales de la sec. 6.4 para la LCD y el semaforo de la garita."""
+    pub("GaritaResultado", "UNO_ENTRADA",
+        {"uid": uid, "linea1": decision.linea1, "linea2": decision.linea2})
+
+
+def _garita_rfid_verificada(db, pub: PublicadorDiferido, uid: str) -> None:
+    """Fase 3 (sec. 6.1): la camara lee la placa y se verifica contra la etiqueta."""
+    lectura = camara_garita.leer_placa_garita(
+        intentos=garita_verificacion.intentos_ocr(),
+        es_valida=lambda l: l["confianza"] >= garita_verificacion.umbral_ocr() and bool(l["texto"]),
+    )
+    decision = garita_verificacion.decidir_entrada(db, uid, lectura)
+
+    if decision.resultado == verificacion.RECHAZO:
+        servicios.registrar_intento_rechazado(db, uid, "garita_entrada", "tarjeta_no_registrada")
+        garita_verificacion.registrar_lectura(db, uid, lectura, "rechazo")
+        pub("RechazarIngreso", "UNO_ENTRADA", {"uid": uid, "motivo": "Tarjeta no registrada"})
+        _pantalla_garita(pub, uid, decision)
         _confirmar(db, pub)
+        return
+
+    if decision.resultado in (verificacion.MODO_DEGRADADO, verificacion.VERIFICACION_MANUAL):
+        # La talanquera no abre; el operador confirma desde la pestana Accesos (sec. 8.2).
+        _alarma_verificacion(db, decision, uid)
+        garita_verificacion.registrar_lectura(db, uid, lectura, decision.resultado, pendiente=True)
+        pub("RechazarIngreso", "UNO_ENTRADA", {"uid": uid, "motivo": decision.linea1[:16]})
+        _pantalla_garita(pub, uid, decision)
+        _confirmar(db, pub)
+        return
+
+    # Autorizado o retencion: primero la validacion documental de la fase 2.
+    try:
+        turno = servicios.ingreso_por_rfid(db, uid, publish_cmd=pub)
+    except servicios.ReglaDeNegocioError as exc:
+        _rechazar_entrada(db, pub, uid, exc)
+        # _rechazar_entrada confirma; ahora queda registrada la lectura de la placa.
+        garita_verificacion.registrar_lectura(db, uid, lectura, "rechazo_documental")
+        db.commit()
+        return
+
+    if decision.resultado == verificacion.RETENCION:
+        # sec. 6.2: la retencion RT07/RT08 se crea despues del pesaje de entrada.
+        _alarma_verificacion(db, decision, uid)
+        garita_verificacion.registrar_lectura(db, uid, lectura, "retencion_pendiente",
+                                              causa=decision.causa, turno_id=turno.id)
+    else:
+        garita_verificacion.registrar_lectura(db, uid, lectura, "autorizado", turno_id=turno.id)
+    _pantalla_garita(pub, uid, decision)
+    _confirmar(db, pub)
+
+
+def _aplicar_retencion_verificacion(db, pub: PublicadorDiferido, turno) -> None:
+    """Despues del pesaje de entrada, aplica la retencion RT07/RT08 que quedo pendiente."""
+    pendiente = garita_verificacion.retencion_pendiente_de(db, turno.id)
+    if pendiente is None or turno.estado == RETENIDO:
+        return
+    servicios.crear_retencion(db, turno, pendiente.causa, estado_resume=turno.estado,
+                              estacion="parqueo", publish_cmd=pub)
+    pendiente.resultado = "retencion_aplicada"
 
 
 def _garita_rechazado(db, pub: PublicadorDiferido, datos: dict) -> None:
@@ -141,6 +219,7 @@ def _pesaje_meseta(db, pub: PublicadorDiferido, datos: dict) -> None:
         if "peso" not in datos:
             servicios.registrar_evento(db, turno.id, "servidor", "Peso simulado a partir del resultado de la garita",
                                        {"resultado": datos.get("resultado"), "peso_g": peso})
+        _aplicar_retencion_verificacion(db, pub, turno)
         _confirmar(db, pub)
     except servicios.ReglaDeNegocioError:
         db.rollback()

@@ -806,6 +806,86 @@
     }
   }
 
+  // ════════════════════════ Accesos (fase 3, sec. 8.2) ════════════════════════
+
+  let timerAccesos = null;
+
+  async function cargarAccesos() {
+    await Promise.all([cargarVerificacionesPendientes(), cargarLecturas()]);
+    clearInterval(timerAccesos);
+    timerAccesos = setInterval(() => {
+      if (!$("verificaciones-pendientes")?.closest(".tab-panel")?.classList.contains("hidden")) {
+        cargarVerificacionesPendientes();
+      }
+    }, 10000);
+  }
+
+  async function cargarVerificacionesPendientes() {
+    const cont = $("verificaciones-pendientes");
+    if (!cont) return;
+    try {
+      const filas = await apiFetch("/api/terminal/verificaciones-pendientes");
+      if (!filas.length) {
+        cont.innerHTML = '<p class="muted">Sin verificaciones pendientes.</p>';
+        return;
+      }
+      cont.innerHTML = filas.map((f) => `
+        <div class="tarjeta-verificacion">
+          <img src="/api/terminal/lecturas/${f.id}/foto" alt="Fotografia de la garita" class="foto-garita">
+          <div>
+            <p><strong>Etiqueta:</strong> ${escapeHtml(f.uid)} &nbsp; <strong>Hora:</strong> ${escapeHtml(fmtDate(f.ts))}</p>
+            <p><strong>Placa leida:</strong> ${escapeHtml(f.placaLeida || "(no leida)")}
+               &nbsp; <strong>Confianza:</strong> ${Math.round(f.confianza)}%
+               &nbsp; <strong>Resultado:</strong> ${escapeHtml(f.resultado)}</p>
+            <label>Motivo (minimo 10 caracteres)
+              <input type="text" id="verif-motivo-${f.id}" minlength="10">
+            </label>
+            <button type="button" class="btn-verif" data-accion="confirmar" data-id="${f.id}">Confirmar ingreso</button>
+            <button type="button" class="btn-verif" data-accion="rechazar" data-id="${f.id}">Rechazar ingreso</button>
+          </div>
+        </div>`).join("");
+    } catch (err) {
+      toast(`Error cargando verificaciones: ${err.message}`, "toast-bad");
+    }
+  }
+
+  async function cargarLecturas() {
+    try {
+      const resultado = $("lecturas-resultado")?.value || "";
+      const filas = await apiFetch(`/api/terminal/lecturas${resultado ? `?resultado=${encodeURIComponent(resultado)}` : ""}`);
+      tabla($("tabla-lecturas"), ["Foto", "Hora", "Etiqueta", "Placa leida", "Confianza", "Resultado", "Causa", "Decidio"], filas, (l) => `<tr>
+        <td><img src="/api/terminal/lecturas/${l.id}/foto" alt="" class="miniatura-garita"></td>
+        <td>${escapeHtml(fmtDate(l.ts))}</td><td>${escapeHtml(l.uid)}</td><td>${escapeHtml(l.placaLeida)}</td>
+        <td>${Math.round(l.confianza)}%</td><td>${escapeHtml(l.resultado)}</td><td>${escapeHtml(l.causa || "")}</td>
+        <td>${escapeHtml(l.decididoPor || "servidor")}</td></tr>`,
+      "Sin lecturas registradas.");
+    } catch (err) {
+      toast(`Error cargando lecturas: ${err.message}`, "toast-bad");
+    }
+  }
+
+  document.addEventListener("click", async (ev) => {
+    const boton = ev.target.closest(".btn-verif");
+    if (boton) {
+      const id = boton.dataset.id;
+      const motivo = ($(`verif-motivo-${id}`)?.value || "").trim();
+      if (motivo.length < 10) {
+        toast("El motivo debe tener al menos diez caracteres.", "toast-bad");
+        return;
+      }
+      const accion = boton.dataset.accion === "confirmar" ? "confirmar" : "rechazar";
+      try {
+        await post(`/api/terminal/verificaciones/${id}/${accion}`, { motivo });
+        toast(accion === "confirmar" ? "Ingreso confirmado." : "Ingreso rechazado.", "toast-ok");
+        await cargarAccesos();
+      } catch (err) {
+        toast(`No se pudo ${accion}: ${err.message}`, "toast-bad");
+      }
+      return;
+    }
+    if (ev.target.id === "btn-lecturas-filtrar") cargarLecturas();
+  });
+
   let transportistas = [];
 
   async function cargarTransportistas() {
@@ -1211,6 +1291,7 @@
   const cargadas = new Set();
   const CARGAR_PESTANA = {
     turnos: () => Promise.all([cargarTurnos(), cargarIntentos(), cargarVehiculos()]),
+    accesos: cargarAccesos,
     retenciones: cargarRetenciones,
     patio: cargarPestanaPatio,
     alarmas: cargarAlarmas,

@@ -7,6 +7,7 @@
       <button type="button" class="tab tab-btn active" data-tab="solicitudes">Solicitudes de levante</button>
       <button type="button" class="tab tab-btn" data-tab="retenciones">Retenciones aduaneras</button>
       <button type="button" class="tab tab-btn" data-tab="carga">Consulta de carga</button>
+      <button type="button" class="tab tab-btn" data-tab="placas">Placas restringidas</button>
     </div>
   </section>
 
@@ -54,6 +55,18 @@
       <button type="submit">Buscar</button>
     </form>
     <div class="table-wrap"><table id="autoridad-table-carga" class="data-table"></table></div>
+  </section>
+
+  <section class="panel tab-panel hidden" data-tab-panel="placas">
+    <h2>Placas restringidas</h2>
+    <p class="muted">Una placa restringida se retiene aunque la etiqueta sea valida. Agregar o quitar exige un motivo de al menos diez caracteres.</p>
+    <form id="autoridad-form-placas" class="filtros">
+      <label>Placa <input type="text" id="autoridad-placa" required></label>
+      <label>Motivo <input type="text" id="autoridad-placa-motivo" minlength="10" required></label>
+      <button type="submit">Restringir placa</button>
+    </form>
+    <p class="muted">La tabla muestra las activas y el historial de las liberadas, con quien las libero y por que.</p>
+    <div class="table-wrap"><table id="autoridad-table-placas" class="data-table"></table></div>
   </section>
 </div>
 

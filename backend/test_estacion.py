@@ -41,23 +41,54 @@ class ConfigEstacionTests(unittest.TestCase):
 
 
 class ControlClimaLluviaTests(unittest.TestCase):
-    def test_flanco_subida_y_bajada(self):
-        enviados = []
+    def setUp(self):
+        self.enviados = []
+        self.t = [0.0]
+        self.c = ControlClimaLluvia(
+            enviar=lambda name, target, params: self.enviados.append((name, target, params)),
+            minutos_sin_lluvia=2,
+            reloj=lambda: self.t[0],
+        )
 
-        def enviar(name, target, params):
-            enviados.append((name, target, params))
+    def test_suspende_con_motivo_clima_una_sola_vez(self):
+        self.c.procesar_lluvia(True)
+        self.c.procesar_lluvia(True)
+        self.assertEqual(len(self.enviados), 1)
+        self.assertEqual(self.enviados[0][0], "GruaSuspender")
+        self.assertEqual(self.enviados[0][2]["motivo"], "Clima")
 
-        c = ControlClimaLluvia(enviar=enviar)
-        c.procesar_lluvia(True)
-        c.procesar_lluvia(True)
-        self.assertEqual(len(enviados), 1)
-        self.assertEqual(enviados[0][0], "GruaSuspender")
-        self.assertEqual(enviados[0][2]["motivo"], "Clima")
+    def test_no_reanuda_antes_de_los_minutos_configurados(self):
+        self.c.procesar_lluvia(True)
+        self.c.procesar_lluvia(False)
+        self.t[0] = 119
+        self.c.procesar_lluvia(False)
+        self.assertEqual([n for n, _, _ in self.enviados], ["GruaSuspender"])
 
-        c.procesar_lluvia(False)
-        self.assertEqual(len(enviados), 2)
-        self.assertEqual(enviados[1][0], "GruaReanudar")
-        self.assertEqual(enviados[1][2]["origen"], "auto")
+    def test_reanuda_con_origen_auto_al_cumplirse_el_tiempo(self):
+        self.c.procesar_lluvia(True)
+        self.c.procesar_lluvia(False)
+        self.t[0] = 120
+        self.c.procesar_lluvia(False)
+        self.assertEqual(self.enviados[-1][0], "GruaReanudar")
+        self.assertEqual(self.enviados[-1][2]["origen"], "auto")
+        self.assertFalse(self.c.suspendido_por_lluvia)
+
+    def test_volver_a_llover_reinicia_el_conteo(self):
+        self.c.procesar_lluvia(True)
+        self.c.procesar_lluvia(False)
+        self.t[0] = 100
+        self.c.procesar_lluvia(True)   # vuelve a llover antes de cumplirse el tiempo
+        self.t[0] = 150
+        self.c.procesar_lluvia(False)  # empieza de cero
+        self.t[0] = 200                # solo 50 s desde el nuevo inicio
+        self.c.procesar_lluvia(False)
+        self.assertEqual([n for n, _, _ in self.enviados], ["GruaSuspender"])
+
+    def test_minutos_fuera_de_rango_se_rechazan(self):
+        with self.assertRaises(ValueError):
+            ControlClimaLluvia(enviar=lambda *a: None, minutos_sin_lluvia=0)
+        with self.assertRaises(ValueError):
+            ControlClimaLluvia(enviar=lambda *a: None, minutos_sin_lluvia=31)
 
 
 class ProcesarLecturaIntegracionTests(unittest.TestCase):

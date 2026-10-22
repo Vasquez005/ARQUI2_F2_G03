@@ -26,7 +26,7 @@ from typing import Optional
 
 import paho.mqtt.client as mqtt
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, URLSafeSerializer
@@ -247,7 +247,7 @@ def require_role(*roles: Role):
 
 
 def terminal_tab_list() -> list:
-    return ["Operacion", "Turnos", "Retenciones", "Patio", "Grua", "Alarmas", "Citas", "Reportes"]
+    return ["Operacion", "Turnos", "Accesos", "Retenciones", "Patio", "Grua", "Alarmas", "Citas", "Reportes"]
 
 
 @app.on_event("startup")
@@ -429,6 +429,78 @@ class AnularIn(BaseModel):
 @app.post("/api/terminal/turnos/{turno_id}/anular")
 def terminal_anular(turno_id: int, body: AnularIn, user: dict = Depends(require_role(Role.TERMINAL))):
     return backend("POST", f"/turnos/{turno_id}/anular", {"causa": body.causa})
+
+
+# ── Fase 3: pestana Accesos del rol TERMINAL (sec. 8.2) ──
+
+class MotivoIn(BaseModel):
+    motivo: str
+    usuario: str = "terminal"
+
+
+@app.get("/api/terminal/verificaciones-pendientes")
+def terminal_verificaciones(user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/garita/verificaciones-pendientes")
+
+
+@app.get("/api/terminal/lecturas")
+def terminal_lecturas(resultado: Optional[str] = None, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/garita/lecturas", params={"resultado": resultado})
+
+
+@app.get("/api/terminal/lecturas/{lectura_id}/foto")
+def terminal_foto(lectura_id: int, user: dict = Depends(require_role(Role.TERMINAL))):
+    url = f"{BACKEND_URL}/garita/lecturas/{lectura_id}/foto"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return Response(content=resp.read(), media_type="image/jpeg")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=exc.code, detail="foto_no_disponible")
+    except urllib.error.URLError:
+        raise HTTPException(status_code=503, detail="backend_no_disponible")
+
+
+@app.post("/api/terminal/verificaciones/{lectura_id}/confirmar")
+def terminal_confirmar_verificacion(lectura_id: int, body: MotivoIn,
+                                    user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", f"/garita/verificaciones/{lectura_id}/confirmar",
+                   {"motivo": body.motivo, "usuario": user.get("username", "terminal")})
+
+
+@app.post("/api/terminal/verificaciones/{lectura_id}/rechazar")
+def terminal_rechazar_verificacion(lectura_id: int, body: MotivoIn,
+                                   user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", f"/garita/verificaciones/{lectura_id}/rechazar",
+                   {"motivo": body.motivo, "usuario": user.get("username", "terminal")})
+
+
+# ── Fase 3: pestana Placas restringidas del rol AUTORIDAD (sec. 8.3) ──
+
+class RestringirIn(BaseModel):
+    placa: str
+    motivo: str
+
+
+class LiberarPlacaWebIn(BaseModel):
+    motivo: str
+
+
+@app.get("/api/autoridad/placas-restringidas")
+def autoridad_placas(user: dict = Depends(require_role(Role.AUTORIDAD))):
+    return backend("GET", "/autoridad/placas-restringidas")
+
+
+@app.post("/api/autoridad/placas-restringidas")
+def autoridad_restringir(body: RestringirIn, user: dict = Depends(require_role(Role.AUTORIDAD))):
+    return backend("POST", "/autoridad/placas-restringidas",
+                   {"placa": body.placa, "motivo": body.motivo, "usuario": user.get("username", "autoridad")})
+
+
+@app.post("/api/autoridad/placas-restringidas/{restriccion_id}/liberar")
+def autoridad_liberar(restriccion_id: int, body: LiberarPlacaWebIn,
+                      user: dict = Depends(require_role(Role.AUTORIDAD))):
+    return backend("POST", f"/autoridad/placas-restringidas/{restriccion_id}/liberar",
+                   {"motivo": body.motivo, "usuario": user.get("username", "autoridad")})
 
 
 @app.get("/api/terminal/retenciones")

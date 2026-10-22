@@ -46,8 +46,10 @@ RT03 = "RT03"  # Canal rojo de selectivo
 RT04 = "RT04"  # Llegada fuera de la ventana asignada
 RT05 = "RT05"  # Retencion documental
 RT06 = "RT06"  # Retencion manual operativa
+RT07 = "RT07"  # Fase 3: la placa leida no corresponde a la etiqueta
+RT08 = "RT08"  # Fase 3: placa restringida por la autoridad
 
-CAUSAS_RETENCION = (RT01, RT02, RT03, RT04, RT05, RT06)
+CAUSAS_RETENCION = (RT01, RT02, RT03, RT04, RT05, RT06, RT07, RT08)
 
 ROL_FACULTADO_POR_CAUSA = {
     RT01: "TERMINAL",
@@ -56,7 +58,12 @@ ROL_FACULTADO_POR_CAUSA = {
     RT04: "TERMINAL",
     RT05: "AUTORIDAD",
     RT06: "TERMINAL",
+    RT07: "TERMINAL",
+    RT08: "AUTORIDAD",
 }
+
+# Fase 3 (sec. 6.3): RT07 y RT08 no admiten Corregir, porque no involucran el peso declarado.
+RESOLUCIONES_PERMITIDAS_FASE3 = {RT07: ("aclarar", "rechazar"), RT08: ("aclarar", "rechazar")}
 
 RESOLUCIONES = ("aclarar", "corregir", "rechazar")
 
@@ -76,6 +83,14 @@ CATALOGO_ALARMAS = {
     "AL12": ("media", "Retencion que supera treinta minutos"),
     "AL13": ("baja", "Permanencia de contenedor superior a dos horas"),
     "AL14": ("baja", "Comando remoto rechazado por el controlador"),
+    # Fase 3 (sec. 8.6)
+    "AL16": ("alta", "Estacion meteorologica sin comunicacion"),
+    "AL17": ("media", "Lluvia detectada, grua suspendida"),
+    "AL18": ("alta", "Camara o modelo de vision fuera de servicio"),
+    "AL19": ("media", "Congestion en la zona de espera"),
+    "AL20": ("alta", "Placa leida no corresponde a la etiqueta"),
+    "AL21": ("critica", "Placa restringida detectada en la garita"),
+    "AL22": ("media", "Verificacion manual de ingreso requerida"),
 }
 
 SEVERIDADES_AUTO_RECONOCIBLES = ("media", "baja")  # boton "Reconocer todas" (sec. 4.6)
