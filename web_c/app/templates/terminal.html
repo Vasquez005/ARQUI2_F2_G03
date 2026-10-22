@@ -91,6 +91,46 @@
 </section>
 
 <section class="panel tab-panel" data-tab-panel="operacion">
+  <h2>Estacion meteorologica e iluminacion</h2>
+  <div class="sin-fila2">
+    <div class="sin-bloque">
+      <div class="sin-tit">Lectura en vivo (MQTT)</div>
+      <p id="est-temp">Temp: —</p>
+      <p id="est-hum">Humedad: —</p>
+      <p id="est-lluvia">Lluvia: —</p>
+      <p id="est-luz">Luz (0–100): —</p>
+      <p class="muted" id="est-ts">Sin datos aun</p>
+    </div>
+    <div class="sin-bloque">
+      <div class="sin-tit">Iluminacion de planta (sec. 4.2)</div>
+      <p>Tira LED: <strong id="ilum-estado" class="chip">—</strong>
+        <span class="muted">Modo: <span id="ilum-modo">—</span></span></p>
+      <form id="ilum-modo-form" class="inline-form">
+        <label>Modo
+          <select id="ilum-modo-select">
+            <option value="Automatico">Automatico</option>
+            <option value="Encendido forzado">Encendido forzado</option>
+            <option value="Apagado forzado">Apagado forzado</option>
+          </select>
+        </label>
+        <button type="submit">Aplicar modo</button>
+      </form>
+      <form id="ilum-umbrales-form" class="inline-form">
+        <label>Umbral encender (&lt;)
+          <input id="ilum-umbral-on" type="number" min="0" max="95" value="30" />
+        </label>
+        <label>Umbral apagar (&gt;)
+          <input id="ilum-umbral-off" type="number" min="5" max="100" value="45" />
+        </label>
+        <button type="submit">Guardar umbrales</button>
+      </form>
+      <p class="muted">Clima: suspension automatica de grua si lluvia (sec. 4.3).
+        <span id="ilum-clima">—</span></p>
+    </div>
+  </div>
+</section>
+
+<section class="panel tab-panel" data-tab-panel="operacion">
   <h2>Controles</h2>
   <div class="controles">
     <button type="button" id="btn-suspender">Suspender grua</button>

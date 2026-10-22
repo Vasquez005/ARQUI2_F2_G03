@@ -8,6 +8,7 @@
 //   portus/srv/alarma     -> alarma nueva generada por el backend
 //   portus/srv/cambio     -> cambio de un turno, retencion, plaza, posicion, intento,
 //                            cita o franja (las citas del bot tambien se anuncian)
+//   portus/estacion/#     -> lecturas de la estacion meteorologica (ESP32)
 // Ante un portus/srv/cambio se vuelve a pedir SOLO lo que cambio. El unico
 // temporizador redibuja relojes y la antiguedad del enlace; no consulta nada.
 (function () {
@@ -45,6 +46,8 @@
     patio: [],
     alarmasActivas: 0,
     eventosGrua: [],
+    estacion: null,
+    iluminacion: null,
   };
 
   // ════════════════════════ utilidades ════════════════════════
@@ -569,7 +572,57 @@
     el.className = `chip ${conectado ? "chip-ok" : "chip-bad"}`;
   }
 
+  function renderEstacionIluminacion() {
+    const e = st.estacion;
+    const set = (id, txt) => { const el = $(id); if (el) el.textContent = txt; };
+    if (e) {
+      set("est-temp", `Temp: ${e.temperatura != null ? `${e.temperatura} °C` : "—"}`);
+      set("est-hum", `Humedad: ${e.humedad != null ? `${e.humedad} %` : "—"}`);
+      set("est-lluvia", `Lluvia: ${e.lluvia === true ? "Si" : e.lluvia === false ? "No" : "—"}`);
+      set("est-luz", `Luz (0–100): ${e.luz != null ? e.luz : "—"}`);
+      set("est-ts", e.uptime_s != null ? `Uptime ESP32: ${e.uptime_s} s` : "Recibido por MQTT");
+    }
+    const il = st.iluminacion;
+    if (il) {
+      const enc = il.encendida;
+      const chip = $("ilum-estado");
+      if (chip) {
+        chip.textContent = enc === true ? "Encendida" : enc === false ? "Apagada" : "—";
+        chip.className = `chip ${enc ? "chip-ok" : "chip-idle"}`;
+      }
+      set("ilum-modo", il.modo || "—");
+      const sel = $("ilum-modo-select");
+      if (sel && il.modo) sel.value = il.modo;
+      const on = $("ilum-umbral-on");
+      const off = $("ilum-umbral-off");
+      if (on && il.umbral_encendido != null) on.value = il.umbral_encendido;
+      if (off && il.umbral_apagado != null) off.value = il.umbral_apagado;
+      set("ilum-clima", il.clima_suspendido_por_lluvia ? "Grua suspendida por lluvia" : "Sin suspension por lluvia");
+    }
+  }
+
+  async function cargarIluminacionEstado() {
+    try {
+      const r = await apiFetch("/api/terminal/iluminacion/estado");
+      st.iluminacion = r;
+      renderEstacionIluminacion();
+    } catch (_) { /* sin backend */ }
+    try {
+      const lec = await apiFetch("/api/terminal/estacion/lectura");
+      if (lec.lectura) {
+        st.estacion = lec.lectura;
+        renderEstacionIluminacion();
+      }
+    } catch (_) { /* sin lectura aun */ }
+  }
+
   function recibir(topic, payload, enVivo) {
+    if (topic === "portus/estacion/lectura" && payload && typeof payload === "object") {
+      st.estacion = payload;
+      renderEstacionIluminacion();
+      if (enVivo) cargarIluminacionEstado();
+      return;
+    }
     if (topic === "portus/srv/cambio") {
       if (!enVivo) return;
       programarRecarga(...(RECARGA_POR_ENTIDAD[payload.entidad] || []));
@@ -606,6 +659,7 @@
         recientes.forEach((e) => recibir(e.topic, e.payload, false));
         recientes.forEach((e) => agregarBitacora(e.topic, e.payload, new Date(e.ts)));
         renderSinoptico();
+        renderEstacionIluminacion();
         return;
       }
       if (msg.kind === "status") {
@@ -617,10 +671,32 @@
         recibir(msg.topic, msg.payload, true);
         agregarBitacora(msg.topic, msg.payload, new Date());
         renderSinoptico();
+        renderEstacionIluminacion();
         if (msg.topic === "portus/evt/grua" && cargadas.has("grua")) renderTablaGrua();
       }
     });
   }
+
+  $("ilum-modo-form")?.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const modo = $("ilum-modo-select")?.value;
+    if (!modo) return;
+    await apiFetch("/api/terminal/iluminacion/modo", { method: "POST", body: { modo, origen: "TERMINAL" } });
+    await cargarIluminacionEstado();
+  });
+
+  $("ilum-umbrales-form")?.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const umbral_encendido = Number($("ilum-umbral-on")?.value);
+    const umbral_apagado = Number($("ilum-umbral-off")?.value);
+    await apiFetch("/api/terminal/iluminacion/umbrales", {
+      method: "POST",
+      body: { umbral_encendido, umbral_apagado },
+    });
+    await cargarIluminacionEstado();
+  });
+
+  cargarIluminacionEstado();
 
   // ════════════════════════ pestaña Turnos ════════════════════════
 

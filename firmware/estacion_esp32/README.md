@@ -72,7 +72,19 @@ Ejemplo de config manual:
 mosquitto_pub -t portus/estacion/config -m "SegundosLecturaEstacion=5;SegundosLatidoEstacion=10"
 ```
 
-## 6. Comportamiento ante fallas
+## 6. Integracion con iluminacion y clima (servidor)
+
+1. El **backend** recibe `portus/estacion/lectura` y usa **`luz`** (0–100) para mandar
+   `IluminacionEncender` / `IluminacionApagar` al **Mega** (pin **24**, tira LED).
+2. Si **`lluvia`** es `true`, el servidor manda **`GruaSuspender;motivo=Clima`**; al cesar,
+   **`GruaReanudar;origen=auto`** (baliza pin **27** en el Mega).
+3. Al conectar MQTT, el backend publica **`portus/estacion/config`** con los intervalos por defecto
+   (variables de entorno opcionales `PORTUS_ESTACION_LECTURA_S`, `PORTUS_ESTACION_LATIDO_S`).
+4. En la web TERMINAL, pestaña **Operacion**: panel de lectura en vivo e iluminacion.
+
+Requisitos: Mosquitto, backend, bridge al Mega y ESP32 en la misma red WiFi que `MQTT_HOST`.
+
+## 7. Comportamiento ante fallas
 
 - Sin WiFi o sin broker: **sigue midiendo** e imprime JSON en serie; reconecta cada **5 s**, **sin reiniciar**.
 - Al recuperar MQTT, **reanuda** publicación en los topics.

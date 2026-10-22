@@ -543,6 +543,36 @@ def terminal_reconocer_todas(user: dict = Depends(require_role(Role.TERMINAL))):
 
 # ── Grua (sec. 4.5) ──
 
+@app.get("/api/terminal/estacion/lectura")
+def terminal_estacion_lectura(user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/estacion/lectura")
+
+
+@app.get("/api/terminal/iluminacion/estado")
+def terminal_iluminacion_estado(user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/iluminacion/estado")
+
+
+class ModoIluminacionIn(BaseModel):
+    modo: str
+    origen: str = "TERMINAL"
+
+
+class UmbralesIluminacionIn(BaseModel):
+    umbral_encendido: int
+    umbral_apagado: int
+
+
+@app.post("/api/terminal/iluminacion/modo")
+def terminal_iluminacion_modo(body: ModoIluminacionIn, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", "/iluminacion/modo", body.model_dump())
+
+
+@app.post("/api/terminal/iluminacion/umbrales")
+def terminal_iluminacion_umbrales(body: UmbralesIluminacionIn, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", "/iluminacion/umbrales", body.model_dump())
+
+
 @app.get("/api/terminal/grua/estado")
 def terminal_grua_estado(user: dict = Depends(require_role(Role.TERMINAL))):
     return backend("GET", "/grua/estado")
@@ -815,6 +845,7 @@ def start_mqtt_listener() -> None:
         client.subscribe("portus/cmd/respuesta")  # ACK/REJ que se le muestra al operador (sec. 11.1)
         # Del backend: alarmas nuevas y cambios de turnos, retenciones, parqueo y patio
         client.subscribe("portus/srv/#")
+        client.subscribe("portus/estacion/#")
         _publish_to_ws_from_thread({"kind": "status", "connected": event_bus.connected})
         _publish_to_roles_from_thread({"kind": "status", "connected": event_bus.connected})
 

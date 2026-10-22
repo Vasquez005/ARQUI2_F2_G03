@@ -11,6 +11,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 
+import estacion
 import grua
 import iluminacion
 import orquestador
@@ -40,9 +41,8 @@ started = False
 orquestador.anunciar_cambios(SessionLocal, lambda t, p: mqttc.publish(t, p))
 
 
-# Fase 3 (sec. 4.2): la luz que mide la estacion decide la tira LED. El servidor
-# manda IluminacionEncender / IluminacionApagar solo cuando cambia el estado.
-def _enviar_comando_iluminacion(name: str, target: str, params: dict) -> None:
+# Fase 3: estacion meteorologica -> iluminacion (luz) y clima (lluvia -> grua).
+def _enviar_comando_mega(name: str, target: str, params: dict) -> None:
     with SessionLocal() as db:
         make_publish_and_audit(db)(name, target, params)
         db.commit()
@@ -58,20 +58,30 @@ def _auditar_iluminacion(detalle: dict) -> None:
 
 
 control_iluminacion = iluminacion.ControlIluminacion(
-    enviar=_enviar_comando_iluminacion, auditar=_auditar_iluminacion,
+    enviar=_enviar_comando_mega, auditar=_auditar_iluminacion,
 )
+registro_estacion = estacion.RegistroEstacion()
+control_clima_lluvia = estacion.ControlClimaLluvia(enviar=_enviar_comando_mega)
+
+
+def _publicar_config_estacion_mqtt() -> None:
+    seg_l = int(os.getenv("PORTUS_ESTACION_LECTURA_S", estacion.CONFIG_LECTURA_DEFECTO_S))
+    seg_t = int(os.getenv("PORTUS_ESTACION_LATIDO_S", estacion.CONFIG_LATIDO_DEFECTO_S))
+    try:
+        msg = estacion.mensaje_config_estacion(seg_l, seg_t)
+        mqttc.publish(estacion.TOPIC_CONFIG, msg)
+        print(f"[ESTACION] config publicada: {msg}")
+    except ValueError as exc:
+        print(f"[ESTACION] config no publicada: {exc!r}")
 
 
 def _procesar_lectura_estacion(payload: dict) -> None:
-    """portus/estacion/lectura: el campo `luz` (escala 0-100) decide la iluminacion."""
     try:
-        luz = float(payload["luz"])
-    except (KeyError, TypeError, ValueError):
-        return
-    try:
-        control_iluminacion.procesar_lectura(luz)
-    except Exception as exc:  # una lectura rara no debe tumbar el hilo MQTT
-        print(f"[ILUMINACION] error: {exc!r}")
+        estacion.procesar_lectura_estacion(
+            payload, registro_estacion, control_iluminacion, control_clima_lluvia,
+        )
+    except Exception as exc:
+        print(f"[ESTACION] error procesando lectura: {exc!r}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -163,6 +173,8 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe("portus/cmd/respuesta")
     client.subscribe("portus/estacion/#")
     upsert_link_status(connected=True)
+    if rc == 0:
+        _publicar_config_estacion_mqtt()
 
 
 def on_disconnect(client, userdata, flags, rc, properties=None):
@@ -194,6 +206,9 @@ def on_message(client, userdata, msg):
 
     if topic == "portus/evt/iluminacion" and payload.get("data", {}).get("evento") == "enlace_restablecido":
         control_iluminacion.resincronizar()
+
+    if topic.startswith("portus/estacion/"):
+        return
 
     # Fase 1: los eventos de garitas y pesaje avanzan el turno solos.
     try:
@@ -320,6 +335,16 @@ class ModoIluminacionIn(BaseModel):
     origen: str = "API"
 
 
+class UmbralesIluminacionIn(BaseModel):
+    umbral_encendido: int
+    umbral_apagado: int
+
+
+class ConfigEstacionIn(BaseModel):
+    segundos_lectura: int = estacion.CONFIG_LECTURA_DEFECTO_S
+    segundos_latido: int = estacion.CONFIG_LATIDO_DEFECTO_S
+
+
 @app.post("/iluminacion/modo")
 def cambiar_modo_iluminacion(body: ModoIluminacionIn):
     try:
@@ -329,6 +354,22 @@ def cambiar_modo_iluminacion(body: ModoIluminacionIn):
     return {"ok": True, "modo": control_iluminacion.modo}
 
 
+@app.post("/iluminacion/umbrales")
+def cambiar_umbrales_iluminacion(body: UmbralesIluminacionIn):
+    try:
+        control_iluminacion.cambiar_umbrales(body.umbral_encendido, body.umbral_apagado)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    ultima = registro_estacion.ultima()
+    if ultima and ultima.luz is not None and control_iluminacion.modo == iluminacion.MODO_AUTOMATICO:
+        control_iluminacion.procesar_lectura(ultima.luz)
+    return {
+        "ok": True,
+        "umbral_encendido": control_iluminacion.umbral_encendido,
+        "umbral_apagado": control_iluminacion.umbral_apagado,
+    }
+
+
 @app.get("/iluminacion/estado")
 def estado_iluminacion():
     return {
@@ -336,7 +377,26 @@ def estado_iluminacion():
         "encendida": control_iluminacion.encendida,
         "umbral_encendido": control_iluminacion.umbral_encendido,
         "umbral_apagado": control_iluminacion.umbral_apagado,
+        "clima_suspendido_por_lluvia": control_clima_lluvia.suspendido_por_lluvia,
     }
+
+
+@app.get("/estacion/lectura")
+def ultima_lectura_estacion():
+    ultima = registro_estacion.ultima()
+    if not ultima:
+        return {"ok": True, "lectura": None}
+    return {"ok": True, "lectura": ultima.to_dict()}
+
+
+@app.post("/estacion/config")
+def publicar_config_estacion(body: ConfigEstacionIn):
+    try:
+        msg = estacion.mensaje_config_estacion(body.segundos_lectura, body.segundos_latido)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    mqttc.publish(estacion.TOPIC_CONFIG, msg)
+    return {"ok": True, "mensaje": msg}
 
 
 @app.post("/commands/send")
