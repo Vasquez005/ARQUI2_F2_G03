@@ -18,6 +18,11 @@ model = YOLO(RUTA_MODELO)
 # QUE: fraccion de la caja de YOLO que se agrega a cada lado antes del OCR (8 %).
 MARGEN_CAJA = 0.08
 
+# QUE: parametro configurable (sec. 5.3, rango 30 a 95). Una lectura solo es valida si la alcanza.
+# Valor del enunciado: 60. Valor usado en pruebas: 30, por fotos tomadas con luz variable en un salon
+# (decision declarada en la bitacora; las lecturas reales se reportan tal cual).
+CONFIANZA_MINIMA_OCR = 30
+
 # QUE: OCR preentrenado de EasyOCR, en CPU (la Raspberry no tiene GPU).
 reader = easyocr.Reader(["en"], gpu=False, verbose=False)
 
@@ -117,6 +122,7 @@ def leer_placa(ruta_imagen):
             "placa": texto,
             "confianza_deteccion": round(conf_det, 3),
             "confianza_ocr": round(conf_ocr, 3),
+            "valida": bool(texto) and conf_ocr * 100 >= CONFIANZA_MINIMA_OCR,
             "bbox": [x1, y1, x2, y2],
         })
 
@@ -138,4 +144,5 @@ if __name__ == "__main__":
             print(f"  #{i}  PLACA: {p['placa'] or '[no leida]'}"
                   f"   det={p['confianza_deteccion']:.0%}"
                   f"   ocr={p['confianza_ocr']:.0%}"
+                  f"   valida={'si' if p['valida'] else 'no'}"
                   f"   bbox={p['bbox']}")
