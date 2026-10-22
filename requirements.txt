@@ -1,0 +1,8 @@
+# PORTUS - Vision (Mac / PC con pantalla)
+ultralytics
+paddlepaddle
+paddleocr
+opencv-python
+numpy
+paho-mqtt
+pyserial

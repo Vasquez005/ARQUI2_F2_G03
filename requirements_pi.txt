@@ -1,0 +1,9 @@
+# PORTUS - Vision (Raspberry Pi 5, sin pantalla)
+ultralytics
+opencv-python-headless
+numpy
+paho-mqtt
+pyserial
+# OCR: intenta paddle primero; si falla en ARM, instala easyocr
+paddlepaddle
+paddleocr
