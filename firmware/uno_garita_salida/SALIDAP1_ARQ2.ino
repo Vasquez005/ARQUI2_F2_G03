@@ -387,7 +387,7 @@ void semaforoAmarillo() {
 void semaforoVerde() {
   digitalWrite(PIN_LED_ROJO, LOW);
   digitalWrite(PIN_LED_AMARILLO, LOW);
-  digitalWrite(PIN_LED_VERDE, LOW);
+  digitalWrite(PIN_LED_VERDE, HIGH);
 }
 
 void mostrarEstado() {
