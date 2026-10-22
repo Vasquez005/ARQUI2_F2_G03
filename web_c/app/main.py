@@ -390,6 +390,11 @@ def terminal_intentos(estacion: Optional[str] = None, user: dict = Depends(requi
     return backend("GET", "/garita/intentos", params={"estacion": estacion})
 
 
+@app.get("/api/terminal/vision")
+def terminal_vision(user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("GET", "/vision/estado")
+
+
 @app.get("/api/terminal/vehiculos")
 def terminal_vehiculos(user: dict = Depends(require_role(Role.TERMINAL))):
     return backend("GET", "/vehiculos")
@@ -815,6 +820,7 @@ def start_mqtt_listener() -> None:
         client.subscribe("portus/cmd/respuesta")  # ACK/REJ que se le muestra al operador (sec. 11.1)
         # Del backend: alarmas nuevas y cambios de turnos, retenciones, parqueo y patio
         client.subscribe("portus/srv/#")
+        client.subscribe("portus/vision/#")
         _publish_to_ws_from_thread({"kind": "status", "connected": event_bus.connected})
         _publish_to_roles_from_thread({"kind": "status", "connected": event_bus.connected})
 
@@ -826,7 +832,8 @@ def start_mqtt_listener() -> None:
     def on_message(client, userdata, msg):
         payload = _safe_json_decode(msg.payload)
         topic = msg.topic
-        event_bus.store_event(topic, payload)
+        if topic != "portus/vision/estado":
+            event_bus.store_event(topic, payload)
         if topic == "portus/evt/estado":
             event_bus.last_heartbeat_iso = datetime.now(timezone.utc).isoformat()
         _publish_to_ws_from_thread(

@@ -46,8 +46,10 @@ RT03 = "RT03"  # Canal rojo de selectivo
 RT04 = "RT04"  # Llegada fuera de la ventana asignada
 RT05 = "RT05"  # Retencion documental
 RT06 = "RT06"  # Retencion manual operativa
+RT07 = "RT07"  # La placa leida no corresponde a la etiqueta
+RT08 = "RT08"  # Placa restringida por la autoridad
 
-CAUSAS_RETENCION = (RT01, RT02, RT03, RT04, RT05, RT06)
+CAUSAS_RETENCION = (RT01, RT02, RT03, RT04, RT05, RT06, RT07, RT08)
 
 ROL_FACULTADO_POR_CAUSA = {
     RT01: "TERMINAL",
@@ -56,6 +58,8 @@ ROL_FACULTADO_POR_CAUSA = {
     RT04: "TERMINAL",
     RT05: "AUTORIDAD",
     RT06: "TERMINAL",
+    RT07: "TERMINAL",
+    RT08: "AUTORIDAD",
 }
 
 RESOLUCIONES = ("aclarar", "corregir", "rechazar")
@@ -76,6 +80,13 @@ CATALOGO_ALARMAS = {
     "AL12": ("media", "Retencion que supera treinta minutos"),
     "AL13": ("baja", "Permanencia de contenedor superior a dos horas"),
     "AL14": ("baja", "Comando remoto rechazado por el controlador"),
+    "AL16": ("alta", "Estacion meteorologica sin comunicacion"),
+    "AL17": ("media", "Lluvia detectada, grua suspendida"),
+    "AL18": ("alta", "Camara o modelo de vision fuera de servicio"),
+    "AL19": ("media", "Congestion en la zona de espera"),
+    "AL20": ("alta", "Placa leida no corresponde a la etiqueta"),
+    "AL21": ("critica", "Placa restringida detectada en la garita"),
+    "AL22": ("media", "Verificacion manual de ingreso requerida"),
 }
 
 SEVERIDADES_AUTO_RECONOCIBLES = ("media", "baja")  # boton "Reconocer todas" (sec. 4.6)
@@ -120,3 +131,11 @@ ESTADOS_EN_ESPERA = (EN_GARITA, EN_RUTA)
 
 # Distancia de la grua: el Mega cuenta marcas (tramos entre posiciones).
 CM_POR_TRAMO = float(os.getenv("PORTUS_CM_POR_TRAMO", "0"))  # 0 = reportar solo tramos
+
+# ── Vision (Fase 3, sec. 5): el servicio vision/ publica portus/vision/*
+CONFIANZA_MINIMA_OCR = float(os.getenv("PORTUS_CONFIANZA_OCR", "0.60"))
+INTENTOS_OCR = max(1, min(5, int(os.getenv("PORTUS_INTENTOS_OCR", "3"))))
+# 0 = Fase 2 intacta (RFID abre). 1 = RFID + placa (RT07/RT08/AL20-22).
+EXIGIR_PLACA = os.getenv("PORTUS_EXIGIR_PLACA", "0") == "1"
+VISION_URL = os.getenv("PORTUS_VISION_URL", "http://127.0.0.1:8200")
+SEGUNDOS_VISION_MUERTA = int(os.getenv("PORTUS_VISION_MUERTA", "20"))

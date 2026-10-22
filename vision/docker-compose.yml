@@ -1,0 +1,41 @@
+# Mongo (obligatorio) + servicio de vision en Python 3.12.
+# La camara USB se pasa al contenedor como /dev/video0.
+#
+#   cd vision
+#   bash descargar_modelo.sh
+#   docker compose up -d mongo
+#   docker compose up --build vision
+
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - portus_mongo:/data/db
+
+  vision:
+    build: .
+    ports:
+      - "8200:8200"
+    depends_on:
+      - mongo
+    environment:
+      PORTUS_MONGO_URI: mongodb://mongo:27017
+      PORTUS_MQTT_HOST: ${PORTUS_MQTT_HOST:-host.docker.internal}
+      PORTUS_MQTT_PORT: ${PORTUS_MQTT_PORT:-1883}
+      PORTUS_CAMARA: ${PORTUS_CAMARA:-0}
+      PORTUS_ROI_GARITA: ${PORTUS_ROI_GARITA:-}
+      PORTUS_PLACAS_SEMILLA: ${PORTUS_PLACAS_SEMILLA:-C-001,C-002,C-003}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    devices:
+      - /dev/video0:/dev/video0
+    group_add:
+      - video
+    volumes:
+      - ./models:/app/models
+      - ./capturas:/app/capturas
+
+volumes:
+  portus_mongo:

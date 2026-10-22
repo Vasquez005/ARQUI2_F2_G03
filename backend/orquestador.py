@@ -34,9 +34,9 @@ from sqlalchemy import event, select
 
 import grua
 import servicios
-from catalogos import ANULADO, EN_GARITA, EN_PESAJE_ENTRADA, EN_SALIDA, RETENIDO
+from catalogos import ANULADO, EN_GARITA, EN_PESAJE_ENTRADA, EN_SALIDA, EXIGIR_PLACA, RETENIDO, VISION_URL
 from models import (
-    Alarma, Cita, CommandAudit, Declaracion, FranjaBloqueada, GruaCiclo, IntentoIngreso, Manifiesto,
+    Alarma, Cita, CommandAudit, Declaracion, EstadoVision, FranjaBloqueada, GruaCiclo, IntentoIngreso, LecturaVision, Manifiesto,
     ParqueoPlaza, PosicionPatio, Retencion, Transportista, Turno, Vehiculo,
 )
 
@@ -48,6 +48,7 @@ ENTIDADES_ANUNCIADAS = {
     PosicionPatio: "patio", IntentoIngreso: "intento", Cita: "cita", FranjaBloqueada: "franja",
     GruaCiclo: "ciclo", Manifiesto: "manifiesto", Declaracion: "declaracion",
     Transportista: "transportista", Vehiculo: "vehiculo",
+    LecturaVision: "vision", EstadoVision: "vision",
 }
 
 EnviarMqtt = Callable[[str, str], None]  # (topic, payload_json)
@@ -86,12 +87,30 @@ def _confirmar(db, pub: PublicadorDiferido) -> None:
 #  Garita de entrada
 # ══════════════════════════════════════════════════════════════════════════
 
+def _pedir_placa(uid: str, enviar_mqtt: EnviarMqtt) -> tuple:
+    """Dispara la camara. Si EXIGIR_PLACA, espera el OCR por HTTP."""
+    enviar_mqtt("portus/vision/capturar", json.dumps({"uid": uid}, ensure_ascii=False))
+    if not EXIGIR_PLACA:
+        return "", 0.0
+    try:
+        import urllib.request
+        url = f"{VISION_URL.rstrip('/')}/capturar?uid={uid}"
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            cuerpo = json.loads(resp.read().decode("utf-8"))
+        lectura = cuerpo.get("lectura") or {}
+        return lectura.get("placa") or "", float(lectura.get("confianza") or 0)
+    except Exception as exc:
+        print(f"[VISION] no se pudo capturar placa: {exc!r}")
+        return "", 0.0
+
+
 def _garita_rfid(db, pub: PublicadorDiferido, datos: dict) -> None:
     uid = servicios.normalizar_uid(datos.get("uid", ""))
     if not uid:
         return
+    placa, confianza = _pedir_placa(uid, pub._enviar_mqtt)
     try:
-        servicios.ingreso_por_rfid(db, uid, publish_cmd=pub)
+        servicios.ingreso_por_rfid(db, uid, publish_cmd=pub, placa_leida=placa, confianza=confianza)
         _confirmar(db, pub)
     except servicios.ReglaDeNegocioError as exc:
         db.rollback()
@@ -285,10 +304,25 @@ MANEJADORES = {
 }
 
 
+def procesar_vision(session_factory, topic: str, datos: dict) -> None:
+    """Resultados del servicio vision/ (no son frames PORTUS)."""
+    with session_factory() as db:
+        if topic == "portus/vision/placa":
+            servicios.registrar_lectura_vision(db, datos)
+        elif topic == "portus/vision/estado":
+            servicios.actualizar_estado_vision(db, datos)
+        else:
+            return
+        db.commit()
+
+
 def procesar_evento(session_factory, enviar_mqtt: EnviarMqtt, topic: str, datos: dict,
                     origen: str = "") -> bool:
     """Punto de entrada desde app.py:on_message. Devuelve True si el evento
     tenia un manejador."""
+    if topic.startswith("portus/vision/"):
+        procesar_vision(session_factory, topic, datos)
+        return True
     if topic == "portus/evt/alarma":
         with session_factory() as db:
             _alarma_controlador(db, PublicadorDiferido(db, enviar_mqtt), datos, origen)

@@ -126,6 +126,7 @@ def alarmas_por_tiempo_loop() -> None:
 def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe("portus/evt/#")
     client.subscribe("portus/cmd/respuesta")
+    client.subscribe("portus/vision/#")
     upsert_link_status(connected=True)
 
 
@@ -143,6 +144,15 @@ def on_message(client, userdata, msg):
     origin = payload.get("origin", "")
     evt_type = payload.get("type", "")
     seq = int(payload.get("seq", 0))
+
+    if topic.startswith("portus/vision/"):
+        if topic == "portus/vision/capturar":
+            return
+        try:
+            orquestador.procesar_vision(SessionLocal, topic, payload)
+        except Exception as exc:
+            print(f"[VISION] error procesando {topic}: {exc!r}")
+        return
 
     with SessionLocal() as db:
         db.add(
@@ -455,6 +465,12 @@ class VehiculoIn(BaseModel):
     transportista_id: Optional[int] = None
     placa: str = ""
     activo: bool = True
+
+
+@app.get("/vision/estado")
+def vision_estado():
+    with SessionLocal() as db:
+        return servicios.estado_vision_dict(db)
 
 
 @app.get("/vehiculos")

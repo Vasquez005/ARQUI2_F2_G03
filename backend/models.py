@@ -285,10 +285,41 @@ class Retencion(Base):
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
+class PlacaRestringida(Base):
+    """Lista de la autoridad: si la camara lee una de estas, RT08 / AL21."""
+    __tablename__ = "placas_restringidas"
+    placa: Mapped[str] = mapped_column(String(16), primary_key=True)
+    motivo: Mapped[str] = mapped_column(String(80), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class LecturaVision(Base):
+    """Ultima lectura de placa (servicio vision/ -> portus/vision/placa)."""
+    __tablename__ = "lecturas_vision"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    uid: Mapped[str] = mapped_column(String(32), default="")
+    placa: Mapped[str] = mapped_column(String(16), default="")
+    confianza: Mapped[float] = mapped_column(Float, default=0.0)
+    resultado: Mapped[str] = mapped_column(String(24), default="")  # ok|no_leida|no_corresponde|restringida
+    foto: Mapped[str] = mapped_column(String(200), default="")
+    intento: Mapped[int] = mapped_column(Integer, default=1)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class EstadoVision(Base):
+    """Una sola fila: latido de la camara (portus/vision/estado)."""
+    __tablename__ = "estado_vision"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    camara: Mapped[str] = mapped_column(String(16), default="desconocida")
+    modelos: Mapped[str] = mapped_column(String(16), default="desconocida")
+    detalle: Mapped[str] = mapped_column(String(120), default="")
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Alarma(Base):
     __tablename__ = "alarmas"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    codigo: Mapped[str] = mapped_column(String(8), index=True)  # AL01..AL14
+    codigo: Mapped[str] = mapped_column(String(8), index=True)  # AL01..AL22
     severidad: Mapped[str] = mapped_column(String(12))  # critica|alta|media|baja
     origen: Mapped[str] = mapped_column(String(32), default="")
     descripcion: Mapped[str] = mapped_column(String(200), default="")
