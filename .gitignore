@@ -10,10 +10,3 @@ __pycache__/
 *.db-wal
 *.db-shm
 .runtime/
-
-# Vision (pesos grandes, fotos de prueba, venv 3.12)
-vision/.venv/
-vision/models/*.pt
-vision/capturas/*.jpg
-vision/capturas/*.jpeg
-vision/capturas/*.png

@@ -39,7 +39,6 @@
     grua: { estado: null, pos: null, suspendida: false, mantenimiento: false, trabajo: null },
     // Estado que manda el Mega: alineado, en curso, abortado (null = se deduce de los turnos)
     transferencia: { estado: null, clase: "idle", detalle: "" },
-    vision: { camara: "desconocida", placa: "", confianza: 0, uid: "" },
     gruaServidor: { trabajoEnCurso: null, cola: [] }, // GET /grua/estado
     turnosActivos: [],
     parqueo: [],
@@ -312,12 +311,6 @@
 
     setEl("el-garita", st.garita.estado, st.garita.clase);
     $("el-garita-sub").innerHTML = `${chipVehiculo(st.garita.uid)} ${escapeHtml(st.garita.detalle || "")}`;
-    const elPlaca = $("el-placa");
-    if (elPlaca) {
-      const cam = st.vision.camara === "ok" ? "camara ok" : `camara ${st.vision.camara || "desconocida"}`;
-      const placa = st.vision.placa ? `${st.vision.placa} (${Math.round((st.vision.confianza || 0) * 100)}%)` : "-";
-      elPlaca.textContent = `placa: ${placa} · ${cam}`;
-    }
 
     const tal = st.talanquera;
     setEl("el-talanquera", tal.moviendo ? "En movimiento" : (tal.estado ? (tal.estado === "abierta" ? "Abierta" : "Cerrada") : "-"),
@@ -440,16 +433,6 @@
     st.parqueo = data.parqueo || [];
   }
 
-  async function cargarVision() {
-    try {
-      const e = await apiFetch("/api/terminal/vision");
-      st.vision.camara = e.camara || "desconocida";
-      st.vision.placa = e.ultimaPlaca || "";
-      st.vision.confianza = e.confianza || 0;
-      st.vision.uid = e.uid || "";
-    } catch (_) { /* el servicio de vision es opcional */ }
-  }
-
   // Recargas por evento, agrupadas: varios cambios seguidos -> una sola peticion
   const pendientes = new Set();
   let temporizadorRecarga = null;
@@ -562,9 +545,6 @@
     if (!msg || typeof msg !== "object") return String(msg);
     if (topic === "portus/srv/alarma") return `ALARMA ${msg.codigo} (${msg.severidad}): ${msg.descripcion}`;
     if (topic === "portus/srv/cambio") return `servidor: cambio en ${msg.entidad} ${msg.id}`;
-    if (topic === "portus/vision/placa") return `vision placa=${msg.placa || "-"} conf=${msg.confianza || 0} uid=${msg.uid || ""}`;
-    if (topic === "portus/vision/estado") return `vision camara=${msg.camara} modelos=${msg.modelos || ""}`;
-    if (topic === "portus/vision/capturar") return `vision capturar uid=${msg.uid || ""}`;
     const datos = Object.entries(msg.data || {}).map(([k, v]) => `${k}=${v}`).join(" ");
     return `${msg.origin || "?"} ${msg.type || ""} ${topic.replace("portus/", "")} ${datos}`;
   }
@@ -573,7 +553,6 @@
     const log = $("event-log");
     if (!log) return;
     if (topic === "portus/evt/estado") return; // los latidos llenarian la bitacora; van en "Estado del enlace"
-    if (topic === "portus/vision/estado") return;
     const row = document.createElement("div");
     row.className = `log-row${topic.startsWith("portus/srv") ? " log-srv" : ""}`;
     row.textContent = `${fmtHora(cuando)}  ${describirEvento(topic, msg)}`;
@@ -601,18 +580,6 @@
     }
     if (topic === "portus/srv/alarma") {
       if (enVivo) alarmaNueva(payload);
-      return;
-    }
-    if (topic === "portus/vision/placa") {
-      st.vision.placa = payload.placa || "";
-      st.vision.confianza = payload.confianza || 0;
-      st.vision.uid = payload.uid || "";
-      renderSinoptico();
-      return;
-    }
-    if (topic === "portus/vision/estado") {
-      st.vision.camara = payload.camara || "desconocida";
-      renderSinoptico();
       return;
     }
     aplicarEvento(topic, payload, enVivo);
@@ -1354,7 +1321,7 @@
   (async () => {
     try {
       await Promise.all([cargarTurnosActivos(), cargarPatio(), cargarGruaServidor(), cargarTransportistas(),
-        contarAlarmasActivas(), cargarVision()]);
+        contarAlarmasActivas()]);
     } catch (err) {
       toast(`Error cargando datos iniciales: ${err.message}`, "toast-bad");
     }

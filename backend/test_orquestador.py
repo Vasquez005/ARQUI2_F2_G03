@@ -59,7 +59,7 @@ class MaquetaBase(unittest.TestCase):
                                     f"portus/evt/{topic}", datos)
 
     def comandos(self, nombre):
-        return [c for c in self.enviados if isinstance(c, dict) and c.get("name") == nombre]
+        return [c for c in self.enviados if c["name"] == nombre]
 
     def turno(self, uid):
         with self.Session() as db:
@@ -162,7 +162,7 @@ class CicloFisicoTests(MaquetaBase):
 
     def test_no_publica_nada_si_la_transaccion_se_deshace(self):
         self.evento("garita", evento="rfid", uid=UID_DESCONOCIDO)
-        self.assertEqual([c["name"] for c in self.enviados if "name" in c], ["RechazarIngreso"])
+        self.assertEqual([c["name"] for c in self.enviados], ["RechazarIngreso"])
 
 
 if __name__ == "__main__":

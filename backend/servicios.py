@@ -9,20 +9,20 @@ todavia — eso sigue pendiente de Persona C.
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Optional
 
 from sqlalchemy import select
 
 from catalogos import (
-    ANULADO, CATALOGO_ALARMAS, CERRADO, CONFIANZA_MINIMA_OCR, EN_GARITA,
+    ANULADO, CATALOGO_ALARMAS, CERRADO, EN_GARITA,
     EN_PESAJE_ENTRADA, EN_PESAJE_SALIDA, EN_RUTA, EN_SALIDA, EN_TRANSFERENCIA,
-    ESTADOS_FINALES, EXIGIR_PLACA, MINUTOS_AL12_RETENCION, MINUTOS_AL13_PATIO, MINUTOS_EXPIRA_CODIGO, ROL_FACULTADO_POR_CAUSA, RESOLUCIONES, RETENIDO,
+    ESTADOS_FINALES, MINUTOS_AL12_RETENCION, MINUTOS_AL13_PATIO, MINUTOS_EXPIRA_CODIGO, ROL_FACULTADO_POR_CAUSA, RESOLUCIONES, RETENIDO,
     CITAS_POR_FRANJA, HORARIO_AGENDA, MINUTOS_FRANJA,
     RT01, RT02, RT03, RT04, SEVERIDADES_AUTO_RECONOCIBLES, TOLERANCIA_VENTANA_MIN,
     TRANSICIONES, ZONA_HORARIA,
 )
 from models import (
-    Alarma, Cita, CommandAudit, EstadoVision, FranjaBloqueada, IntentoIngreso, LecturaVision, ManifiestoEvento, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PlacaRestringida, PosicionPatio,
+    Alarma, Cita, CommandAudit, FranjaBloqueada, IntentoIngreso, ManifiestoEvento, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
     Retencion, Transportista, Turno, EventoTurno, Vehiculo,
 )
 
@@ -1014,9 +1014,6 @@ MOTIVO_LCD = {
     "sin_turno": "Sin turno activo",
     "retenido": "Retenido",
     "pesaje_pendiente": "Falta pesaje",
-    "placa_no_corresponde": "Placa no coincide",
-    "placa_restringida": "Placa restringida",
-    "placa_no_leida": "Verificar manual",
 }
 
 # No hay bascula real: la garita de entrada solo informa resultado=ok o
@@ -1098,8 +1095,7 @@ def resolver_manifiesto_por_uid(db, vehiculo_uid: str, ahora: Optional[datetime]
 
 
 def ingreso_por_rfid(db, vehiculo_uid: str, publish_cmd: PublishFn = _noop_publish,
-                     ahora: Optional[datetime] = None,
-                     placa_leida: Optional[str] = None, confianza: float = 0.0) -> Turno:
+                     ahora: Optional[datetime] = None) -> Turno:
     """La garita de entrada leyo una tarjeta: el servidor decide (sec. 12).
     Si autoriza, crea el turno y manda AbrirTalanquera; si no, lanza
     ReglaDeNegocioError con la causa y quien llama responde RechazarIngreso."""
@@ -1107,10 +1103,6 @@ def ingreso_por_rfid(db, vehiculo_uid: str, publish_cmd: PublishFn = _noop_publi
         raise ReglaDeNegocioError("turno_activo")
     manifiesto = resolver_manifiesto_por_uid(db, vehiculo_uid, ahora)
     try:
-        if EXIGIR_PLACA:
-            causa = evaluar_placa_ingreso(db, vehiculo_uid, placa_leida or "", confianza)
-            if causa:
-                raise ReglaDeNegocioError(causa)
         return procesar_ingreso_garita(db, manifiesto.contenedor_id, vehiculo_uid,
                                        manifiesto.transportista_id, publish_cmd=publish_cmd,
                                        ahora=ahora, manifiesto=manifiesto)
@@ -1200,120 +1192,3 @@ def evaluar_enlace_perdido(db, device: LinkDevice, umbral_s: int, ahora_ts: int)
     if not vencido and not device.connected:
         device.connected = True
     return False
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Vision / placas (Fase 3). El OCR vive en vision/; aqui solo se compara.
-# ══════════════════════════════════════════════════════════════════════════
-
-def normalizar_placa(texto: str) -> str:
-    return "".join(c for c in (texto or "").upper() if c.isalnum())
-
-
-def _un_caracter(a: str, b: str) -> bool:
-    """True si a y b diferencian en un solo caracter (sustitucion, alta o baja)."""
-    if a == b:
-        return True
-    if abs(len(a) - len(b)) > 1:
-        return False
-    if len(a) == len(b):
-        return sum(x != y for x, y in zip(a, b)) == 1
-    if len(a) < len(b):
-        a, b = b, a
-    i = j = diffs = 0
-    while i < len(a) and j < len(b):
-        if a[i] == b[j]:
-            i += 1
-            j += 1
-            continue
-        diffs += 1
-        if diffs > 1:
-            return False
-        i += 1
-    return diffs + (len(a) - i) <= 1
-
-
-def coincidencia_placa(leida: str, catalogo: List[str]) -> Optional[str]:
-    n = normalizar_placa(leida)
-    if not n:
-        return None
-    exactas = [p for p in catalogo if p == n]
-    if exactas:
-        return exactas[0]
-    cercanas = [p for p in catalogo if _un_caracter(n, p)]
-    return cercanas[0] if len(cercanas) == 1 else None
-
-
-def catalogo_placas(db) -> Tuple[List[str], List[str]]:
-    veh = [normalizar_placa(v.placa) for v in db.scalars(select(Vehiculo)).all() if v.placa]
-    rest = [normalizar_placa(p.placa) for p in db.scalars(select(PlacaRestringida)).all() if p.placa]
-    return [p for p in veh if p], [p for p in rest if p]
-
-
-def evaluar_placa_ingreso(db, vehiculo_uid: str, placa_leida: str, confianza: float) -> Optional[str]:
-    """None si pasa. Si no: placa_no_leida | placa_restringida | placa_no_corresponde.
-    Tambien genera AL20/AL21/AL22."""
-    veh, rest = catalogo_placas(db)
-    if not placa_leida or confianza < CONFIANZA_MINIMA_OCR:
-        generar_alarma(db, "AL22", origen="vision", referencia=f"uid:{vehiculo_uid}",
-                       descripcion=f"OCR sin lectura valida para {vehiculo_uid}")
-        return "placa_no_leida"
-    if coincidencia_placa(placa_leida, rest):
-        generar_alarma(db, "AL21", origen="vision", referencia=f"placa:{normalizar_placa(placa_leida)}",
-                       descripcion=f"Placa restringida {placa_leida} en garita")
-        return "placa_restringida"
-    match = coincidencia_placa(placa_leida, veh)
-    vehiculo = db.get(Vehiculo, vehiculo_uid)
-    esperada = normalizar_placa(vehiculo.placa if vehiculo else "")
-    if match is None or (esperada and match != esperada):
-        generar_alarma(db, "AL20", origen="vision", referencia=f"uid:{vehiculo_uid}",
-                       descripcion=f"Placa {placa_leida} no corresponde a {vehiculo_uid} ({esperada or 'sin placa'})")
-        return "placa_no_corresponde"
-    return None
-
-
-def registrar_lectura_vision(db, datos: dict) -> LecturaVision:
-    lectura = LecturaVision(
-        uid=normalizar_uid(datos.get("uid", "")),
-        placa=datos.get("placa") or "",
-        confianza=float(datos.get("confianza") or 0),
-        resultado=datos.get("resultado") or "",
-        foto=(datos.get("foto") or "")[:200],
-        intento=int(datos.get("intento") or 1),
-    )
-    db.add(lectura)
-    return lectura
-
-
-def actualizar_estado_vision(db, datos: dict) -> EstadoVision:
-    fila = db.get(EstadoVision, 1) or EstadoVision(id=1)
-    fila.camara = str(datos.get("camara") or "desconocida")[:16]
-    fila.modelos = str(datos.get("modelos") or "desconocida")[:16]
-    fila.detalle = str(datos.get("detalle") or "")[:120]
-    fila.ts = datetime.utcnow()
-    db.add(fila)
-    if fila.camara != "ok" or fila.modelos == "fuera":
-        generar_alarma_unica(db, "AL18", "vision", origen="vision",
-                             descripcion="Camara o modelo de vision fuera de servicio",
-                             solo_activas=True)
-    return fila
-
-
-def ultima_lectura_vision(db) -> Optional[LecturaVision]:
-    return db.scalars(select(LecturaVision).order_by(LecturaVision.id.desc())).first()
-
-
-def estado_vision_dict(db) -> dict:
-    fila = db.get(EstadoVision, 1)
-    lectura = ultima_lectura_vision(db)
-    return {
-        "camara": fila.camara if fila else "desconocida",
-        "modelos": fila.modelos if fila else "desconocida",
-        "detalle": fila.detalle if fila else "",
-        "ts": fila.ts.isoformat() if fila and fila.ts else None,
-        "ultimaPlaca": lectura.placa if lectura else "",
-        "confianza": lectura.confianza if lectura else 0,
-        "uid": lectura.uid if lectura else "",
-        "foto": lectura.foto if lectura else "",
-        "exigirPlaca": EXIGIR_PLACA,
-    }
