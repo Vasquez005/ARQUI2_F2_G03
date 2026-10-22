@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 import grua
+import iluminacion
 import orquestador
 import reportes
 import servicios
@@ -37,6 +38,40 @@ started = False
 # Cada alarma nueva (portus/srv/alarma) y cada cambio de turnos, retenciones,
 # parqueo y patio (portus/srv/cambio) sale por MQTT al confirmarse: la web lo muestra en vivo.
 orquestador.anunciar_cambios(SessionLocal, lambda t, p: mqttc.publish(t, p))
+
+
+# Fase 3 (sec. 4.2): la luz que mide la estacion decide la tira LED. El servidor
+# manda IluminacionEncender / IluminacionApagar solo cuando cambia el estado.
+def _enviar_comando_iluminacion(name: str, target: str, params: dict) -> None:
+    with SessionLocal() as db:
+        make_publish_and_audit(db)(name, target, params)
+        db.commit()
+
+
+def _auditar_iluminacion(detalle: dict) -> None:
+    with SessionLocal() as db:
+        db.add(CommandAudit(
+            cmd_name="CambioModoIluminacion", target="SERVIDOR",
+            request_json=json.dumps(detalle, ensure_ascii=False), result="OK", response_json="{}",
+        ))
+        db.commit()
+
+
+control_iluminacion = iluminacion.ControlIluminacion(
+    enviar=_enviar_comando_iluminacion, auditar=_auditar_iluminacion,
+)
+
+
+def _procesar_lectura_estacion(payload: dict) -> None:
+    """portus/estacion/lectura: el campo `luz` (escala 0-100) decide la iluminacion."""
+    try:
+        luz = float(payload["luz"])
+    except (KeyError, TypeError, ValueError):
+        return
+    try:
+        control_iluminacion.procesar_lectura(luz)
+    except Exception as exc:  # una lectura rara no debe tumbar el hilo MQTT
+        print(f"[ILUMINACION] error: {exc!r}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -126,6 +161,7 @@ def alarmas_por_tiempo_loop() -> None:
 def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe("portus/evt/#")
     client.subscribe("portus/cmd/respuesta")
+    client.subscribe("portus/estacion/#")
     upsert_link_status(connected=True)
 
 
@@ -152,6 +188,12 @@ def on_message(client, userdata, msg):
             )
         )
         db.commit()
+
+    if topic == "portus/estacion/lectura":
+        _procesar_lectura_estacion(payload)
+
+    if topic == "portus/evt/iluminacion" and payload.get("data", {}).get("evento") == "enlace_restablecido":
+        control_iluminacion.resincronizar()
 
     # Fase 1: los eventos de garitas y pesaje avanzan el turno solos.
     try:
@@ -271,6 +313,30 @@ class CmdRequest(BaseModel):
     name: str
     target: str
     params: dict = {}
+
+
+class ModoIluminacionIn(BaseModel):
+    modo: str  # Automatico | Encendido forzado | Apagado forzado
+    origen: str = "API"
+
+
+@app.post("/iluminacion/modo")
+def cambiar_modo_iluminacion(body: ModoIluminacionIn):
+    try:
+        control_iluminacion.cambiar_modo(body.modo, origen=body.origen)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "modo": control_iluminacion.modo}
+
+
+@app.get("/iluminacion/estado")
+def estado_iluminacion():
+    return {
+        "modo": control_iluminacion.modo,
+        "encendida": control_iluminacion.encendida,
+        "umbral_encendido": control_iluminacion.umbral_encendido,
+        "umbral_apagado": control_iluminacion.umbral_apagado,
+    }
 
 
 @app.post("/commands/send")

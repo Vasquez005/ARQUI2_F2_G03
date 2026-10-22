@@ -13,6 +13,14 @@
  *     Sin pos (o si la celda no sirve) se usa la primera celda libre / ocupada.
  *   - La grua informa trabajo_inicio, trabajo_fin (duracion y tramos
  *     recorridos), deposito / retiro confirmados y abortos con su alarma.
+ *
+ * FASE 3 (iluminacion y baliza, sec. 4 del enunciado):
+ *   - Tira LED de la planta: IluminacionEncender / IluminacionApagar (el
+ *     servidor decide, aqui solo se actua). Sin latido del RPi durante
+ *     MS_ENLACE_SERVIDOR la tira se enciende y queda asi hasta una orden nueva.
+ *   - Baliza de la grua: parpadea 1 s solo con GruaSuspender;motivo=Clima.
+ *   - GruaReanudar de una suspension por Clima solo lo acepta la regla
+ *     automatica (origen=auto). Los parpadeos no usan delay().
  */
 
 #include <Stepper.h>
@@ -36,6 +44,10 @@ const int PIN_LED_SEMAFORO_VERDE    = 49;
 // --- LEDs por celda ---
 const int PIN_LED_CELDA_LIBRE[4]   = {22, 25, 28, 44};  // P1..P4
 const int PIN_LED_CELDA_OCUPADA[4] = {23, 26, 29, 45};  // P1..P4
+
+// --- Iluminacion y baliza (fase 3) ---
+const int PIN_TIRA_LED     = 24;  // MOSFET o rele de la tira LED (HIGH = encendida)
+const int PIN_BALIZA_GRUA  = 27;  // LED ambar de la grua (HIGH = encendido)
 
 bool esDeposito = true;
 
@@ -61,6 +73,12 @@ const long  PASOS_MAX_REFERENCIA      = 15000;
 const bool  ARRANQUE_MANUAL_EN_P0     = true;
 const bool  RECUPERAR_A_P0_EN_FALLO   = true;
 
+// --- Iluminacion y baliza (fase 3) ---
+// Tiempo sin latido PIN del RPi para declarar el enlace perdido (sec. 4.2 regla 3).
+const unsigned long MS_ENLACE_SERVIDOR = 10000;
+// Periodo completo de la baliza: 1 s encendida/apagada alternando cada 500 ms.
+const unsigned long MS_MEDIO_PERIODO_BALIZA = 500;
+
 bool irOcupadoEnHigh = true;
 
 Stepper motorHorizontal(PASOS_POR_REVOLUCION, 8, 10, 9, 11);
@@ -85,6 +103,9 @@ enum CodigoError {
   ERR_NINGUNO, ERR_SIN_REFERENCIA, ERR_SIN_MARCA,
   ERR_DEPOSITO, ERR_CAMION_MOVIDO, ERR_PATIO_LLENO
 };
+
+
+enum MotivoSuspension { SUSP_NINGUNO, SUSP_MANUAL, SUSP_CLIMA };
 
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -113,6 +134,15 @@ bool omitirPrimeraMarcaRetorno = false;
 bool gruaSuspendidaRemota = false;
 bool modoMantenimientoRemoto = false;
 int  posicionOrigenRetiro = 0;
+
+// Fase 3: iluminacion, baliza y enlace con el servidor
+MotivoSuspension motivoSuspension = SUSP_NINGUNO;
+bool          iluminacionEncendida   = false;
+String        modoIluminacion        = "Automatico";
+bool          enlaceServidorPerdido  = false;
+unsigned long ultimoEnlaceServidorMs = 0;
+unsigned long ultimoParpadeoBalizaMs = 0;
+bool          balizaEncendida        = false;
 
 bool vertActivo   = false;
 bool vertSubiendo = false;
@@ -198,6 +228,11 @@ void inicializarLedsEstado();
 void actualizarLedsSemaforo();
 void actualizarLedsCeldas();
 void actualizarLedsEstado();
+void vigilarEnlaceServidor();
+void actualizarIluminacion();
+void actualizarBaliza();
+void emitirIluminacionPortus(const char* evento);
+void registrarEnlaceServidor();
 
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -213,6 +248,15 @@ void setup() {
 
   pinMode(PIN_ELECTROIMAN, OUTPUT);
   digitalWrite(PIN_ELECTROIMAN, LOW);
+
+  // --- Iluminacion y baliza (fase 3) ---
+  // El arranque cuenta como enlace reciente: la tira solo se enciende si el
+  // RPi no da latido durante MS_ENLACE_SERVIDOR desde el arranque.
+  pinMode(PIN_TIRA_LED, OUTPUT);
+  pinMode(PIN_BALIZA_GRUA, OUTPUT);
+  digitalWrite(PIN_TIRA_LED, LOW);
+  digitalWrite(PIN_BALIZA_GRUA, LOW);
+  ultimoEnlaceServidorMs = millis();
 
   for (int i = 0; i < 4; i++) pinMode(PIN_IR_CELDA[i], INPUT_PULLUP);
   pinMode(PIN_OPTICO, INPUT);
@@ -267,6 +311,9 @@ void loop() {
   procesarComandoSerial();
   actualizarCamion();
   actualizarLedsEstado();
+  vigilarEnlaceServidor();
+  actualizarIluminacion();
+  actualizarBaliza();
 
   if (millis() - ultimoPatioMs >= INTERVALO_PATIO_MS) {
     sincronizarPatioFisico();
@@ -381,6 +428,46 @@ void actualizarLedsEstado() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  ILUMINACION Y BALIZA (FASE 3)
+// ════════════════════════════════════════════════════════════════════════════
+// Todo es no bloqueante: nada de delay(). El servidor decide la iluminacion;
+// el controlador solo la aplica y la mantiene si pierde el enlace.
+
+void vigilarEnlaceServidor() {
+  bool perdido = (millis() - ultimoEnlaceServidorMs) > MS_ENLACE_SERVIDOR;
+  if (perdido && !enlaceServidorPerdido) {
+    // sec. 4.2 regla 3: sin enlace, encender y mantener hasta recibir una orden.
+    enlaceServidorPerdido = true;
+    iluminacionEncendida  = true;
+    modoIluminacion       = "enlace_perdido";
+    emitirIluminacionPortus("enlace_perdido");
+  }
+}
+
+void actualizarIluminacion() {
+  digitalWrite(PIN_TIRA_LED, iluminacionEncendida ? HIGH : LOW);
+}
+
+void actualizarBaliza() {
+  // sec. 4.3: parpadea solo mientras la grua esta suspendida por lluvia.
+  bool parpadea = gruaSuspendidaRemota && motivoSuspension == SUSP_CLIMA;
+  if (!parpadea) {
+    balizaEncendida = false;
+  } else if (millis() - ultimoParpadeoBalizaMs >= MS_MEDIO_PERIODO_BALIZA) {
+    ultimoParpadeoBalizaMs = millis();
+    balizaEncendida = !balizaEncendida;
+  }
+  digitalWrite(PIN_BALIZA_GRUA, balizaEncendida ? HIGH : LOW);
+}
+
+void emitirIluminacionPortus(const char* evento) {
+  String payload = "evento=" + String(evento) +
+                   ";encendida=" + String(iluminacionEncendida ? "1" : "0") +
+                   ";modo=" + modoIluminacion;
+  Serial.println(framePortus("EVT", "iluminacion", payload, txSeqPortus++));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  PROTOCOLO PORTUS (Serial <-> Raspberry)
 // ════════════════════════════════════════════════════════════════════════════
 String hex2Portus(uint8_t v) {
@@ -445,7 +532,8 @@ void emitirHeartbeatPortus() {
   ultimoHeartbeatPortusMs = millis();
   String payload = "estado=" + String((int)estadoGrua) +
                    ";suspendida=" + String(gruaSuspendidaRemota ? "1" : "0") +
-                   ";mantenimiento=" + String(modoMantenimientoRemoto ? "1" : "0");
+                   ";mantenimiento=" + String(modoMantenimientoRemoto ? "1" : "0") +
+                   ";iluminacion=" + String(iluminacionEncendida ? "1" : "0");
   Serial.println(framePortus("HBT", "estado", payload, txSeqPortus++));
 }
 
@@ -468,7 +556,9 @@ void handleCmdPortus(const String& payload) {
 
   String name = fieldPortus(payload, "name");
   if (name == "GruaSuspender") {
+    // sec. 8.5: nunca se rechaza. motivo=Clima enciende la baliza; sin motivo es Manual.
     gruaSuspendidaRemota = true;
+    motivoSuspension = (fieldPortus(payload, "motivo") == "Clima") ? SUSP_CLIMA : SUSP_MANUAL;
     responderCmdPortus(true, name, "");
     return;
   }
@@ -477,8 +567,23 @@ void handleCmdPortus(const String& payload) {
       responderCmdPortus(false, name, "causa=falla_sin_rearme");
       return;
     }
+    // sec. 3.3 regla 3 y 8.5: la reanudacion por lluvia es solo automatica.
+    if (motivoSuspension == SUSP_CLIMA && fieldPortus(payload, "origen") != "auto") {
+      responderCmdPortus(false, name, "causa=suspension_por_clima");
+      return;
+    }
     gruaSuspendidaRemota = false;
+    motivoSuspension = SUSP_NINGUNO;
     responderCmdPortus(true, name, "");
+    return;
+  }
+  if (name == "IluminacionEncender" || name == "IluminacionApagar") {
+    // sec. 8.5: nunca se rechazan. El modo vigente lo envia el servidor solo para reportarlo.
+    iluminacionEncendida = (name == "IluminacionEncender");
+    String modo = fieldPortus(payload, "modo");
+    if (modo.length()) modoIluminacion = modo;
+    responderCmdPortus(true, name, "");
+    emitirIluminacionPortus("cambio");
     return;
   }
   if (name == "GruaReferenciar") {
@@ -574,7 +679,18 @@ void procesarComandosPortus() {
   String src, kind, topic, payload;
   long seq = 0;
   if (!parseFramePortus(line, src, seq, kind, topic, payload)) return;
+  // Cualquier trama valida del RPi prueba que el enlace sigue vivo (PIN cada 3 s).
+  if (src == "RPI") registrarEnlaceServidor();
   if (kind == "CMD" && topic == "cmd") handleCmdPortus(payload);
+}
+
+void registrarEnlaceServidor() {
+  ultimoEnlaceServidorMs = millis();
+  if (enlaceServidorPerdido) {
+    // Restablecido: la tira se queda como esta hasta que el servidor mande una orden.
+    enlaceServidorPerdido = false;
+    emitirIluminacionPortus("enlace_restablecido");
+  }
 }
 
 
