@@ -1,0 +1,146 @@
+diff --git a/backend/app.py b/backend/app.py
+index 98f455d..ee11c4d 100644
+--- a/backend/app.py
++++ b/backend/app.py
+@@ -866,6 +866,60 @@ def registrar_vehiculo(body: VehiculoIn):
+         return {"uid": uid}
+ 
+ 
++class PruebaIngresoIn(BaseModel):
++    uid: str
++    placa: str = ""
++    transportista_id: Optional[int] = None
++
++
++@app.post("/pruebas/preparar-ingreso")
++def preparar_ingreso_prueba(body: PruebaIngresoIn):
++    """ATAJO SOLO PARA PRUEBAS (escenarios sec. 11): deja un vehiculo listo para
++    entrar sin recorrer naviera -> agente -> autoridad. Registra la tarjeta con su
++    placa y conductor, anula el turno activo que hubiera y crea un manifiesto con
++    levante verde para esa tarjeta. Se desactiva con PORTUS_PRUEBAS=0."""
++    if os.getenv("PORTUS_PRUEBAS", "1") != "1":
++        raise HTTPException(403, "modo_pruebas_desactivado")
++    uid = servicios.normalizar_uid(body.uid)
++    if not uid:
++        raise HTTPException(400, "uid_obligatorio")
++    placa = (body.placa or "").strip().upper()
++    with SessionLocal() as db:
++        if body.transportista_id is not None and not db.get(Transportista, body.transportista_id):
++            raise HTTPException(404, "transportista_no_existe")
++        # 1) tarjeta -> placa + conductor
++        v = db.get(Vehiculo, uid) or Vehiculo(uid=uid)
++        v.transportista_id = body.transportista_id
++        v.placa = placa
++        v.activo = True
++        db.add(v)
++        # 2) libera el turno activo anterior (para poder repetir el ingreso en pruebas)
++        turno = servicios.turno_activo_por_uid(db, uid)
++        if turno is not None:
++            servicios.liberar_plazas_de_turno(db, turno.id)
++            turno.estado = "Anulado"
++            turno.closed_at = datetime.utcnow()
++            servicios.registrar_evento(db, turno.id, "pruebas", "Turno reiniciado por el boton de pruebas")
++        # 3) contenedor de pruebas en el catalogo
++        cont = ("PRUEBA" + uid.replace(" ", ""))[:32]
++        if not db.get(ContenedorCatalogo, cont):
++            db.add(ContenedorCatalogo(contenedor_id=cont, descripcion="Contenedor de pruebas", activo=True))
++        # 4) manifiesto con levante verde para esta tarjeta (si no hay uno usable)
++        man = db.scalars(
++            select(Manifiesto).where(Manifiesto.vehiculo_uid == uid, Manifiesto.anulado.is_(False))
++            .order_by(Manifiesto.id.desc())
++        ).first()
++        if man is None or man.estado_documental != "levante_otorgado" or not servicios._manifiesto_sin_turno(db, man):
++            man = Manifiesto(contenedor_id=cont, tipo_operacion="DEPOSITO", peso_declarado_g=1000,
++                             transportista_id=body.transportista_id, vehiculo_uid=uid,
++                             estado_documental="levante_otorgado", canal="verde")
++            db.add(man)
++            db.flush()
++        db.commit()
++        return {"ok": True, "uid": uid, "placa": placa,
++                "contenedor": man.contenedor_id, "manifiesto": man.id}
++
++
+ @app.post("/manifiestos")
+ def crear_manifiesto(body: ManifiestoIn):
+     if body.tipo_operacion not in ("DEPOSITO", "RETIRO"):
+diff --git a/web_c/app/main.py b/web_c/app/main.py
+index dc323a7..97901c1 100644
+--- a/web_c/app/main.py
++++ b/web_c/app/main.py
+@@ -407,6 +407,17 @@ def terminal_registrar_vehiculo(body: VehiculoIn, user: dict = Depends(require_r
+     return backend("POST", "/vehiculos", body.model_dump())
+ 
+ 
++class PruebaIngresoIn(BaseModel):
++    uid: str
++    placa: str = ""
++    transportista_id: Optional[int] = None
++
++
++@app.post("/api/terminal/pruebas/preparar-ingreso")
++def terminal_prueba_ingreso(body: PruebaIngresoIn, user: dict = Depends(require_role(Role.TERMINAL))):
++    return backend("POST", "/pruebas/preparar-ingreso", body.model_dump())
++
++
+ @app.get("/api/terminal/turnos/{turno_id}")
+ def terminal_turno_detalle(turno_id: int, user: dict = Depends(require_role(Role.TERMINAL))):
+     return backend("GET", f"/turnos/{turno_id}")
+diff --git a/web_c/app/static/app.js b/web_c/app/static/app.js
+index c5f8aa9..13fb3e4 100644
+--- a/web_c/app/static/app.js
++++ b/web_c/app/static/app.js
+@@ -895,6 +895,8 @@
+       `<option value="${t.id}">${t.id} - ${escapeHtml(t.nombre)}${t.vinculado ? " (vinculado)" : ""}</option>`).join("");
+     $("transportista-select").innerHTML = opciones || "<option value=''>Sin transportistas</option>";
+     $("vehiculo-transportista").innerHTML = `<option value="">Sin transportista</option>${opciones}`;
++    const selPrueba = document.getElementById("prueba-transportista");
++    if (selPrueba) selPrueba.innerHTML = `<option value="">Sin transportista</option>${opciones}`;
+   }
+ 
+   async function cargarVehiculos() {
+@@ -1462,6 +1464,21 @@
+     }
+   });
+ 
++  const formPrueba = document.getElementById("form-prueba-ingreso");
++  if (formPrueba) formPrueba.addEventListener("submit", async (e) => {
++    e.preventDefault();
++    const f = new FormData(e.target);
++    const body = {
++      uid: f.get("uid"),
++      placa: (f.get("placa") || "").toUpperCase(),
++      transportista_id: f.get("transportista_id") ? Number(f.get("transportista_id")) : null,
++    };
++    if (await accion(post("/api/terminal/pruebas/preparar-ingreso", body),
++                     `Listo: ${body.uid} con placa ${body.placa} puede entrar. Pon la placa frente a la camara y pasa la tarjeta.`)) {
++      cargarVehiculos();
++    }
++  });
++
+   $("refresh-transportistas").addEventListener("click", cargarTransportistas);
+   $("generate-link-code").addEventListener("click", async () => {
+     const id = Number($("transportista-select").value);
+diff --git a/web_c/app/templates/terminal.html b/web_c/app/templates/terminal.html
+index 25f6f2f..d1901a9 100644
+--- a/web_c/app/templates/terminal.html
++++ b/web_c/app/templates/terminal.html
+@@ -201,6 +201,19 @@
+   <div class="table-wrap"><table class="data-table" id="tabla-intentos"></table></div>
+ </section>
+ 
++<section class="panel tab-panel hidden" data-tab-panel="turnos">
++  <h2>Prueba rapida de ingreso <small class="muted">(solo pruebas)</small></h2>
++  <p class="muted">Deja un camion listo para entrar sin recorrer naviera/agente/autoridad:
++    registra la tarjeta con su placa y conductor, libera el turno anterior y le crea un
++    manifiesto con levante verde. Luego pon la placa frente a la camara y pasa la tarjeta.</p>
++  <form id="form-prueba-ingreso" class="filtros">
++    <label>Tarjeta (UID) <input name="uid" required placeholder="E1 69 73 15" /></label>
++    <label>Matricula (placa) <input name="placa" required placeholder="P002FDC" /></label>
++    <label>Conductor <select name="transportista_id" id="prueba-transportista"></select></label>
++    <button type="submit">Preparar ingreso</button>
++  </form>
++</section>
++
+ <section class="panel tab-panel hidden" data-tab-panel="turnos">
+   <h2>Vehiculos (tarjetas RFID)</h2>
+   <form id="form-vehiculo" class="filtros">

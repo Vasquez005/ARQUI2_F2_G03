@@ -407,6 +407,17 @@ def terminal_registrar_vehiculo(body: VehiculoIn, user: dict = Depends(require_r
     return backend("POST", "/vehiculos", body.model_dump())
 
 
+class PruebaIngresoIn(BaseModel):
+    uid: str
+    placa: str = ""
+    transportista_id: Optional[int] = None
+
+
+@app.post("/api/terminal/pruebas/preparar-ingreso")
+def terminal_prueba_ingreso(body: PruebaIngresoIn, user: dict = Depends(require_role(Role.TERMINAL))):
+    return backend("POST", "/pruebas/preparar-ingreso", body.model_dump())
+
+
 @app.get("/api/terminal/turnos/{turno_id}")
 def terminal_turno_detalle(turno_id: int, user: dict = Depends(require_role(Role.TERMINAL))):
     return backend("GET", f"/turnos/{turno_id}")

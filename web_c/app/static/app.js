@@ -895,6 +895,8 @@
       `<option value="${t.id}">${t.id} - ${escapeHtml(t.nombre)}${t.vinculado ? " (vinculado)" : ""}</option>`).join("");
     $("transportista-select").innerHTML = opciones || "<option value=''>Sin transportistas</option>";
     $("vehiculo-transportista").innerHTML = `<option value="">Sin transportista</option>${opciones}`;
+    const selPrueba = document.getElementById("prueba-transportista");
+    if (selPrueba) selPrueba.innerHTML = `<option value="">Sin transportista</option>${opciones}`;
   }
 
   async function cargarVehiculos() {
@@ -1458,6 +1460,21 @@
     };
     if (await accion(post("/api/terminal/vehiculos", body), `Tarjeta ${body.uid} guardada`)) {
       e.target.reset();
+      cargarVehiculos();
+    }
+  });
+
+  const formPrueba = document.getElementById("form-prueba-ingreso");
+  if (formPrueba) formPrueba.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const body = {
+      uid: f.get("uid"),
+      placa: (f.get("placa") || "").toUpperCase(),
+      transportista_id: f.get("transportista_id") ? Number(f.get("transportista_id")) : null,
+    };
+    if (await accion(post("/api/terminal/pruebas/preparar-ingreso", body),
+                     `Listo: ${body.uid} con placa ${body.placa} puede entrar. Pon la placa frente a la camara y pasa la tarjeta.`)) {
       cargarVehiculos();
     }
   });

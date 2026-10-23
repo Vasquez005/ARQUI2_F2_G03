@@ -202,6 +202,19 @@
 </section>
 
 <section class="panel tab-panel hidden" data-tab-panel="turnos">
+  <h2>Prueba rapida de ingreso <small class="muted">(solo pruebas)</small></h2>
+  <p class="muted">Deja un camion listo para entrar sin recorrer naviera/agente/autoridad:
+    registra la tarjeta con su placa y conductor, libera el turno anterior y le crea un
+    manifiesto con levante verde. Luego pon la placa frente a la camara y pasa la tarjeta.</p>
+  <form id="form-prueba-ingreso" class="filtros">
+    <label>Tarjeta (UID) <input name="uid" required placeholder="E1 69 73 15" /></label>
+    <label>Matricula (placa) <input name="placa" required placeholder="P002FDC" /></label>
+    <label>Conductor <select name="transportista_id" id="prueba-transportista"></select></label>
+    <button type="submit">Preparar ingreso</button>
+  </form>
+</section>
+
+<section class="panel tab-panel hidden" data-tab-panel="turnos">
   <h2>Vehiculos (tarjetas RFID)</h2>
   <form id="form-vehiculo" class="filtros">
     <label>UID de la tarjeta <input name="uid" required placeholder="E1 69 73 15" /></label>

@@ -866,6 +866,60 @@ def registrar_vehiculo(body: VehiculoIn):
         return {"uid": uid}
 
 
+class PruebaIngresoIn(BaseModel):
+    uid: str
+    placa: str = ""
+    transportista_id: Optional[int] = None
+
+
+@app.post("/pruebas/preparar-ingreso")
+def preparar_ingreso_prueba(body: PruebaIngresoIn):
+    """ATAJO SOLO PARA PRUEBAS (escenarios sec. 11): deja un vehiculo listo para
+    entrar sin recorrer naviera -> agente -> autoridad. Registra la tarjeta con su
+    placa y conductor, anula el turno activo que hubiera y crea un manifiesto con
+    levante verde para esa tarjeta. Se desactiva con PORTUS_PRUEBAS=0."""
+    if os.getenv("PORTUS_PRUEBAS", "1") != "1":
+        raise HTTPException(403, "modo_pruebas_desactivado")
+    uid = servicios.normalizar_uid(body.uid)
+    if not uid:
+        raise HTTPException(400, "uid_obligatorio")
+    placa = (body.placa or "").strip().upper()
+    with SessionLocal() as db:
+        if body.transportista_id is not None and not db.get(Transportista, body.transportista_id):
+            raise HTTPException(404, "transportista_no_existe")
+        # 1) tarjeta -> placa + conductor
+        v = db.get(Vehiculo, uid) or Vehiculo(uid=uid)
+        v.transportista_id = body.transportista_id
+        v.placa = placa
+        v.activo = True
+        db.add(v)
+        # 2) libera el turno activo anterior (para poder repetir el ingreso en pruebas)
+        turno = servicios.turno_activo_por_uid(db, uid)
+        if turno is not None:
+            servicios.liberar_plazas_de_turno(db, turno.id)
+            turno.estado = "Anulado"
+            turno.closed_at = datetime.utcnow()
+            servicios.registrar_evento(db, turno.id, "pruebas", "Turno reiniciado por el boton de pruebas")
+        # 3) contenedor de pruebas en el catalogo
+        cont = ("PRUEBA" + uid.replace(" ", ""))[:32]
+        if not db.get(ContenedorCatalogo, cont):
+            db.add(ContenedorCatalogo(contenedor_id=cont, descripcion="Contenedor de pruebas", activo=True))
+        # 4) manifiesto con levante verde para esta tarjeta (si no hay uno usable)
+        man = db.scalars(
+            select(Manifiesto).where(Manifiesto.vehiculo_uid == uid, Manifiesto.anulado.is_(False))
+            .order_by(Manifiesto.id.desc())
+        ).first()
+        if man is None or man.estado_documental != "levante_otorgado" or not servicios._manifiesto_sin_turno(db, man):
+            man = Manifiesto(contenedor_id=cont, tipo_operacion="DEPOSITO", peso_declarado_g=1000,
+                             transportista_id=body.transportista_id, vehiculo_uid=uid,
+                             estado_documental="levante_otorgado", canal="verde")
+            db.add(man)
+            db.flush()
+        db.commit()
+        return {"ok": True, "uid": uid, "placa": placa,
+                "contenedor": man.contenedor_id, "manifiesto": man.id}
+
+
 @app.post("/manifiestos")
 def crear_manifiesto(body: ManifiestoIn):
     if body.tipo_operacion not in ("DEPOSITO", "RETIRO"):
