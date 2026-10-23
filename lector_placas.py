@@ -20,11 +20,15 @@ import easyocr
 # QUE: confianza minima (sec. 5.3, rango 30 a 95). Configurable para igualar al backend.
 CONFIANZA_MINIMA_OCR = float(os.getenv("PORTUS_CONFIANZA_MINIMA_OCR", "30"))
 
-# QUE: ancho (px) al que se normaliza la region antes del OCR. Mas chico = menos memoria.
-# En una Raspberry de 2 GB conviene 480-600 para no quedarse sin RAM.
-ANCHO_OCR = int(os.getenv("PORTUS_OCR_ANCHO", "560"))
+# QUE: ancho (px) al que se normaliza la region antes del OCR. Mas chico = menos memoria,
+# pero muy chico pierde detalle. 800 va bien en una Pi de 2 GB (no hizo OOM a 560).
+ANCHO_OCR = int(os.getenv("PORTUS_OCR_ANCHO", "800"))
 # QUE: lienzo interno de EasyOCR. Por defecto es 2560 (enorme para una Pi); lo acotamos.
-CANVAS_OCR = int(os.getenv("PORTUS_OCR_CANVAS", "640"))
+CANVAS_OCR = int(os.getenv("PORTUS_OCR_CANVAS", "1024"))
+# QUE: solo letras y digitos (es una placa): evita que lea ruido o simbolos.
+ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+# QUE: enderezar la placa solo si se pide (PORTUS_ENDEREZAR=1). Con camara de frente estorba.
+ENDEREZAR = os.getenv("PORTUS_ENDEREZAR", "0") == "1"
 
 # QUE: un solo hilo de torch: menos memoria y menos contencion de CPU en la Pi.
 try:
@@ -107,7 +111,7 @@ def ocr_sobre(img):
     canvas_size y mag_ratio acotan la memoria que usa el detector (clave en la Pi de 2 GB)."""
     img_rgb = img if img.ndim == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
     resultados = reader.readtext(img_rgb, detail=1, paragraph=False,
-                                 canvas_size=CANVAS_OCR, mag_ratio=1.0)
+                                 canvas_size=CANVAS_OCR, mag_ratio=1.0, allowlist=ALLOWLIST)
     if not resultados:
         return "", 0.0
     _, texto, conf = max(resultados, key=altura_caja)
@@ -127,7 +131,7 @@ def leer_placa(ruta_imagen):
     img_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     region, bbox = recortar_region(img_rgb)
-    recto = enderezar(region)
+    recto = enderezar(region) if ENDEREZAR else region
     # QUE: normaliza el ancho a ANCHO_OCR en vez de ampliar 3x a ciegas (eso disparaba la memoria).
     alto, ancho = recto.shape[:2]
     escala = ANCHO_OCR / max(1, ancho)
