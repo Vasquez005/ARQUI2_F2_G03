@@ -46,7 +46,10 @@ const int PIN_LED_CELDA_LIBRE[4]   = {22, 25, 28, 44};  // P1..P4
 const int PIN_LED_CELDA_OCUPADA[4] = {23, 26, 29, 45};  // P1..P4
 
 // --- Iluminacion y baliza (fase 3) ---
-const int PIN_TIRA_LED     = 24;  // MOSFET o rele de la tira LED (HIGH = encendida)
+const int PIN_TIRA_LED     = 24;  // Rele ACTIVO EN BAJO de la tira LED: LOW = encendida, HIGH = apagada
+// El modulo de rele del equipo se energiza con el pin en LOW. Si cambias a un
+// rele/MOSFET activo en alto, pon RELE_TIRA_ACTIVO_BAJO en false.
+const bool RELE_TIRA_ACTIVO_BAJO = true;
 const int PIN_BALIZA_GRUA  = 27;  // LED ambar de la grua (HIGH = encendido)
 
 bool esDeposito = true;
@@ -254,7 +257,8 @@ void setup() {
   // RPi no da latido durante MS_ENLACE_SERVIDOR desde el arranque.
   pinMode(PIN_TIRA_LED, OUTPUT);
   pinMode(PIN_BALIZA_GRUA, OUTPUT);
-  digitalWrite(PIN_TIRA_LED, LOW);
+  // Tira apagada al arrancar: con rele activo en bajo eso es el pin en HIGH.
+  digitalWrite(PIN_TIRA_LED, RELE_TIRA_ACTIVO_BAJO ? HIGH : LOW);
   digitalWrite(PIN_BALIZA_GRUA, LOW);
   ultimoEnlaceServidorMs = millis();
 
@@ -445,7 +449,9 @@ void vigilarEnlaceServidor() {
 }
 
 void actualizarIluminacion() {
-  digitalWrite(PIN_TIRA_LED, iluminacionEncendida ? HIGH : LOW);
+  // Rele activo en bajo: encender = LOW. Con RELE_TIRA_ACTIVO_BAJO=false vuelve a HIGH=encender.
+  bool nivel = RELE_TIRA_ACTIVO_BAJO ? !iluminacionEncendida : iluminacionEncendida;
+  digitalWrite(PIN_TIRA_LED, nivel ? HIGH : LOW);
 }
 
 void actualizarBaliza() {
