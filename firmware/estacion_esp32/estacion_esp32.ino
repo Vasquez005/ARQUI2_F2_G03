@@ -9,8 +9,8 @@
 #include <Preferences.h>
 #include <time.h>
 
-const char*    WIFI_SSID     = "Estudio";
-const char*    WIFI_PASSWORD = "9067047cc0";
+const char*    WIFI_SSID     = "Galaxy S25 55E1";
+const char*    WIFI_PASSWORD = "cabris007";
 const char*    MQTT_HOST     = "10.116.145.220";
 const uint16_t MQTT_PORT     = 1883;
 const char*    ID_ESTACION   = "ESTACION_1";
