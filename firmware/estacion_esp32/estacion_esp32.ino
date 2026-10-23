@@ -11,7 +11,7 @@
 
 const char*    WIFI_SSID     = "Estudio";
 const char*    WIFI_PASSWORD = "9067047cc0";
-const char*    MQTT_HOST     = "192.168.1.100";
+const char*    MQTT_HOST     = "192.168.28.73";
 const uint16_t MQTT_PORT     = 1883;
 const char*    ID_ESTACION   = "ESTACION_1";
 
