@@ -43,9 +43,17 @@ class GaritaVerificacionTests(MaquetaBase):
     def ejecutar(self, uid, lectura):
         camara_garita.leer_placa_garita = lambda **kwargs: lectura
         comandos = []
+        self.vision = []  # (topic, datos) de portus/vision/* publicados en el flujo
+
+        def capturar(topic, payload):
+            datos = json.loads(payload)
+            if topic == "portus/cmd/solicitud":
+                comandos.append(datos)
+            elif topic.startswith("portus/vision/"):
+                self.vision.append((topic, datos))
+
         with self.Session() as db:
-            pub = orquestador.PublicadorDiferido(
-                db, lambda topic, payload: comandos.append(json.loads(payload)))
+            pub = orquestador.PublicadorDiferido(db, capturar)
             orquestador._garita_rfid_verificada(db, pub, uid)
         return [c["name"] for c in comandos], comandos
 
@@ -60,6 +68,28 @@ class GaritaVerificacionTests(MaquetaBase):
             self.assertEqual((lect.resultado, lect.placa_leida), ("autorizado", PLACA_OK))
             self.assertIsNotNone(lect.turno_id)
             self.assertEqual(db.query(Turno).count(), 1)
+
+    def test_ingreso_autorizado_publica_vision_y_notifica_con_foto(self):
+        from models import Notificacion
+        self.ejecutar(UID_OK, self.lectura(PLACA_OK))
+        # sec. 2.2: se publico el resultado de la lectura y el estado de la camara
+        topicos = {t for t, _ in self.vision}
+        self.assertIn("portus/vision/placa", topicos)
+        self.assertIn("portus/vision/estado", topicos)
+        placa_msg = next(d for t, d in self.vision if t == "portus/vision/placa")
+        self.assertEqual(placa_msg["placa"], PLACA_OK)
+        estado_msg = next(d for t, d in self.vision if t == "portus/vision/estado")
+        self.assertEqual(estado_msg["camara"], "operativa")
+        # sec. 9.2: aviso de ingreso con referencia a la foto (ingreso:<id>)
+        with self.Session() as db:
+            notif = db.query(Notificacion).filter(Notificacion.evento == "ingreso_verificado").one()
+            lect = db.query(LecturaPlaca).one()
+            self.assertEqual(notif.referencia, f"ingreso:{lect.id}")
+
+    def test_camara_fuera_de_servicio_publica_estado_fuera(self):
+        self.ejecutar(UID_OK, None)  # None = camara fuera de servicio
+        estado_msg = next(d for t, d in self.vision if t == "portus/vision/estado")
+        self.assertEqual(estado_msg["camara"], "fuera_de_servicio")
 
     def test_placa_de_otro_camion_crea_retencion_pendiente_rt07_y_al20(self):
         self.ejecutar(UID_OK, self.lectura(PLACA_OTRA))

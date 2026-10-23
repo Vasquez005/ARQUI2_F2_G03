@@ -7,6 +7,7 @@ Las dependencias de vision (OpenCV, YOLO, EasyOCR) solo se cargan cuando se usan
 para que el backend siga arrancando en equipos sin esas librerias.
 """
 
+import contextlib
 import os
 import sys
 import threading
@@ -20,6 +21,24 @@ RUTA_FOTO = os.getenv("PORTUS_RUTA_FOTO_GARITA", os.path.join(RAIZ_REPO, "captur
 
 _lock = threading.Lock()
 _lector = None
+
+# Sec. 4.2 regla 2: app.py registra aqui control_iluminacion.para_captura para que
+# la planta se encienda antes de la foto. Sin hardware (pruebas) queda en None y no hace nada.
+_preparar_iluminacion: Optional[Callable[[], "contextlib.AbstractContextManager"]] = None
+
+
+def set_preparador_iluminacion(factory: Optional[Callable[[], "contextlib.AbstractContextManager"]]) -> None:
+    global _preparar_iluminacion
+    _preparar_iluminacion = factory
+
+
+@contextlib.contextmanager
+def _iluminacion_para_captura():
+    if _preparar_iluminacion is None:
+        yield
+    else:
+        with _preparar_iluminacion():
+            yield
 
 
 def _modulo_lector():
@@ -83,12 +102,14 @@ def leer_placa_garita(
     with _lock:
         if leer is None:
             leer = _modulo_lector().leer_placa
-        for _ in range(intentos):
-            if not capturar():
-                return None
-            ultima = _mejor_placa(leer(RUTA_FOTO), RUTA_FOTO)
-            if es_valida is None or es_valida(ultima):
-                break
+        # sec. 4.2 r2: la planta se enciende (si hacia falta) y se restaura al terminar.
+        with _iluminacion_para_captura():
+            for _ in range(intentos):
+                if not capturar():
+                    return None
+                ultima = _mejor_placa(leer(RUTA_FOTO), RUTA_FOTO)
+                if es_valida is None or es_valida(ultima):
+                    break
     return ultima
 
 

@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 
+import camara_garita
 import estacion
 import grua
 import iluminacion
@@ -62,8 +63,77 @@ def _auditar_iluminacion(detalle: dict) -> None:
 control_iluminacion = iluminacion.ControlIluminacion(
     enviar=_enviar_comando_mega, auditar=_auditar_iluminacion,
 )
+# Sec. 4.2 r2: antes de fotografiar una placa, la planta debe estar encendida.
+camara_garita.set_preparador_iluminacion(control_iluminacion.para_captura)
 registro_estacion = estacion.RegistroEstacion()
-control_clima_lluvia = estacion.ControlClimaLluvia(enviar=_enviar_comando_mega)
+
+CLAVE_CONFIG_CLIMA = "clima_actual"  # snapshot que lee el bot para /clima (sec. 9.1)
+
+
+def _afectados_por_lluvia(db) -> list[int]:
+    """Transportistas con turno activo en la terminal (sec. 3.3). La cita en franja
+    se cubre con la notificacion de cita; aqui avisamos a los que estan operando."""
+    ids = db.scalars(
+        select(Turno.transportista_id)
+        .where(Turno.estado.not_in(ESTADOS_FINALES), Turno.transportista_id.is_not(None))
+        .distinct()
+    ).all()
+    return [i for i in ids if i is not None]
+
+
+def _guardar_snapshot_clima(disponible: bool) -> None:
+    """Deja el ultimo clima y el estado de la grua en la tabla configuracion para /clima."""
+    ultima = registro_estacion.ultima()
+    datos = {
+        "ok": disponible and ultima is not None,
+        "t": getattr(ultima, "temperatura", None) if ultima else None,
+        "h": getattr(ultima, "humedad", None) if ultima else None,
+        "ll": getattr(ultima, "lluvia", None) if ultima else None,
+        "luz": getattr(ultima, "luz", None) if ultima else None,
+        "ts": getattr(ultima, "ts", None) if ultima else None,
+        "susp": control_clima_lluvia.suspendido_por_lluvia,
+        "susp_desde": _suspension_desde[0],
+    }
+    with SessionLocal() as db:
+        servicios.set_config_json(db, CLAVE_CONFIG_CLIMA, datos)
+        db.commit()
+
+
+_suspension_desde = [None]  # hora ISO del inicio de la suspension por lluvia vigente
+
+
+def _al_cambiar_clima(suspendido: bool) -> None:
+    """Sec. 2.2 / 3.3: inicio y fin de la suspension por lluvia -> portus/evt/clima,
+    alarma AL17 y avisos a los transportistas afectados."""
+    ahora = datetime.now(timezone.utc)
+    if suspendido:
+        _suspension_desde[0] = ahora.isoformat()
+        with SessionLocal() as db:
+            servicios.generar_alarma(db, "AL17", origen="estacion",
+                                     descripcion="Lluvia detectada, grua suspendida")
+            texto = (f"PORTUS: operacion de grua suspendida por lluvia desde "
+                     f"{servicios.hora_local(ahora, '%H:%M')}. Tu operacion podria demorarse.")
+            for tid in _afectados_por_lluvia(db):
+                servicios.encolar_notificacion(db, tid, "grua_suspendida_lluvia", texto)
+            db.commit()
+        mqttc.publish("portus/evt/clima",
+                      json.dumps({"estado": "suspension", "motivo": "Clima", "ts": ahora.isoformat()}))
+    else:
+        inicio = _suspension_desde[0]
+        _suspension_desde[0] = None
+        with SessionLocal() as db:
+            texto = f"PORTUS: operacion de grua reanudada a las {servicios.hora_local(ahora, '%H:%M')}."
+            for tid in _afectados_por_lluvia(db):
+                servicios.encolar_notificacion(db, tid, "grua_reanudada_lluvia", texto)
+            db.commit()
+        mqttc.publish("portus/evt/clima",
+                      json.dumps({"estado": "reanudacion", "desde": inicio, "ts": ahora.isoformat()}))
+    _guardar_snapshot_clima(disponible=True)
+
+
+control_clima_lluvia = estacion.ControlClimaLluvia(
+    enviar=_enviar_comando_mega, al_cambiar=_al_cambiar_clima,
+)
 
 
 def _publicar_config_estacion_mqtt() -> None:
@@ -83,6 +153,7 @@ def _procesar_lectura_estacion(payload: dict) -> None:
         estacion.procesar_lectura_estacion(
             payload, registro_estacion, control_iluminacion, control_clima_lluvia,
         )
+        _guardar_snapshot_clima(disponible=True)
     except Exception as exc:
         print(f"[ESTACION] error procesando lectura: {exc!r}")
 
@@ -98,6 +169,7 @@ def _alerta_estacion_fuera() -> None:
                                  descripcion="Estacion meteorologica sin comunicacion")
         db.commit()
     control_iluminacion.encender_sin_estacion()
+    _guardar_snapshot_clima(disponible=False)  # /clima respondera que el clima no esta disponible
 
 
 def _recuperacion_estacion() -> None:

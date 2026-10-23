@@ -341,7 +341,7 @@ class Configuracion(Base):
     """Ajustes del sistema que cambia la terminal (ej. la politica de patio)."""
     __tablename__ = "configuracion"
     clave: Mapped[str] = mapped_column(String(40), primary_key=True)
-    valor: Mapped[str] = mapped_column(String(200))
+    valor: Mapped[str] = mapped_column(Text)
 
 
 class Notificacion(Base):

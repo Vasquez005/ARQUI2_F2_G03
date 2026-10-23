@@ -1,7 +1,6 @@
 # PORTUS - Vision (Mac / PC con pantalla)
 ultralytics
-paddlepaddle
-paddleocr
+easyocr
 opencv-python
 numpy
 paho-mqtt

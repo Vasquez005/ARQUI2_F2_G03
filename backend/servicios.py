@@ -21,12 +21,33 @@ from catalogos import (
     RT01, RT02, RT03, RT04, SEVERIDADES_AUTO_RECONOCIBLES, TOLERANCIA_VENTANA_MIN,
     TRANSICIONES, ZONA_HORARIA,
 )
+import json
+
 from models import (
-    Alarma, Cita, CommandAudit, FranjaBloqueada, IntentoIngreso, ManifiestoEvento, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
+    Alarma, Cita, CommandAudit, Configuracion, FranjaBloqueada, IntentoIngreso, ManifiestoEvento, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
     Retencion, Transportista, Turno, EventoTurno, Vehiculo,
 )
 
 PublishFn = Callable[[str, str, dict], None]
+
+
+def set_config_json(db, clave: str, datos: dict) -> None:
+    """Guarda (o reemplaza) un ajuste del sistema como JSON en la tabla configuracion.
+    Lo usa el servidor para dejar el ultimo clima a mano del bot (/clima)."""
+    fila = db.get(Configuracion, clave) or Configuracion(clave=clave, valor="")
+    fila.valor = json.dumps(datos, ensure_ascii=False)
+    db.add(fila)
+
+
+def get_config_json(db, clave: str) -> dict:
+    """Lee un ajuste JSON de la tabla configuracion. {} si no existe o esta corrupto."""
+    fila = db.get(Configuracion, clave)
+    if fila is None or not fila.valor:
+        return {}
+    try:
+        return json.loads(fila.valor)
+    except (ValueError, TypeError):
+        return {}
 
 
 class ReglaDeNegocioError(Exception):

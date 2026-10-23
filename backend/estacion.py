@@ -107,16 +107,21 @@ class ControlClimaLluvia:
         enviar: EnviarComando,
         minutos_sin_lluvia: int = CONFIG_MINUTOS_SIN_LLUVIA_DEFECTO,
         reloj: Callable[[], float] = time.monotonic,
+        al_cambiar: Optional[Callable[[bool], None]] = None,
     ) -> None:
         validar_minutos_sin_lluvia(minutos_sin_lluvia)
         self._enviar = enviar
         self._minutos = minutos_sin_lluvia
         self._reloj = reloj
+        # Se invoca con True al iniciar la suspension por lluvia y con False al reanudar.
+        # app.py lo usa para portus/evt/clima, la alarma AL17 y los avisos (sec. 2.2, 3.3).
+        self._al_cambiar = al_cambiar or (lambda suspendido: None)
         self._lock = threading.Lock()
         self._sin_lluvia_desde: Optional[float] = None
         self.suspendido_por_lluvia = False
 
     def procesar_lluvia(self, lloviendo: bool) -> None:
+        cambio: Optional[bool] = None
         with self._lock:
             if lloviendo:
                 # Si vuelve a llover, el conteo de tiempo sin lluvia se reinicia desde cero.
@@ -124,17 +129,19 @@ class ControlClimaLluvia:
                 if not self.suspendido_por_lluvia:
                     self._enviar("GruaSuspender", TARGET_GRUA, {"motivo": "Clima"})
                     self.suspendido_por_lluvia = True
-                return
-
-            if not self.suspendido_por_lluvia:
-                return
-            ahora = self._reloj()
-            if self._sin_lluvia_desde is None:
-                self._sin_lluvia_desde = ahora
-            if ahora - self._sin_lluvia_desde >= self._minutos * 60:
-                self._enviar("GruaReanudar", TARGET_GRUA, {"origen": "auto"})
-                self.suspendido_por_lluvia = False
-                self._sin_lluvia_desde = None
+                    cambio = True
+            elif self.suspendido_por_lluvia:
+                ahora = self._reloj()
+                if self._sin_lluvia_desde is None:
+                    self._sin_lluvia_desde = ahora
+                if ahora - self._sin_lluvia_desde >= self._minutos * 60:
+                    self._enviar("GruaReanudar", TARGET_GRUA, {"origen": "auto"})
+                    self.suspendido_por_lluvia = False
+                    self._sin_lluvia_desde = None
+                    cambio = False
+        # Fuera del lock: el callback puede publicar MQTT y tocar la base de datos.
+        if cambio is not None:
+            self._al_cambiar(cambio)
 
 
 def validar_config_estacion(seg_lectura: int, seg_latido: int) -> None:

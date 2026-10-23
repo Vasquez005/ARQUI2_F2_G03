@@ -28,6 +28,7 @@ Los comandos se publican DESPUES del commit: si la transaccion se deshace
 """
 
 import json
+from datetime import datetime
 from typing import Callable, Optional
 
 from sqlalchemy import event, select
@@ -79,6 +80,14 @@ class PublicadorDiferido:
             self._enviar_mqtt("portus/cmd/solicitud", payload)
         self._pendientes.clear()
 
+    def publicar_ahora(self, topic: str, datos: dict) -> None:
+        """Publica de inmediato en un topico informativo (no es un comando con ACK ni
+        depende del commit). Sirve para portus/vision/* (sec. 2.2)."""
+        try:
+            self._enviar_mqtt(topic, json.dumps(datos, ensure_ascii=False))
+        except Exception as exc:
+            print(f"[VISION] no se pudo publicar en {topic}: {exc!r}")
+
 
 def _confirmar(db, pub: PublicadorDiferido) -> None:
     db.commit()
@@ -128,6 +137,41 @@ def _pantalla_garita(pub: PublicadorDiferido, uid: str, decision: verificacion.D
         {"uid": uid, "linea1": decision.linea1, "linea2": decision.linea2})
 
 
+def _publicar_vision(pub: PublicadorDiferido, uid: str, lectura: Optional[dict],
+                     decision: verificacion.Decision) -> None:
+    """Sec. 2.2: resultado de cada lectura (portus/vision/placa) y estado de la camara
+    y los modelos (portus/vision/estado). lectura None = camara fuera de servicio."""
+    camara_ok = lectura is not None
+    pub.publicar_ahora("portus/vision/placa", {
+        "uid": uid,
+        "placa": (lectura or {}).get("texto", ""),
+        "confianza": (lectura or {}).get("confianza", 0.0),
+        "resultado": decision.resultado,
+        "causa": decision.causa,
+        "foto": (lectura or {}).get("foto"),
+    })
+    pub.publicar_ahora("portus/vision/estado", {
+        "camara": "operativa" if camara_ok else "fuera_de_servicio",
+        "modelos": "operativos" if camara_ok else "fuera_de_servicio",
+    })
+
+
+def _notificar_ingreso(db, turno, lectura: Optional[dict], fila) -> None:
+    """Sec. 9.2: al autorizar el ingreso, se avisa al transportista con la fotografia,
+    la placa leida, la hora, el contenedor y el tipo de operacion. La foto se resuelve
+    por la lectura de placa (referencia ingreso:<id>), que el bot adjunta."""
+    placa = (lectura or {}).get("texto", "") or "-"
+    texto = (
+        "PORTUS: ingreso verificado en garita.\n"
+        f"Placa leida: {placa}\n"
+        f"Contenedor: {turno.contenedor_id or '-'}\n"
+        f"Operacion: {turno.tipo_operacion or '-'}\n"
+        f"Hora de ingreso: {servicios.hora_local(datetime.utcnow(), '%d/%m/%Y %H:%M')}"
+    )
+    servicios.encolar_notificacion(db, turno.transportista_id, "ingreso_verificado", texto,
+                                   referencia=f"ingreso:{fila.id}")
+
+
 def _garita_rfid_verificada(db, pub: PublicadorDiferido, uid: str) -> None:
     """Fase 3 (sec. 6.1): la camara lee la placa y se verifica contra la etiqueta."""
     lectura = camara_garita.leer_placa_garita(
@@ -135,6 +179,7 @@ def _garita_rfid_verificada(db, pub: PublicadorDiferido, uid: str) -> None:
         es_valida=lambda l: l["confianza"] >= garita_verificacion.umbral_ocr() and bool(l["texto"]),
     )
     decision = garita_verificacion.decidir_entrada(db, uid, lectura)
+    _publicar_vision(pub, uid, lectura, decision)
 
     if decision.resultado == verificacion.RECHAZO:
         servicios.registrar_intento_rechazado(db, uid, "garita_entrada", "tarjeta_no_registrada")
@@ -169,7 +214,8 @@ def _garita_rfid_verificada(db, pub: PublicadorDiferido, uid: str) -> None:
         garita_verificacion.registrar_lectura(db, uid, lectura, "retencion_pendiente",
                                               causa=decision.causa, turno_id=turno.id)
     else:
-        garita_verificacion.registrar_lectura(db, uid, lectura, "autorizado", turno_id=turno.id)
+        fila = garita_verificacion.registrar_lectura(db, uid, lectura, "autorizado", turno_id=turno.id)
+        _notificar_ingreso(db, turno, lectura, fila)
     _pantalla_garita(pub, uid, decision)
     _confirmar(db, pub)
 

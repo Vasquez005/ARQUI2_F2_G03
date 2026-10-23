@@ -73,6 +73,19 @@ class ControlClimaLluviaTests(unittest.TestCase):
         self.assertEqual(self.enviados[-1][2]["origen"], "auto")
         self.assertFalse(self.c.suspendido_por_lluvia)
 
+    def test_al_cambiar_avisa_inicio_y_fin_de_la_suspension(self):
+        cambios = []
+        c = ControlClimaLluvia(
+            enviar=lambda *a: None, minutos_sin_lluvia=2, reloj=lambda: self.t[0],
+            al_cambiar=cambios.append,
+        )
+        c.procesar_lluvia(True)        # inicia suspension -> True
+        c.procesar_lluvia(True)        # ya suspendida, no repite
+        c.procesar_lluvia(False)
+        self.t[0] = 120
+        c.procesar_lluvia(False)       # reanuda -> False
+        self.assertEqual(cambios, [True, False])
+
     def test_volver_a_llover_reinicia_el_conteo(self):
         self.c.procesar_lluvia(True)
         self.c.procesar_lluvia(False)

@@ -1,0 +1,648 @@
+diff --git a/backend/app.py b/backend/app.py
+index 3d4ed32..98f455d 100644
+--- a/backend/app.py
++++ b/backend/app.py
+@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
+ from pydantic import BaseModel
+ from sqlalchemy import select
+ 
++import camara_garita
+ import estacion
+ import grua
+ import iluminacion
+@@ -62,8 +63,77 @@ def _auditar_iluminacion(detalle: dict) -> None:
+ control_iluminacion = iluminacion.ControlIluminacion(
+     enviar=_enviar_comando_mega, auditar=_auditar_iluminacion,
+ )
++# Sec. 4.2 r2: antes de fotografiar una placa, la planta debe estar encendida.
++camara_garita.set_preparador_iluminacion(control_iluminacion.para_captura)
+ registro_estacion = estacion.RegistroEstacion()
+-control_clima_lluvia = estacion.ControlClimaLluvia(enviar=_enviar_comando_mega)
++
++CLAVE_CONFIG_CLIMA = "clima_actual"  # snapshot que lee el bot para /clima (sec. 9.1)
++
++
++def _afectados_por_lluvia(db) -> list[int]:
++    """Transportistas con turno activo en la terminal (sec. 3.3). La cita en franja
++    se cubre con la notificacion de cita; aqui avisamos a los que estan operando."""
++    ids = db.scalars(
++        select(Turno.transportista_id)
++        .where(Turno.estado.not_in(ESTADOS_FINALES), Turno.transportista_id.is_not(None))
++        .distinct()
++    ).all()
++    return [i for i in ids if i is not None]
++
++
++def _guardar_snapshot_clima(disponible: bool) -> None:
++    """Deja el ultimo clima y el estado de la grua en la tabla configuracion para /clima."""
++    ultima = registro_estacion.ultima()
++    datos = {
++        "ok": disponible and ultima is not None,
++        "t": getattr(ultima, "temperatura", None) if ultima else None,
++        "h": getattr(ultima, "humedad", None) if ultima else None,
++        "ll": getattr(ultima, "lluvia", None) if ultima else None,
++        "luz": getattr(ultima, "luz", None) if ultima else None,
++        "ts": getattr(ultima, "ts", None) if ultima else None,
++        "susp": control_clima_lluvia.suspendido_por_lluvia,
++        "susp_desde": _suspension_desde[0],
++    }
++    with SessionLocal() as db:
++        servicios.set_config_json(db, CLAVE_CONFIG_CLIMA, datos)
++        db.commit()
++
++
++_suspension_desde = [None]  # hora ISO del inicio de la suspension por lluvia vigente
++
++
++def _al_cambiar_clima(suspendido: bool) -> None:
++    """Sec. 2.2 / 3.3: inicio y fin de la suspension por lluvia -> portus/evt/clima,
++    alarma AL17 y avisos a los transportistas afectados."""
++    ahora = datetime.now(timezone.utc)
++    if suspendido:
++        _suspension_desde[0] = ahora.isoformat()
++        with SessionLocal() as db:
++            servicios.generar_alarma(db, "AL17", origen="estacion",
++                                     descripcion="Lluvia detectada, grua suspendida")
++            texto = (f"PORTUS: operacion de grua suspendida por lluvia desde "
++                     f"{servicios.hora_local(ahora, '%H:%M')}. Tu operacion podria demorarse.")
++            for tid in _afectados_por_lluvia(db):
++                servicios.encolar_notificacion(db, tid, "grua_suspendida_lluvia", texto)
++            db.commit()
++        mqttc.publish("portus/evt/clima",
++                      json.dumps({"estado": "suspension", "motivo": "Clima", "ts": ahora.isoformat()}))
++    else:
++        inicio = _suspension_desde[0]
++        _suspension_desde[0] = None
++        with SessionLocal() as db:
++            texto = f"PORTUS: operacion de grua reanudada a las {servicios.hora_local(ahora, '%H:%M')}."
++            for tid in _afectados_por_lluvia(db):
++                servicios.encolar_notificacion(db, tid, "grua_reanudada_lluvia", texto)
++            db.commit()
++        mqttc.publish("portus/evt/clima",
++                      json.dumps({"estado": "reanudacion", "desde": inicio, "ts": ahora.isoformat()}))
++    _guardar_snapshot_clima(disponible=True)
++
++
++control_clima_lluvia = estacion.ControlClimaLluvia(
++    enviar=_enviar_comando_mega, al_cambiar=_al_cambiar_clima,
++)
+ 
+ 
+ def _publicar_config_estacion_mqtt() -> None:
+@@ -83,6 +153,7 @@ def _procesar_lectura_estacion(payload: dict) -> None:
+         estacion.procesar_lectura_estacion(
+             payload, registro_estacion, control_iluminacion, control_clima_lluvia,
+         )
++        _guardar_snapshot_clima(disponible=True)
+     except Exception as exc:
+         print(f"[ESTACION] error procesando lectura: {exc!r}")
+ 
+@@ -98,6 +169,7 @@ def _alerta_estacion_fuera() -> None:
+                                  descripcion="Estacion meteorologica sin comunicacion")
+         db.commit()
+     control_iluminacion.encender_sin_estacion()
++    _guardar_snapshot_clima(disponible=False)  # /clima respondera que el clima no esta disponible
+ 
+ 
+ def _recuperacion_estacion() -> None:
+diff --git a/backend/camara_garita.py b/backend/camara_garita.py
+index 8353bd4..32fbaa1 100644
+--- a/backend/camara_garita.py
++++ b/backend/camara_garita.py
+@@ -7,6 +7,7 @@ Las dependencias de vision (OpenCV, YOLO, EasyOCR) solo se cargan cuando se usan
+ para que el backend siga arrancando en equipos sin esas librerias.
+ """
+ 
++import contextlib
+ import os
+ import sys
+ import threading
+@@ -21,6 +22,24 @@ RUTA_FOTO = os.getenv("PORTUS_RUTA_FOTO_GARITA", os.path.join(RAIZ_REPO, "captur
+ _lock = threading.Lock()
+ _lector = None
+ 
++# Sec. 4.2 regla 2: app.py registra aqui control_iluminacion.para_captura para que
++# la planta se encienda antes de la foto. Sin hardware (pruebas) queda en None y no hace nada.
++_preparar_iluminacion: Optional[Callable[[], "contextlib.AbstractContextManager"]] = None
++
++
++def set_preparador_iluminacion(factory: Optional[Callable[[], "contextlib.AbstractContextManager"]]) -> None:
++    global _preparar_iluminacion
++    _preparar_iluminacion = factory
++
++
++@contextlib.contextmanager
++def _iluminacion_para_captura():
++    if _preparar_iluminacion is None:
++        yield
++    else:
++        with _preparar_iluminacion():
++            yield
++
+ 
+ def _modulo_lector():
+     """Importa lector_placas solo la primera vez (carga YOLO y EasyOCR)."""
+@@ -83,12 +102,14 @@ def leer_placa_garita(
+     with _lock:
+         if leer is None:
+             leer = _modulo_lector().leer_placa
+-        for _ in range(intentos):
+-            if not capturar():
+-                return None
+-            ultima = _mejor_placa(leer(RUTA_FOTO), RUTA_FOTO)
+-            if es_valida is None or es_valida(ultima):
+-                break
++        # sec. 4.2 r2: la planta se enciende (si hacia falta) y se restaura al terminar.
++        with _iluminacion_para_captura():
++            for _ in range(intentos):
++                if not capturar():
++                    return None
++                ultima = _mejor_placa(leer(RUTA_FOTO), RUTA_FOTO)
++                if es_valida is None or es_valida(ultima):
++                    break
+     return ultima
+ 
+ 
+diff --git a/backend/estacion.py b/backend/estacion.py
+index 498700c..393f2ba 100644
+--- a/backend/estacion.py
++++ b/backend/estacion.py
+@@ -107,16 +107,21 @@ class ControlClimaLluvia:
+         enviar: EnviarComando,
+         minutos_sin_lluvia: int = CONFIG_MINUTOS_SIN_LLUVIA_DEFECTO,
+         reloj: Callable[[], float] = time.monotonic,
++        al_cambiar: Optional[Callable[[bool], None]] = None,
+     ) -> None:
+         validar_minutos_sin_lluvia(minutos_sin_lluvia)
+         self._enviar = enviar
+         self._minutos = minutos_sin_lluvia
+         self._reloj = reloj
++        # Se invoca con True al iniciar la suspension por lluvia y con False al reanudar.
++        # app.py lo usa para portus/evt/clima, la alarma AL17 y los avisos (sec. 2.2, 3.3).
++        self._al_cambiar = al_cambiar or (lambda suspendido: None)
+         self._lock = threading.Lock()
+         self._sin_lluvia_desde: Optional[float] = None
+         self.suspendido_por_lluvia = False
+ 
+     def procesar_lluvia(self, lloviendo: bool) -> None:
++        cambio: Optional[bool] = None
+         with self._lock:
+             if lloviendo:
+                 # Si vuelve a llover, el conteo de tiempo sin lluvia se reinicia desde cero.
+@@ -124,17 +129,19 @@ class ControlClimaLluvia:
+                 if not self.suspendido_por_lluvia:
+                     self._enviar("GruaSuspender", TARGET_GRUA, {"motivo": "Clima"})
+                     self.suspendido_por_lluvia = True
+-                return
+-
+-            if not self.suspendido_por_lluvia:
+-                return
+-            ahora = self._reloj()
+-            if self._sin_lluvia_desde is None:
+-                self._sin_lluvia_desde = ahora
+-            if ahora - self._sin_lluvia_desde >= self._minutos * 60:
+-                self._enviar("GruaReanudar", TARGET_GRUA, {"origen": "auto"})
+-                self.suspendido_por_lluvia = False
+-                self._sin_lluvia_desde = None
++                    cambio = True
++            elif self.suspendido_por_lluvia:
++                ahora = self._reloj()
++                if self._sin_lluvia_desde is None:
++                    self._sin_lluvia_desde = ahora
++                if ahora - self._sin_lluvia_desde >= self._minutos * 60:
++                    self._enviar("GruaReanudar", TARGET_GRUA, {"origen": "auto"})
++                    self.suspendido_por_lluvia = False
++                    self._sin_lluvia_desde = None
++                    cambio = False
++        # Fuera del lock: el callback puede publicar MQTT y tocar la base de datos.
++        if cambio is not None:
++            self._al_cambiar(cambio)
+ 
+ 
+ def validar_config_estacion(seg_lectura: int, seg_latido: int) -> None:
+diff --git a/backend/iluminacion.py b/backend/iluminacion.py
+index 9fe53e2..f6d04dd 100644
+--- a/backend/iluminacion.py
++++ b/backend/iluminacion.py
+@@ -15,7 +15,9 @@ Este modulo no toca la base de datos ni MQTT: recibe una funcion que envia el
+ comando, y asi se prueba sin hardware (ver test_iluminacion.py).
+ """
+ 
++import contextlib
+ import threading
++import time
+ from typing import Callable, Optional
+ 
+ MODO_AUTOMATICO = "Automatico"
+@@ -135,6 +137,31 @@ class ControlIluminacion:
+                 # Automatico: la siguiente lectura de luz manda el estado correcto.
+                 self.encendida = None
+ 
++    @contextlib.contextmanager
++    def para_captura(self, espera_s: float = 1.0, dormir: Callable[[float], None] = time.sleep):
++        """Sec. 4.2 regla 2: antes de fotografiar una placa la iluminacion debe estar
++        encendida. Si esta apagada la enciende, espera espera_s segundos y, al terminar
++        la captura, devuelve la tira al estado que indique el modo vigente. Se aplica en
++        los tres modos (en Encendido forzado o Apagado forzado respeta el modo al salir)."""
++        with self._lock:
++            encender_ahora = self.encendida is not True
++            if encender_ahora:
++                self._mandar(True)
++        if encender_ahora:
++            dormir(espera_s)
++        try:
++            yield
++        finally:
++            with self._lock:
++                if self.modo == MODO_ENCENDIDO:
++                    self._mandar(True)
++                elif self.modo == MODO_APAGADO:
++                    self._mandar(False)
++                elif encender_ahora:
++                    # Automatico: la encendimos solo para la foto, la devolvemos a apagada;
++                    # la siguiente lectura de luz fijara el estado correcto.
++                    self._mandar(False)
++
+     def _mandar(self, encender: bool) -> None:
+         nombre = "IluminacionEncender" if encender else "IluminacionApagar"
+         self._enviar(nombre, TARGET_CONTROLADOR, {"modo": self.modo})
+diff --git a/backend/models.py b/backend/models.py
+index 3e152c4..ea6e259 100644
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -341,7 +341,7 @@ class Configuracion(Base):
+     """Ajustes del sistema que cambia la terminal (ej. la politica de patio)."""
+     __tablename__ = "configuracion"
+     clave: Mapped[str] = mapped_column(String(40), primary_key=True)
+-    valor: Mapped[str] = mapped_column(String(200))
++    valor: Mapped[str] = mapped_column(Text)
+ 
+ 
+ class Notificacion(Base):
+diff --git a/backend/orquestador.py b/backend/orquestador.py
+index a6622b2..156282e 100644
+--- a/backend/orquestador.py
++++ b/backend/orquestador.py
+@@ -28,6 +28,7 @@ Los comandos se publican DESPUES del commit: si la transaccion se deshace
+ """
+ 
+ import json
++from datetime import datetime
+ from typing import Callable, Optional
+ 
+ from sqlalchemy import event, select
+@@ -79,6 +80,14 @@ class PublicadorDiferido:
+             self._enviar_mqtt("portus/cmd/solicitud", payload)
+         self._pendientes.clear()
+ 
++    def publicar_ahora(self, topic: str, datos: dict) -> None:
++        """Publica de inmediato en un topico informativo (no es un comando con ACK ni
++        depende del commit). Sirve para portus/vision/* (sec. 2.2)."""
++        try:
++            self._enviar_mqtt(topic, json.dumps(datos, ensure_ascii=False))
++        except Exception as exc:
++            print(f"[VISION] no se pudo publicar en {topic}: {exc!r}")
++
+ 
+ def _confirmar(db, pub: PublicadorDiferido) -> None:
+     db.commit()
+@@ -128,6 +137,41 @@ def _pantalla_garita(pub: PublicadorDiferido, uid: str, decision: verificacion.D
+         {"uid": uid, "linea1": decision.linea1, "linea2": decision.linea2})
+ 
+ 
++def _publicar_vision(pub: PublicadorDiferido, uid: str, lectura: Optional[dict],
++                     decision: verificacion.Decision) -> None:
++    """Sec. 2.2: resultado de cada lectura (portus/vision/placa) y estado de la camara
++    y los modelos (portus/vision/estado). lectura None = camara fuera de servicio."""
++    camara_ok = lectura is not None
++    pub.publicar_ahora("portus/vision/placa", {
++        "uid": uid,
++        "placa": (lectura or {}).get("texto", ""),
++        "confianza": (lectura or {}).get("confianza", 0.0),
++        "resultado": decision.resultado,
++        "causa": decision.causa,
++        "foto": (lectura or {}).get("foto"),
++    })
++    pub.publicar_ahora("portus/vision/estado", {
++        "camara": "operativa" if camara_ok else "fuera_de_servicio",
++        "modelos": "operativos" if camara_ok else "fuera_de_servicio",
++    })
++
++
++def _notificar_ingreso(db, turno, lectura: Optional[dict], fila) -> None:
++    """Sec. 9.2: al autorizar el ingreso, se avisa al transportista con la fotografia,
++    la placa leida, la hora, el contenedor y el tipo de operacion. La foto se resuelve
++    por la lectura de placa (referencia ingreso:<id>), que el bot adjunta."""
++    placa = (lectura or {}).get("texto", "") or "-"
++    texto = (
++        "PORTUS: ingreso verificado en garita.\n"
++        f"Placa leida: {placa}\n"
++        f"Contenedor: {turno.contenedor_id or '-'}\n"
++        f"Operacion: {turno.tipo_operacion or '-'}\n"
++        f"Hora de ingreso: {servicios.hora_local(datetime.utcnow(), '%d/%m/%Y %H:%M')}"
++    )
++    servicios.encolar_notificacion(db, turno.transportista_id, "ingreso_verificado", texto,
++                                   referencia=f"ingreso:{fila.id}")
++
++
+ def _garita_rfid_verificada(db, pub: PublicadorDiferido, uid: str) -> None:
+     """Fase 3 (sec. 6.1): la camara lee la placa y se verifica contra la etiqueta."""
+     lectura = camara_garita.leer_placa_garita(
+@@ -135,6 +179,7 @@ def _garita_rfid_verificada(db, pub: PublicadorDiferido, uid: str) -> None:
+         es_valida=lambda l: l["confianza"] >= garita_verificacion.umbral_ocr() and bool(l["texto"]),
+     )
+     decision = garita_verificacion.decidir_entrada(db, uid, lectura)
++    _publicar_vision(pub, uid, lectura, decision)
+ 
+     if decision.resultado == verificacion.RECHAZO:
+         servicios.registrar_intento_rechazado(db, uid, "garita_entrada", "tarjeta_no_registrada")
+@@ -169,7 +214,8 @@ def _garita_rfid_verificada(db, pub: PublicadorDiferido, uid: str) -> None:
+         garita_verificacion.registrar_lectura(db, uid, lectura, "retencion_pendiente",
+                                               causa=decision.causa, turno_id=turno.id)
+     else:
+-        garita_verificacion.registrar_lectura(db, uid, lectura, "autorizado", turno_id=turno.id)
++        fila = garita_verificacion.registrar_lectura(db, uid, lectura, "autorizado", turno_id=turno.id)
++        _notificar_ingreso(db, turno, lectura, fila)
+     _pantalla_garita(pub, uid, decision)
+     _confirmar(db, pub)
+ 
+diff --git a/backend/servicios.py b/backend/servicios.py
+index 50011df..bab33d0 100644
+--- a/backend/servicios.py
++++ b/backend/servicios.py
+@@ -21,14 +21,35 @@ from catalogos import (
+     RT01, RT02, RT03, RT04, SEVERIDADES_AUTO_RECONOCIBLES, TOLERANCIA_VENTANA_MIN,
+     TRANSICIONES, ZONA_HORARIA,
+ )
++import json
++
+ from models import (
+-    Alarma, Cita, CommandAudit, FranjaBloqueada, IntentoIngreso, ManifiestoEvento, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
++    Alarma, Cita, CommandAudit, Configuracion, FranjaBloqueada, IntentoIngreso, ManifiestoEvento, LinkDevice, Manifiesto, Notificacion, ParqueoPlaza, PosicionPatio,
+     Retencion, Transportista, Turno, EventoTurno, Vehiculo,
+ )
+ 
+ PublishFn = Callable[[str, str, dict], None]
+ 
+ 
++def set_config_json(db, clave: str, datos: dict) -> None:
++    """Guarda (o reemplaza) un ajuste del sistema como JSON en la tabla configuracion.
++    Lo usa el servidor para dejar el ultimo clima a mano del bot (/clima)."""
++    fila = db.get(Configuracion, clave) or Configuracion(clave=clave, valor="")
++    fila.valor = json.dumps(datos, ensure_ascii=False)
++    db.add(fila)
++
++
++def get_config_json(db, clave: str) -> dict:
++    """Lee un ajuste JSON de la tabla configuracion. {} si no existe o esta corrupto."""
++    fila = db.get(Configuracion, clave)
++    if fila is None or not fila.valor:
++        return {}
++    try:
++        return json.loads(fila.valor)
++    except (ValueError, TypeError):
++        return {}
++
++
+ class ReglaDeNegocioError(Exception):
+     """Un rechazo esperado del dominio (no autorizado, estado invalido, etc.)."""
+ 
+diff --git a/backend/test_estacion.py b/backend/test_estacion.py
+index faba29a..4a2b720 100644
+--- a/backend/test_estacion.py
++++ b/backend/test_estacion.py
+@@ -73,6 +73,19 @@ class ControlClimaLluviaTests(unittest.TestCase):
+         self.assertEqual(self.enviados[-1][2]["origen"], "auto")
+         self.assertFalse(self.c.suspendido_por_lluvia)
+ 
++    def test_al_cambiar_avisa_inicio_y_fin_de_la_suspension(self):
++        cambios = []
++        c = ControlClimaLluvia(
++            enviar=lambda *a: None, minutos_sin_lluvia=2, reloj=lambda: self.t[0],
++            al_cambiar=cambios.append,
++        )
++        c.procesar_lluvia(True)        # inicia suspension -> True
++        c.procesar_lluvia(True)        # ya suspendida, no repite
++        c.procesar_lluvia(False)
++        self.t[0] = 120
++        c.procesar_lluvia(False)       # reanuda -> False
++        self.assertEqual(cambios, [True, False])
++
+     def test_volver_a_llover_reinicia_el_conteo(self):
+         self.c.procesar_lluvia(True)
+         self.c.procesar_lluvia(False)
+diff --git a/backend/test_garita_verificacion.py b/backend/test_garita_verificacion.py
+index f7263c7..a32acf8 100644
+--- a/backend/test_garita_verificacion.py
++++ b/backend/test_garita_verificacion.py
+@@ -43,9 +43,17 @@ class GaritaVerificacionTests(MaquetaBase):
+     def ejecutar(self, uid, lectura):
+         camara_garita.leer_placa_garita = lambda **kwargs: lectura
+         comandos = []
++        self.vision = []  # (topic, datos) de portus/vision/* publicados en el flujo
++
++        def capturar(topic, payload):
++            datos = json.loads(payload)
++            if topic == "portus/cmd/solicitud":
++                comandos.append(datos)
++            elif topic.startswith("portus/vision/"):
++                self.vision.append((topic, datos))
++
+         with self.Session() as db:
+-            pub = orquestador.PublicadorDiferido(
+-                db, lambda topic, payload: comandos.append(json.loads(payload)))
++            pub = orquestador.PublicadorDiferido(db, capturar)
+             orquestador._garita_rfid_verificada(db, pub, uid)
+         return [c["name"] for c in comandos], comandos
+ 
+@@ -61,6 +69,28 @@ class GaritaVerificacionTests(MaquetaBase):
+             self.assertIsNotNone(lect.turno_id)
+             self.assertEqual(db.query(Turno).count(), 1)
+ 
++    def test_ingreso_autorizado_publica_vision_y_notifica_con_foto(self):
++        from models import Notificacion
++        self.ejecutar(UID_OK, self.lectura(PLACA_OK))
++        # sec. 2.2: se publico el resultado de la lectura y el estado de la camara
++        topicos = {t for t, _ in self.vision}
++        self.assertIn("portus/vision/placa", topicos)
++        self.assertIn("portus/vision/estado", topicos)
++        placa_msg = next(d for t, d in self.vision if t == "portus/vision/placa")
++        self.assertEqual(placa_msg["placa"], PLACA_OK)
++        estado_msg = next(d for t, d in self.vision if t == "portus/vision/estado")
++        self.assertEqual(estado_msg["camara"], "operativa")
++        # sec. 9.2: aviso de ingreso con referencia a la foto (ingreso:<id>)
++        with self.Session() as db:
++            notif = db.query(Notificacion).filter(Notificacion.evento == "ingreso_verificado").one()
++            lect = db.query(LecturaPlaca).one()
++            self.assertEqual(notif.referencia, f"ingreso:{lect.id}")
++
++    def test_camara_fuera_de_servicio_publica_estado_fuera(self):
++        self.ejecutar(UID_OK, None)  # None = camara fuera de servicio
++        estado_msg = next(d for t, d in self.vision if t == "portus/vision/estado")
++        self.assertEqual(estado_msg["camara"], "fuera_de_servicio")
++
+     def test_placa_de_otro_camion_crea_retencion_pendiente_rt07_y_al20(self):
+         self.ejecutar(UID_OK, self.lectura(PLACA_OTRA))
+         with self.Session() as db:
+diff --git a/backend/test_iluminacion.py b/backend/test_iluminacion.py
+index 2688c79..32491c2 100644
+--- a/backend/test_iluminacion.py
++++ b/backend/test_iluminacion.py
+@@ -133,6 +133,26 @@ class ControlIluminacionTests(unittest.TestCase):
+         with self.assertRaises(ValueError):
+             ControlIluminacion(enviar=lambda *a: None, umbral_encendido=50, umbral_apagado=50)
+ 
++    # Sec. 4.2 regla 2: iluminacion previa a la captura de placa.
++    def test_para_captura_enciende_si_estaba_apagada_y_restaura_en_automatico(self):
++        self.control.procesar_lectura(80)   # luz alta -> apagada
++        self.enviados.clear()
++        esperas = []
++        with self.control.para_captura(espera_s=1.0, dormir=esperas.append):
++            # dentro de la captura la tira esta encendida y ya se espero 1 s
++            self.assertEqual(esperas, [1.0])
++            self.assertEqual(self.enviados[-1][0], "IluminacionEncender")
++        # al salir, en Automatico se devuelve a apagada (la siguiente lectura la ajusta)
++        self.assertEqual(self.enviados[-1][0], "IluminacionApagar")
++
++    def test_para_captura_no_apaga_si_el_modo_es_encendido_forzado(self):
++        self.control.cambiar_modo(MODO_ENCENDIDO)  # queda encendida
++        self.enviados.clear()
++        with self.control.para_captura(espera_s=1.0, dormir=lambda s: None):
++            pass
++        # no estaba apagada, el modo es Encendido forzado: nunca manda IluminacionApagar
++        self.assertNotIn("IluminacionApagar", [n for n, _, _ in self.enviados])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/bot_d/app/main.py b/bot_d/app/main.py
+index 4cf561f..04145ab 100644
+--- a/bot_d/app/main.py
++++ b/bot_d/app/main.py
+@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session  # noqa: E402
+ import servicios  # noqa: E402
+ from catalogos import ESTADOS_FINALES, TOLERANCIA_VENTANA_MIN  # noqa: E402
+ from models import (  # noqa: E402
+-    Cita, Manifiesto, Notificacion, PosicionPatio, Transportista, Turno, make_db,
++    Cita, LecturaPlaca, Manifiesto, Notificacion, PosicionPatio, Transportista, Turno, make_db,
+ )
+ from servicios import estado_cita, proximas_franjas, texto_franja  # noqa: E402
+ 
+@@ -77,6 +77,7 @@ COMANDOS = [
+     ("/miscitas", "Lista tus citas y su estado"),
+     ("/estado CONTENEDOR", "Consulta el estado de uno de tus contenedores"),
+     ("/misturnos", "Lista tus operaciones en curso"),
++    ("/clima", "Consulta el clima de la terminal y el estado de la grua"),
+     ("/ayuda", "Repite esta lista de comandos"),
+ ]
+ 
+@@ -298,6 +299,42 @@ def cmd_misturnos(db: Session, trans: Transportista) -> str:
+     return "Tus turnos activos:\n" + "\n".join(lineas)
+ 
+ 
++def cmd_clima(db: Session) -> str:
++    """Sec. 9.1: temperatura, humedad, estado de lluvia y estado de la grua. Si la
++    estacion esta fuera de servicio, se indica que no hay clima disponible."""
++    datos = servicios.get_config_json(db, "clima_actual")
++    susp = datos.get("susp")
++    if susp:
++        desde = datos.get("susp_desde")
++        try:
++            hora = servicios.hora_local(datetime.fromisoformat(desde), "%H:%M") if desde else "?"
++        except (TypeError, ValueError):
++            hora = "?"
++        grua = f"suspendida por lluvia desde las {hora}"
++    else:
++        grua = "operando"
++
++    if not datos.get("ok"):
++        return ("Clima de la terminal:\n"
++                "Informacion meteorologica no disponible (estacion fuera de servicio).\n"
++                f"Grua: {grua}.")
++
++    lluvia = "con lluvia" if datos.get("ll") else "sin lluvia"
++    ts = datos.get("ts")
++    try:
++        ultima = servicios.hora_local(datetime.utcfromtimestamp(int(ts)), "%d/%m/%Y %H:%M") if ts else "-"
++    except (TypeError, ValueError, OverflowError, OSError):
++        ultima = "-"
++    temp = datos.get("t")
++    hum = datos.get("h")
++    return ("Clima de la terminal:\n"
++            f"Temperatura: {temp if temp is not None else '-'} C\n"
++            f"Humedad: {hum if hum is not None else '-'} %\n"
++            f"Estado: {lluvia}\n"
++            f"Grua: {grua}\n"
++            f"Ultima lectura: {ultima}")
++
++
+ def process_command(db: Session, chat_id: str, text: str) -> str:
+     """Nunca devuelve vacio: sec. 6.2 'el servicio nunca debera quedar sin responder'."""
+     parts = (text or "").strip().split()
+@@ -325,6 +362,8 @@ def process_command(db: Session, chat_id: str, text: str) -> str:
+         return cmd_estado(db, trans, args[0] if args else None)
+     if cmd == "/misturnos":
+         return cmd_misturnos(db, trans)
++    if cmd == "/clima":
++        return cmd_clima(db)
+     return MSG_NO_RECONOCIDO
+ 
+ 
+@@ -369,12 +408,28 @@ def notificaciones_pendientes(db: Session) -> list:
+     ).all()
+ 
+ 
++def _foto_de_notificacion(db: Session, notif: Notificacion) -> Optional[str]:
++    """Sec. 9.2: la notificacion de ingreso trae referencia 'ingreso:<id>'. Resuelve la
++    foto de esa lectura de placa si el archivo existe en el servidor (misma maquina)."""
++    ref = notif.referencia or ""
++    if notif.evento != "ingreso_verificado" or not ref.startswith("ingreso:"):
++        return None
++    try:
++        lectura = db.get(LecturaPlaca, int(ref.split(":", 1)[1]))
++    except (ValueError, IndexError):
++        return None
++    if lectura and lectura.foto and os.path.exists(lectura.foto):
++        return lectura.foto
++    return None
++
++
+ async def despachar_notificaciones(send) -> None:
+     with SessionLocal() as db:
+         encolar_recordatorios(db)
+         for notif, chat_id in notificaciones_pendientes(db):
++            foto = _foto_de_notificacion(db, notif)
+             try:
+-                await send(chat_id, notif.texto)
++                await send(chat_id, notif.texto, foto)
+             except Exception as exc:  # un chat bloqueado no debe frenar a los demas
+                 print(f"[NOTIF] error enviando #{notif.id} a {chat_id}: {exc}")
+                 continue
+@@ -422,7 +477,14 @@ async def telegram_mode(token: str) -> None:
+     # el servicio nunca queda sin responder. Las ediciones no se contestan dos veces.
+     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, on_message))
+ 
+-    async def send(chat_id: str, text: str) -> None:
++    async def send(chat_id: str, text: str, foto: Optional[str] = None) -> None:
++        if foto:
++            try:
++                with open(foto, "rb") as f:
++                    await app.bot.send_photo(chat_id=chat_id, photo=f, caption=text)
++                return
++            except Exception as exc:
++                print(f"[NOTIF] no se pudo enviar la foto {foto}: {exc}; se envia solo texto")
+         await app.bot.send_message(chat_id=chat_id, text=text)
+ 
+     await app.initialize()
+@@ -446,8 +508,9 @@ def cli_mode() -> None:
+     print("Modo simulacion CLI (sin PORTUS_BOT_TOKEN). BD:", DB_PATH)
+     print("Utilitarios: transportistas | gen-code <id> | chat <chat_id> <texto> | notifs | exit")
+ 
+-    async def send(chat_id: str, text: str) -> None:
+-        print(f"[NOTIF -> chat {chat_id}]\n{text}\n")
++    async def send(chat_id: str, text: str, foto: Optional[str] = None) -> None:
++        extra = f" [foto: {foto}]" if foto else ""
++        print(f"[NOTIF -> chat {chat_id}]{extra}\n{text}\n")
+ 
+     while True:
+         try:

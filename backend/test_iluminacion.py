@@ -133,6 +133,26 @@ class ControlIluminacionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ControlIluminacion(enviar=lambda *a: None, umbral_encendido=50, umbral_apagado=50)
 
+    # Sec. 4.2 regla 2: iluminacion previa a la captura de placa.
+    def test_para_captura_enciende_si_estaba_apagada_y_restaura_en_automatico(self):
+        self.control.procesar_lectura(80)   # luz alta -> apagada
+        self.enviados.clear()
+        esperas = []
+        with self.control.para_captura(espera_s=1.0, dormir=esperas.append):
+            # dentro de la captura la tira esta encendida y ya se espero 1 s
+            self.assertEqual(esperas, [1.0])
+            self.assertEqual(self.enviados[-1][0], "IluminacionEncender")
+        # al salir, en Automatico se devuelve a apagada (la siguiente lectura la ajusta)
+        self.assertEqual(self.enviados[-1][0], "IluminacionApagar")
+
+    def test_para_captura_no_apaga_si_el_modo_es_encendido_forzado(self):
+        self.control.cambiar_modo(MODO_ENCENDIDO)  # queda encendida
+        self.enviados.clear()
+        with self.control.para_captura(espera_s=1.0, dormir=lambda s: None):
+            pass
+        # no estaba apagada, el modo es Encendido forzado: nunca manda IluminacionApagar
+        self.assertNotIn("IluminacionApagar", [n for n, _, _ in self.enviados])
+
 
 if __name__ == "__main__":
     unittest.main()

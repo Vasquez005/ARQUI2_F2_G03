@@ -15,7 +15,9 @@ Este modulo no toca la base de datos ni MQTT: recibe una funcion que envia el
 comando, y asi se prueba sin hardware (ver test_iluminacion.py).
 """
 
+import contextlib
 import threading
+import time
 from typing import Callable, Optional
 
 MODO_AUTOMATICO = "Automatico"
@@ -134,6 +136,31 @@ class ControlIluminacion:
             else:
                 # Automatico: la siguiente lectura de luz manda el estado correcto.
                 self.encendida = None
+
+    @contextlib.contextmanager
+    def para_captura(self, espera_s: float = 1.0, dormir: Callable[[float], None] = time.sleep):
+        """Sec. 4.2 regla 2: antes de fotografiar una placa la iluminacion debe estar
+        encendida. Si esta apagada la enciende, espera espera_s segundos y, al terminar
+        la captura, devuelve la tira al estado que indique el modo vigente. Se aplica en
+        los tres modos (en Encendido forzado o Apagado forzado respeta el modo al salir)."""
+        with self._lock:
+            encender_ahora = self.encendida is not True
+            if encender_ahora:
+                self._mandar(True)
+        if encender_ahora:
+            dormir(espera_s)
+        try:
+            yield
+        finally:
+            with self._lock:
+                if self.modo == MODO_ENCENDIDO:
+                    self._mandar(True)
+                elif self.modo == MODO_APAGADO:
+                    self._mandar(False)
+                elif encender_ahora:
+                    # Automatico: la encendimos solo para la foto, la devolvemos a apagada;
+                    # la siguiente lectura de luz fijara el estado correcto.
+                    self._mandar(False)
 
     def _mandar(self, encender: bool) -> None:
         nombre = "IluminacionEncender" if encender else "IluminacionApagar"

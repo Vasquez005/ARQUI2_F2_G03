@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session  # noqa: E402
 import servicios  # noqa: E402
 from catalogos import ESTADOS_FINALES, TOLERANCIA_VENTANA_MIN  # noqa: E402
 from models import (  # noqa: E402
-    Cita, Manifiesto, Notificacion, PosicionPatio, Transportista, Turno, make_db,
+    Cita, LecturaPlaca, Manifiesto, Notificacion, PosicionPatio, Transportista, Turno, make_db,
 )
 from servicios import estado_cita, proximas_franjas, texto_franja  # noqa: E402
 
@@ -77,6 +77,7 @@ COMANDOS = [
     ("/miscitas", "Lista tus citas y su estado"),
     ("/estado CONTENEDOR", "Consulta el estado de uno de tus contenedores"),
     ("/misturnos", "Lista tus operaciones en curso"),
+    ("/clima", "Consulta el clima de la terminal y el estado de la grua"),
     ("/ayuda", "Repite esta lista de comandos"),
 ]
 
@@ -298,6 +299,42 @@ def cmd_misturnos(db: Session, trans: Transportista) -> str:
     return "Tus turnos activos:\n" + "\n".join(lineas)
 
 
+def cmd_clima(db: Session) -> str:
+    """Sec. 9.1: temperatura, humedad, estado de lluvia y estado de la grua. Si la
+    estacion esta fuera de servicio, se indica que no hay clima disponible."""
+    datos = servicios.get_config_json(db, "clima_actual")
+    susp = datos.get("susp")
+    if susp:
+        desde = datos.get("susp_desde")
+        try:
+            hora = servicios.hora_local(datetime.fromisoformat(desde), "%H:%M") if desde else "?"
+        except (TypeError, ValueError):
+            hora = "?"
+        grua = f"suspendida por lluvia desde las {hora}"
+    else:
+        grua = "operando"
+
+    if not datos.get("ok"):
+        return ("Clima de la terminal:\n"
+                "Informacion meteorologica no disponible (estacion fuera de servicio).\n"
+                f"Grua: {grua}.")
+
+    lluvia = "con lluvia" if datos.get("ll") else "sin lluvia"
+    ts = datos.get("ts")
+    try:
+        ultima = servicios.hora_local(datetime.utcfromtimestamp(int(ts)), "%d/%m/%Y %H:%M") if ts else "-"
+    except (TypeError, ValueError, OverflowError, OSError):
+        ultima = "-"
+    temp = datos.get("t")
+    hum = datos.get("h")
+    return ("Clima de la terminal:\n"
+            f"Temperatura: {temp if temp is not None else '-'} C\n"
+            f"Humedad: {hum if hum is not None else '-'} %\n"
+            f"Estado: {lluvia}\n"
+            f"Grua: {grua}\n"
+            f"Ultima lectura: {ultima}")
+
+
 def process_command(db: Session, chat_id: str, text: str) -> str:
     """Nunca devuelve vacio: sec. 6.2 'el servicio nunca debera quedar sin responder'."""
     parts = (text or "").strip().split()
@@ -325,6 +362,8 @@ def process_command(db: Session, chat_id: str, text: str) -> str:
         return cmd_estado(db, trans, args[0] if args else None)
     if cmd == "/misturnos":
         return cmd_misturnos(db, trans)
+    if cmd == "/clima":
+        return cmd_clima(db)
     return MSG_NO_RECONOCIDO
 
 
@@ -369,12 +408,28 @@ def notificaciones_pendientes(db: Session) -> list:
     ).all()
 
 
+def _foto_de_notificacion(db: Session, notif: Notificacion) -> Optional[str]:
+    """Sec. 9.2: la notificacion de ingreso trae referencia 'ingreso:<id>'. Resuelve la
+    foto de esa lectura de placa si el archivo existe en el servidor (misma maquina)."""
+    ref = notif.referencia or ""
+    if notif.evento != "ingreso_verificado" or not ref.startswith("ingreso:"):
+        return None
+    try:
+        lectura = db.get(LecturaPlaca, int(ref.split(":", 1)[1]))
+    except (ValueError, IndexError):
+        return None
+    if lectura and lectura.foto and os.path.exists(lectura.foto):
+        return lectura.foto
+    return None
+
+
 async def despachar_notificaciones(send) -> None:
     with SessionLocal() as db:
         encolar_recordatorios(db)
         for notif, chat_id in notificaciones_pendientes(db):
+            foto = _foto_de_notificacion(db, notif)
             try:
-                await send(chat_id, notif.texto)
+                await send(chat_id, notif.texto, foto)
             except Exception as exc:  # un chat bloqueado no debe frenar a los demas
                 print(f"[NOTIF] error enviando #{notif.id} a {chat_id}: {exc}")
                 continue
@@ -422,7 +477,14 @@ async def telegram_mode(token: str) -> None:
     # el servicio nunca queda sin responder. Las ediciones no se contestan dos veces.
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, on_message))
 
-    async def send(chat_id: str, text: str) -> None:
+    async def send(chat_id: str, text: str, foto: Optional[str] = None) -> None:
+        if foto:
+            try:
+                with open(foto, "rb") as f:
+                    await app.bot.send_photo(chat_id=chat_id, photo=f, caption=text)
+                return
+            except Exception as exc:
+                print(f"[NOTIF] no se pudo enviar la foto {foto}: {exc}; se envia solo texto")
         await app.bot.send_message(chat_id=chat_id, text=text)
 
     await app.initialize()
@@ -446,8 +508,9 @@ def cli_mode() -> None:
     print("Modo simulacion CLI (sin PORTUS_BOT_TOKEN). BD:", DB_PATH)
     print("Utilitarios: transportistas | gen-code <id> | chat <chat_id> <texto> | notifs | exit")
 
-    async def send(chat_id: str, text: str) -> None:
-        print(f"[NOTIF -> chat {chat_id}]\n{text}\n")
+    async def send(chat_id: str, text: str, foto: Optional[str] = None) -> None:
+        extra = f" [foto: {foto}]" if foto else ""
+        print(f"[NOTIF -> chat {chat_id}]{extra}\n{text}\n")
 
     while True:
         try:
