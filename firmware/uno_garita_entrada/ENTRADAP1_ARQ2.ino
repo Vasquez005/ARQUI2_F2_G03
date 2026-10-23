@@ -73,9 +73,9 @@ bool esperandoServidor = false;
 String uidPendiente = "";
 unsigned long tEsperaMs = 0;
 // Fase 3: la verificacion de placa (camara + OCR en la Pi) tarda unos segundos.
-// SegundosEsperaVerificacion del enunciado es 10 s por defecto (rango 5-30); se
-// sube a 15 s para dar margen a la lectura, sobre todo la primera.
-const unsigned long TIMEOUT_SERVIDOR_MS = 15000;
+// SegundosEsperaVerificacion del enunciado: default 10 s, rango 5-30. Se usa el
+// maximo (30 s) para dar el mayor margen posible a la lectura en la Raspberry.
+const unsigned long TIMEOUT_SERVIDOR_MS = 30000;
 
 // ===== BASCULA SIMULADA =====
 // No hay bascula real: esta tarjeta simula un peso fuera de tolerancia
