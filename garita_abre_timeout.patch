@@ -1,0 +1,49 @@
+diff --git a/backend/app.py b/backend/app.py
+index ee11c4d..64bcf3e 100644
+--- a/backend/app.py
++++ b/backend/app.py
+@@ -357,6 +357,20 @@ def mqtt_loop():
+             time.sleep(3)
+ 
+ 
++def precalentar_lector() -> None:
++    """Carga EasyOCR al arrancar (no en la primera tarjeta) para que la lectura de
++    placa responda dentro del tiempo de espera de la garita (sec. 6.1). Sin esto,
++    la primera lectura tarda decenas de segundos y el UNO rechaza 'Sin respuesta'."""
++    if os.getenv("PORTUS_VERIFICACION_PLACA", "0") != "1":
++        return
++    try:
++        print("[VISION] precalentando el lector de placas...")
++        camara_garita._modulo_lector()
++        print("[VISION] lector de placas listo")
++    except Exception as exc:
++        print(f"[VISION] no se pudo precalentar el lector: {exc!r}")
++
++
+ def ensure_started():
+     global started
+     if started:
+@@ -366,6 +380,7 @@ def ensure_started():
+     threading.Thread(target=link_watchdog_loop, daemon=True).start()
+     threading.Thread(target=alarmas_por_tiempo_loop, daemon=True).start()
+     threading.Thread(target=vigilancia_estacion_loop, daemon=True).start()
++    threading.Thread(target=precalentar_lector, daemon=True).start()
+ 
+ 
+ def make_publish_and_audit(db):
+diff --git a/firmware/uno_garita_entrada/ENTRADAP1_ARQ2.ino b/firmware/uno_garita_entrada/ENTRADAP1_ARQ2.ino
+index f03a5e1..aeb12a9 100644
+--- a/firmware/uno_garita_entrada/ENTRADAP1_ARQ2.ino
++++ b/firmware/uno_garita_entrada/ENTRADAP1_ARQ2.ino
+@@ -72,7 +72,10 @@ String opEnPesaje = "";
+ bool esperandoServidor = false;
+ String uidPendiente = "";
+ unsigned long tEsperaMs = 0;
+-const unsigned long TIMEOUT_SERVIDOR_MS = 5000;
++// Fase 3: la verificacion de placa (camara + OCR en la Pi) tarda unos segundos.
++// SegundosEsperaVerificacion del enunciado es 10 s por defecto (rango 5-30); se
++// sube a 15 s para dar margen a la lectura, sobre todo la primera.
++const unsigned long TIMEOUT_SERVIDOR_MS = 15000;
+ 
+ // ===== BASCULA SIMULADA =====
+ // No hay bascula real: esta tarjeta simula un peso fuera de tolerancia

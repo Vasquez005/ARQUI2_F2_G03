@@ -357,6 +357,20 @@ def mqtt_loop():
             time.sleep(3)
 
 
+def precalentar_lector() -> None:
+    """Carga EasyOCR al arrancar (no en la primera tarjeta) para que la lectura de
+    placa responda dentro del tiempo de espera de la garita (sec. 6.1). Sin esto,
+    la primera lectura tarda decenas de segundos y el UNO rechaza 'Sin respuesta'."""
+    if os.getenv("PORTUS_VERIFICACION_PLACA", "0") != "1":
+        return
+    try:
+        print("[VISION] precalentando el lector de placas...")
+        camara_garita._modulo_lector()
+        print("[VISION] lector de placas listo")
+    except Exception as exc:
+        print(f"[VISION] no se pudo precalentar el lector: {exc!r}")
+
+
 def ensure_started():
     global started
     if started:
@@ -366,6 +380,7 @@ def ensure_started():
     threading.Thread(target=link_watchdog_loop, daemon=True).start()
     threading.Thread(target=alarmas_por_tiempo_loop, daemon=True).start()
     threading.Thread(target=vigilancia_estacion_loop, daemon=True).start()
+    threading.Thread(target=precalentar_lector, daemon=True).start()
 
 
 def make_publish_and_audit(db):
