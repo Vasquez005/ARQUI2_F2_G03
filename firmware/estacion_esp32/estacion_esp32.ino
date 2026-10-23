@@ -1,13 +1,6 @@
 /*
- * PORTUS Fase 3 — Estación meteorológica (ESP32-S3)
- * WiFi + MQTT. Independiente del Mega.
- *
- * Cableado maqueta (ESP32-S3-WROOM-1, silkscreen):
- *   DHT11 DATA  → GPIO 4  (3.3V, GND)
- *   YL-83 DO    → GPIO 9  (3.3V, GND; LOW = lluvia; AO sin cable)
- *   LDR + 10kΩ  → GPIO 10 (3.3V — LDR — GPIO10 — 10k — GND)
- *
- * En placa genérica del curso: lluvia GPIO 27 + BH1750 I2C; aquí LDR en GPIO 10.
+ * PORTUS Fase 3 - Estacion meteorologica ESP32-S3
+ * DHT11 pin 4, lluvia DO pin 9, LDR pin 10
  */
 
 #include <WiFi.h>
@@ -16,7 +9,6 @@
 #include <Preferences.h>
 #include <time.h>
 
-// ─── CONFIGURACIÓN (editar antes de cargar) ───────────────────────────────
 const char*    WIFI_SSID     = "Estudio";
 const char*    WIFI_PASSWORD = "9067047cc0";
 const char*    MQTT_HOST     = "192.168.1.100";
@@ -30,7 +22,6 @@ const int PIN_LDR    = 10;
 #define DHTTYPE DHT11
 const int LLUVIA_ACTIVA = LOW;
 
-// Calibrar con el monitor: tapa LDR → anota raw; luz fuerte → anota raw.
 int LUZ_RAW_OSCURO = 800;
 int LUZ_RAW_CLARO  = 3200;
 
