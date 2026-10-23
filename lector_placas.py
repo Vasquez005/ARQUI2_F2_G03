@@ -1,34 +1,60 @@
 # lector_placas.py
-# Detecta la placa con YOLO, la recorta, la preprocesa y lee el texto con EasyOCR.
-# Uso:  python lector_placas.py ref/test-image/placa2.jpg
+# Lectura de placa con EasyOCR sobre una REGION FIJA de la imagen (sin YOLO).
+# El enunciado (sec. 5.3 punto 3) permite usar una region fija cuando el detector
+# no es confiable por la escala de la maqueta. Ademas, no cargar YOLO ni sus
+# dependencias reduce la memoria a la mitad: entra en una Raspberry Pi de 2 GB.
+#
+# Uso:  python lector_placas.py captura_1.jpg
+#
+# Region de interes (opcional): PORTUS_ROI="x,y,w,h" en fracciones de 0 a 1.
+#   Ej. PORTUS_ROI="0.2,0.35,0.6,0.3"  -> recorta el centro donde cae la placa.
+#   Sin PORTUS_ROI se usa la imagen completa (EasyOCR ubica el texto solo).
 
 import os
 import sys
+
 import cv2
 import numpy as np
 import easyocr
-from ultralytics import YOLO
 
-# ── CAMBIA ESTO por el nombre real de tu archivo .pt ──
-RUTA_MODELO = "models/license-plate-finetune-v1x.pt"
-
-# QUE: carga el detector de placas (YOLO) una sola vez.
-model = YOLO(RUTA_MODELO)
-
-# QUE: fraccion de la caja de YOLO que se agrega a cada lado antes del OCR (8 %).
-MARGEN_CAJA = 0.08
-
-# QUE: parametro configurable (sec. 5.3, rango 30 a 95). Una lectura solo es valida si la alcanza.
-# Valor del enunciado: 60. Valor usado en pruebas: 30, por fotos tomadas con luz variable en un salon
-# (decision declarada en la bitacora; las lecturas reales se reportan tal cual).
-CONFIANZA_MINIMA_OCR = 30
+# QUE: confianza minima (sec. 5.3, rango 30 a 95). Configurable para igualar al backend.
+CONFIANZA_MINIMA_OCR = float(os.getenv("PORTUS_CONFIANZA_MINIMA_OCR", "30"))
 
 # QUE: OCR preentrenado de EasyOCR, en CPU (la Raspberry no tiene GPU).
 reader = easyocr.Reader(["en"], gpu=False, verbose=False)
 
 
+def _roi_config():
+    """Lee PORTUS_ROI='x,y,w,h' (fracciones 0-1). Devuelve None si no esta definida."""
+    crudo = os.getenv("PORTUS_ROI", "").strip()
+    if not crudo:
+        return None
+    try:
+        x, y, w, h = (float(v) for v in crudo.split(","))
+        return x, y, w, h
+    except (ValueError, TypeError):
+        print(f"PORTUS_ROI invalida ({crudo!r}); se usa la imagen completa.")
+        return None
+
+
+def recortar_region(img_rgb):
+    """Recorta la region fija donde aparece la placa (si PORTUS_ROI esta definida)."""
+    roi = _roi_config()
+    if roi is None:
+        return img_rgb, [0, 0, img_rgb.shape[1], img_rgb.shape[0]]
+    alto, ancho = img_rgb.shape[:2]
+    fx, fy, fw, fh = roi
+    x1 = max(0, int(fx * ancho))
+    y1 = max(0, int(fy * alto))
+    x2 = min(ancho, int((fx + fw) * ancho))
+    y2 = min(alto, int((fy + fh) * alto))
+    if x2 <= x1 or y2 <= y1:
+        return img_rgb, [0, 0, ancho, alto]
+    return img_rgb[y1:y2, x1:x2], [x1, y1, x2, y2]
+
+
 def enderezar(crop_rgb):
-    """Gira el recorte para que la placa quede recta. Mide la inclinacion con el cuerpo blanco de la placa."""
+    """Gira el recorte para que la placa quede recta, midiendo con el cuerpo blanco."""
     gris = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
     _, blanco = cv2.threshold(gris, 180, 255, cv2.THRESH_BINARY)
     contornos, _ = cv2.findContours(blanco, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -43,23 +69,13 @@ def enderezar(crop_rgb):
     return cv2.warpAffine(crop_rgb, M, (ancho, alto), borderMode=cv2.BORDER_REPLICATE)
 
 
-def preprocesar(crop_rgb):
-    """Mejora el recorte de la placa para que el OCR lea mejor."""
-    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
-    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-    gray = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    return cv2.filter2D(gray, -1, kernel)
-
-
-# QUE: confusiones tipicas del OCR. En las posiciones de digitos se cambian letras por numeros y viceversa.
+# QUE: confusiones tipicas del OCR. En posiciones de digitos se cambian letras por numeros y viceversa.
 MAPA_DIGITO = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "T": "1", "S": "5", "Z": "2", "B": "8", "G": "6"}
 MAPA_LETRA = {"0": "O", "1": "I", "5": "S", "8": "B", "2": "Z", "6": "G"}
 
 
 def corregir_formato(texto):
-    """Formato de placa: 1 letra, 3 digitos, 3 letras (ej. C123BCD). Solo corrige si tiene 7 caracteres."""
+    """Formato placa comercial: 1 letra, 3 digitos, 3 letras (ej. C123BCD). Solo si hay 7 caracteres."""
     if len(texto) != 7:
         return texto
     digitos = "".join(MAPA_DIGITO.get(c, c) for c in texto[1:4])
@@ -79,7 +95,6 @@ def ocr_sobre(img):
     resultados = reader.readtext(img_rgb, detail=1, paragraph=False)
     if not resultados:
         return "", 0.0
-
     _, texto, conf = max(resultados, key=altura_caja)
     texto = texto.upper().replace(" ", "")
     texto = "".join(c for c in texto if c.isalnum() or c == "-")
@@ -88,45 +103,31 @@ def ocr_sobre(img):
 
 
 def leer_placa(ruta_imagen):
-    """Devuelve una lista de placas encontradas en la imagen."""
+    """Devuelve una lista con la lectura de la placa (una region). Interfaz compatible
+    con camara_garita: cada dict trae 'placa' y 'confianza_ocr' (0-1)."""
     bgr = cv2.imread(ruta_imagen)
     if bgr is None:
         print(f"No se pudo abrir la imagen: {ruta_imagen}")
         return []
     img_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    resultados = model(img_rgb, verbose=False)[0]
-    placas = []
+    region, bbox = recortar_region(img_rgb)
+    recto = enderezar(region)
+    ampliado = cv2.resize(recto, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    texto, conf_ocr = ocr_sobre(ampliado)
 
-    for i, box in enumerate(resultados.boxes, 1):
-        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-        conf_det = float(box.conf[0])
-        # QUE: margen alrededor de la caja de YOLO para no cortar letras de la orilla.
-        margen_x = int((x2 - x1) * MARGEN_CAJA)
-        margen_y = int((y2 - y1) * MARGEN_CAJA)
-        alto_img, ancho_img = img_rgb.shape[:2]
-        x1, x2 = max(0, x1 - margen_x), min(ancho_img, x2 + margen_x)
-        y1, y2 = max(0, y1 - margen_y), min(alto_img, y2 + margen_y)
-        crop = img_rgb[y1:y2, x1:x2]
-        # QUE: primero se endereza la placa y luego se amplía a color; EasyOCR lee mejor asi.
-        recto = enderezar(crop)
-        ampliado = cv2.resize(recto, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        texto, conf_ocr = ocr_sobre(ampliado)
+    # DEBUG: guarda lo que recibe el OCR para revisarlo a simple vista.
+    os.makedirs("debug", exist_ok=True)
+    cv2.imwrite("debug/region.jpg", cv2.cvtColor(region, cv2.COLOR_RGB2BGR))
+    cv2.imwrite("debug/ampliado.png", cv2.cvtColor(ampliado, cv2.COLOR_RGB2BGR))
 
-        # DEBUG: guarda lo que recibe el OCR para revisarlo a simple vista.
-        os.makedirs("debug", exist_ok=True)
-        cv2.imwrite(f"debug/crop_{i}.jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(f"debug/ampliado_{i}.png", cv2.cvtColor(ampliado, cv2.COLOR_RGB2BGR))
-
-        placas.append({
-            "placa": texto,
-            "confianza_deteccion": round(conf_det, 3),
-            "confianza_ocr": round(conf_ocr, 3),
-            "valida": bool(texto) and conf_ocr * 100 >= CONFIANZA_MINIMA_OCR,
-            "bbox": [x1, y1, x2, y2],
-        })
-
-    return placas
+    return [{
+        "placa": texto,
+        "confianza_deteccion": 1.0,          # region fija: no hay detector que puntuar
+        "confianza_ocr": conf_ocr,
+        "valida": bool(texto) and conf_ocr * 100 >= CONFIANZA_MINIMA_OCR,
+        "bbox": bbox,
+    }]
 
 
 if __name__ == "__main__":
@@ -135,14 +136,11 @@ if __name__ == "__main__":
         sys.exit(1)
 
     placas = leer_placa(sys.argv[1])
-
     if not placas:
         print("No se detecto ninguna placa en la imagen.")
     else:
-        print(f"Placas detectadas: {len(placas)}")
-        for i, p in enumerate(placas, 1):
-            print(f"  #{i}  PLACA: {p['placa'] or '[no leida]'}"
-                  f"   det={p['confianza_deteccion']:.0%}"
+        for p in placas:
+            print(f"  PLACA: {p['placa'] or '[no leida]'}"
                   f"   ocr={p['confianza_ocr']:.0%}"
                   f"   valida={'si' if p['valida'] else 'no'}"
                   f"   bbox={p['bbox']}")
