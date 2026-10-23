@@ -20,8 +20,21 @@ import easyocr
 # QUE: confianza minima (sec. 5.3, rango 30 a 95). Configurable para igualar al backend.
 CONFIANZA_MINIMA_OCR = float(os.getenv("PORTUS_CONFIANZA_MINIMA_OCR", "30"))
 
-# QUE: OCR preentrenado de EasyOCR, en CPU (la Raspberry no tiene GPU).
-reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+# QUE: ancho (px) al que se normaliza la region antes del OCR. Mas chico = menos memoria.
+# En una Raspberry de 2 GB conviene 480-600 para no quedarse sin RAM.
+ANCHO_OCR = int(os.getenv("PORTUS_OCR_ANCHO", "560"))
+# QUE: lienzo interno de EasyOCR. Por defecto es 2560 (enorme para una Pi); lo acotamos.
+CANVAS_OCR = int(os.getenv("PORTUS_OCR_CANVAS", "640"))
+
+# QUE: un solo hilo de torch: menos memoria y menos contencion de CPU en la Pi.
+try:
+    import torch
+    torch.set_num_threads(1)
+except Exception:
+    pass
+
+# QUE: OCR preentrenado de EasyOCR, en CPU (la Raspberry no tiene GPU). quantize reduce memoria.
+reader = easyocr.Reader(["en"], gpu=False, quantize=True, verbose=False)
 
 
 def _roi_config():
@@ -90,9 +103,11 @@ def altura_caja(resultado):
 
 
 def ocr_sobre(img):
-    """Corre EasyOCR y devuelve (texto, confianza 0-1) del renglon mas alto. Acepta RGB o gris."""
+    """Corre EasyOCR y devuelve (texto, confianza 0-1) del renglon mas alto. Acepta RGB o gris.
+    canvas_size y mag_ratio acotan la memoria que usa el detector (clave en la Pi de 2 GB)."""
     img_rgb = img if img.ndim == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-    resultados = reader.readtext(img_rgb, detail=1, paragraph=False)
+    resultados = reader.readtext(img_rgb, detail=1, paragraph=False,
+                                 canvas_size=CANVAS_OCR, mag_ratio=1.0)
     if not resultados:
         return "", 0.0
     _, texto, conf = max(resultados, key=altura_caja)
@@ -113,7 +128,11 @@ def leer_placa(ruta_imagen):
 
     region, bbox = recortar_region(img_rgb)
     recto = enderezar(region)
-    ampliado = cv2.resize(recto, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    # QUE: normaliza el ancho a ANCHO_OCR en vez de ampliar 3x a ciegas (eso disparaba la memoria).
+    alto, ancho = recto.shape[:2]
+    escala = ANCHO_OCR / max(1, ancho)
+    ampliado = cv2.resize(recto, (ANCHO_OCR, max(1, int(alto * escala))),
+                          interpolation=cv2.INTER_CUBIC)
     texto, conf_ocr = ocr_sobre(ampliado)
 
     # DEBUG: guarda lo que recibe el OCR para revisarlo a simple vista.
